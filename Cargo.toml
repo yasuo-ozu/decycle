@@ -1,0 +1,19 @@
+[package]
+name = "decycle"
+version = "0.1.0"
+edition = "2021"
+description = "Solve circular trait obligation"
+license = "MIT"
+repository = "https://github.com/yasuo-ozu/decycle"
+keywords = ["macro", "trait", "recursive", "circular", "obligation"]
+categories = ["rust-patterns", "development-tools::procedural-macro-helpers"]
+authors = ["yasuo-ozu"]
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+decycle-macro = { path = "macro", version = "0.1.0" }
+
+[workspace]
+members = ["macro"]

@@ -13,6 +13,8 @@ use process_trait::process_trait;
 struct Args {
     decycle: Option<Path>,
     marker: Option<Path>,
+    recurse_level: Option<usize>,
+    support_infinite_cycle: Option<bool>,
 }
 
 impl Parse for Args {
@@ -20,9 +22,13 @@ impl Parse for Args {
         let mut args = Args {
             decycle: None,
             marker: None,
+            recurse_level: None,
+            support_infinite_cycle: None,
         };
         syn::custom_keyword!(decycle);
         syn::custom_keyword!(marker);
+        syn::custom_keyword!(recurse_level);
+        syn::custom_keyword!(support_infinite_cycle);
         while !input.is_empty() {
             let lookahead = input.lookahead1();
             if lookahead.peek(decycle) {
@@ -33,10 +39,20 @@ impl Parse for Args {
                 input.parse::<marker>()?;
                 input.parse::<Token![=]>()?;
                 args.marker = Some(input.parse()?);
+            } else if lookahead.peek(recurse_level) {
+                input.parse::<recurse_level>()?;
+                input.parse::<Token![=]>()?;
+                let lit: LitInt = input.parse()?;
+                args.recurse_level = Some(lit.base10_parse()?);
+            } else if lookahead.peek(support_infinite_cycle) {
+                input.parse::<support_infinite_cycle>()?;
+                input.parse::<Token![=]>()?;
+                let lit: LitBool = input.parse()?;
+                args.support_infinite_cycle = Some(lit.value);
             } else {
                 abort!(
                     input.span(),
-                    "keyword arguments should be one of 'decycle', 'marker'"
+                    "keyword arguments should be one of 'decycle', 'marker', 'recurse_level', 'support_infinite_cycle'"
                 )
             }
             if input.parse::<Token![,]>().is_err() {
@@ -57,8 +73,22 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
         if let Some(marker) = &args.marker {
             abort!(marker, "unsupported argument 'marker'")
         }
-        process_module(module, &decycle_path).into()
+        let recurse_level = args.recurse_level.unwrap_or(10);
+        let support_infinite_cycle = args.support_infinite_cycle.unwrap_or(true);
+        process_module(module, &decycle_path, recurse_level, support_infinite_cycle).into()
     } else if let Ok(item) = parse::<ItemTrait>(input.clone()) {
+        if let Some(_) = args.recurse_level {
+            abort!(
+                Span::call_site(),
+                "recurse_level is not supported for trait items"
+            )
+        }
+        if let Some(_) = args.support_infinite_cycle {
+            abort!(
+                Span::call_site(),
+                "support_infinite_cycle is not supported for trait items"
+            )
+        }
         process_trait(&item, &decycle_path, args.marker.as_ref()).into()
     } else if let Ok(mut item_use) = parse::<ItemUse>(input.clone()) {
         item_use.attrs.clear();
@@ -78,7 +108,7 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
         abort!(
             Span::call_site(),
             "not supported";
-            hint = "#[decycle] only supports module"
+            hint = "#[decycle] supports module or trait"
         )
     }
 }

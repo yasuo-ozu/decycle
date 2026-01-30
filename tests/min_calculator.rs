@@ -1,18 +1,9 @@
-use decycle::*;
-
-#[decycle]
-trait Evaluate {
-    fn evaluate(
-        &self,
-        input: &[&'static ::core::primitive::str],
-        index: &mut ::core::primitive::usize,
-    ) -> ::core::primitive::i32;
-}
-
-#[decycle()]
+#[decycle::decycle]
 mod calculator {
     #[decycle]
-    use super::Evaluate;
+    pub trait Evaluate {
+        fn evaluate(&self, input: &[&'static str], index: &mut usize) -> i32;
+    }
 
     pub struct Expr;
     pub struct Term;

@@ -324,7 +324,10 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                         .inputs
                         .iter()
                         .map(|arg| match arg {
-                            FnArg::Receiver(_) => quote!(self),
+                            FnArg::Receiver(receiver) => {
+                                let self_token = &receiver.self_token;
+                                quote!(#self_token)
+                            }
                             FnArg::Typed(pat_type) => {
                                 let pat = &pat_type.pat;
                                 quote!(#pat)

@@ -15,5 +15,11 @@ path = "lib.rs"
 [dependencies]
 decycle-macro = { path = "macro", version = "0.1.0" }
 
+[dev-dependencies]
+traitdef = { path = "tests/traitdef" }
+typedef = { path = "tests/typedef" }
+trybuild = "1.0"
+
 [workspace]
-members = ["macro"]
+members = ["macro", "tests/traitdef", "tests/typedef"]
+resolver = "2"

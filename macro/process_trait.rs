@@ -187,11 +187,5 @@ pub fn process_trait(
         #output0
 
         #typeref_impls
-
-        #(for (num, ty) in referrer.iter().enumerate()) {
-            impl #decycle_path::Repeater<#num> for #marker_path {
-                type Type = #ty;
-            }
-        }
     }
 }

@@ -1,0 +1,11 @@
+[package]
+name = "typedef"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+traitdef = { path = "../traitdef", version = "0.1.0" }
+
+[lib]
+path = "lib.rs"

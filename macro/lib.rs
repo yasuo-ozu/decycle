@@ -1,3 +1,5 @@
+//! see document for [`decycle`](https://docs.rs/decycle) crate.
+
 use proc_macro::{Span, TokenStream};
 use proc_macro_error::*;
 use syn::parse::{Parse, ParseStream};

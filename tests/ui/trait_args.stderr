@@ -1,0 +1,12 @@
+error: specify 'marker' arg
+ --> tests/ui/trait_args.rs:1:1
+  |
+1 | #[decycle::decycle(recurse_level = 4)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+help: first type to be interned
+ --> tests/ui/trait_args.rs:3:24
+  |
+3 |     fn value(&self) -> i32;
+  |                        ^^^
+  = note: this error originates in the attribute macro `decycle::decycle` (in Nightly builds, run with -Z macro-backtrace for more info)

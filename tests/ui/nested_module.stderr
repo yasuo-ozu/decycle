@@ -1,0 +1,16 @@
+error: #[decycle] is not supported in nested modules
+ --> tests/ui/nested_module.rs:3:5
+  |
+3 |     #[decycle::decycle]
+  |     ^^^^^^^^^^^^^^^^^^^
+
+error: missing `enum` for enum definition
+ --> tests/ui/nested_module.rs:2:5
+  |
+2 | mod outer {
+  |     ^^^^^
+  |
+help: add `enum` here to parse `outer` as an enum
+  |
+2 | mod enum outer {
+  |     ++++

@@ -57,14 +57,10 @@ pub fn process_module(
         .as_mut()
         .unwrap_or_else(|| abort!(&module.semi, "needs content"))
         .1;
-    // preprocess. collect annotated paths
     let (traits, working_list): (Vec<_>, Vec<_>) = contents.iter_mut().fold(
         Default::default(),
         |(mut traits, mut working_list), item| {
             match item {
-                Item::Mod(item_mod) => {
-                    check_submodule(item_mod);
-                }
                 Item::Trait(ItemTrait { attrs, .. })
                 | Item::TraitAlias(ItemTraitAlias { attrs, .. })
                 | Item::Use(ItemUse { attrs, .. }) => {
@@ -86,16 +82,27 @@ pub fn process_module(
                         }
                     }
                 }
-                Item::Macro(_) => abort!(&item, "macro is not supported in #[decycle] module"),
                 _ => (),
             }
             (traits, working_list)
         },
     );
+    proc_macro_error::set_dummy(
+        quote! { #{&module.ident} {#(for content in contents.clone()) { #content }} },
+    );
+    for item in contents.iter() {
+        match item {
+            Item::Mod(item_mod) => {
+                check_submodule(item_mod);
+            }
+            Item::Macro(_) => abort!(&item, "macro is not supported in #[decycle] module"),
+            _ => (),
+        }
+    }
     if traits.is_empty() && working_list.is_empty() {
         abort!(
             Span::call_site(),
-            "cannot detect traits nor use statement annotated witn #[decycle]"
+            "cannot detect traits nor `use` statement annotated witn #[decycle]"
         )
     }
     let all_traits: HashSet<Ident> = working_list

@@ -15,6 +15,17 @@ macro_rules! parse_quote {
 
 use parse_quote;
 
+fn parse_comma_separated<T: Parse>(input: ParseStream) -> Result<Vec<T>> {
+    let mut items = Vec::new();
+    while !input.is_empty() {
+        items.push(input.parse()?);
+        if !input.is_empty() {
+            input.parse::<Token![,]>()?;
+        }
+    }
+    Ok(items)
+}
+
 /// Inserts a `Type` as a `GenericArgument::Type` at the given position
 /// in the last segment's arguments of `path`.
 fn path_insert_type_arg(path: &mut Path, index: usize, ty: Type) {
@@ -35,6 +46,66 @@ fn path_insert_type_arg(path: &mut Path, index: usize, ty: Type) {
             angle_args.args.insert(index, arg);
         }
         PathArguments::Parenthesized(_) => {}
+    }
+}
+
+/// Returns `false` for trait bounds whose path is a single segment present
+/// in `replacing_table`, used to filter out bounds that will be replaced.
+fn should_keep_bound(bound: &TypeParamBound, replacing_table: &HashMap<Ident, (usize, Path)>) -> bool {
+    if let TypeParamBound::Trait(trait_bound) = bound {
+        if trait_bound.path.segments.len() == 1 {
+            return !replacing_table.contains_key(&trait_bound.path.segments[0].ident);
+        }
+    }
+    true
+}
+
+/// Strips bounds matching `replacing_table` from a `Generics`, removing
+/// type param bounds and where-clause predicates whose paths appear as keys.
+fn strip_replaced_bounds(
+    generics: &mut Generics,
+    replacing_table: &HashMap<Ident, (usize, Path)>,
+) {
+    for param in &mut generics.params {
+        if let GenericParam::Type(ref mut type_param) = param {
+            type_param.bounds = type_param
+                .bounds
+                .iter()
+                .filter(|bound| should_keep_bound(bound, replacing_table))
+                .cloned()
+                .collect();
+            if type_param.bounds.is_empty() {
+                type_param.colon_token = None;
+            }
+        }
+    }
+    if let Some(ref mut where_clause) = generics.where_clause {
+        where_clause.predicates = where_clause
+            .predicates
+            .iter()
+            .filter_map(|pred| {
+                if let WherePredicate::Type(type_pred) = pred {
+                    let new_bounds: Punctuated<TypeParamBound, Token![+]> = type_pred
+                        .bounds
+                        .iter()
+                        .filter(|bound| should_keep_bound(bound, replacing_table))
+                        .cloned()
+                        .collect();
+                    if new_bounds.is_empty() {
+                        None
+                    } else {
+                        let mut new_pred = type_pred.clone();
+                        new_pred.bounds = new_bounds;
+                        Some(WherePredicate::Type(new_pred))
+                    }
+                } else {
+                    Some(pred.clone())
+                }
+            })
+            .collect();
+        if where_clause.predicates.is_empty() {
+            generics.where_clause = None;
+        }
     }
 }
 
@@ -83,33 +154,15 @@ impl Parse for FinalizeArgs {
 
         let working_list_content;
         bracketed!(working_list_content in input);
-        let mut working_list = Vec::new();
-        while !working_list_content.is_empty() {
-            working_list.push(working_list_content.parse()?);
-            if !working_list_content.is_empty() {
-                working_list_content.parse::<Token![,]>()?;
-            }
-        }
+        let working_list = parse_comma_separated(&working_list_content)?;
 
         let traits_content;
         braced!(traits_content in input);
-        let mut traits = Vec::new();
-        while !traits_content.is_empty() {
-            traits.push(traits_content.parse()?);
-            if !traits_content.is_empty() {
-                traits_content.parse::<Token![,]>()?;
-            }
-        }
+        let traits = parse_comma_separated(&traits_content)?;
 
         let contents_content;
         braced!(contents_content in input);
-        let mut contents = Vec::new();
-        while !contents_content.is_empty() {
-            contents.push(contents_content.parse()?);
-            if !contents_content.is_empty() {
-                contents_content.parse::<Token![,]>()?;
-            }
-        }
+        let contents = parse_comma_separated(&contents_content)?;
 
         let lit: LitInt = input.parse()?;
         let recurse_level = lit.base10_parse()?;
@@ -184,33 +237,11 @@ impl GenericsScheme for Generics {
 impl GenericsScheme for Path {
     fn insert(&self, index: usize, param: TypeParam) -> Self {
         let mut path = self.clone();
-        let last_segment = path.segments.last_mut().unwrap();
-
-        let generic_arg = GenericArgument::Type(Type::Path(TypePath {
+        let ty = Type::Path(TypePath {
             qself: None,
             path: parse_quote!(#param),
-        }));
-
-        match &mut last_segment.arguments {
-            PathArguments::None => {
-                let mut args = Punctuated::new();
-                args.insert(index, generic_arg);
-                last_segment.arguments =
-                    PathArguments::AngleBracketed(AngleBracketedGenericArguments {
-                        colon2_token: None,
-                        lt_token: Default::default(),
-                        args,
-                        gt_token: Default::default(),
-                    });
-            }
-            PathArguments::AngleBracketed(ref mut angle_args) => {
-                angle_args.args.insert(index, generic_arg);
-            }
-            PathArguments::Parenthesized(_) => {
-                // Cannot insert into parenthesized arguments
-            }
-        }
-
+        });
+        path_insert_type_arg(&mut path, index, ty);
         path
     }
 
@@ -238,12 +269,9 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
 
     for item_impl in args.contents {
         let mut trait_path = item_impl.trait_.clone().unwrap().1;
-        trait_path.segments.last_mut().map(
-            |PathSegment {
-                 ident: _,
-                 arguments,
-             }| *arguments = PathArguments::None,
-        );
+        if let Some(last_seg) = trait_path.segments.last_mut() {
+            last_seg.arguments = PathArguments::None;
+        }
         traits_impls.entry(trait_path).or_default().push(item_impl);
     }
 
@@ -268,9 +296,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
     let mut output = TokenStream::new();
     for trait_ in &args.traits {
         let ident = &trait_.ident;
-        let impls = if let Some(impls) = traits_impls.get(&parse_quote!(#ident)) {
-            impls
-        } else {
+        let Some(impls) = traits_impls.get(&parse_quote!(#ident)) else {
             emit_warning!(ident, "trait '{}' has no implementations", ident);
             continue;
         };
@@ -279,17 +305,13 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
         let &(loc, ref ranked_path) = replacing_table.get(ident).unwrap();
         let initial_rank = get_initial_rank(args.recurse_level);
 
-        let ranked_bound: Path = {
+        let make_ranked_path = |rank_ty: Type| -> Path {
             let mut path: Path = parse_quote!(#ranked_path #{g.ty_generics()});
-            path_insert_type_arg(&mut path, loc, initial_rank.clone());
+            path_insert_type_arg(&mut path, loc, rank_ty);
             path
         };
-
-        let ranked_bound_end: Path = {
-            let mut path: Path = parse_quote!(#ranked_path #{g.ty_generics()});
-            path_insert_type_arg(&mut path, loc, parse_quote!(()));
-            path
-        };
+        let ranked_bound = make_ranked_path(initial_rank.clone());
+        let ranked_bound_end = make_ranked_path(parse_quote!(()));
 
         let delegated_items: Vec<TokenStream> = trait_
             .items
@@ -443,65 +465,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                 .collect();
 
             let mut modified_g = g.clone();
-            // Remove type bounds with paths in replacing_table.keys() (both GenericParam,
-            // WherePredicate) from modified_g
-            for param in &mut modified_g.params {
-                if let GenericParam::Type(ref mut type_param) = param {
-                    type_param.bounds = type_param
-                        .bounds
-                        .iter()
-                        .filter(|bound| {
-                            if let TypeParamBound::Trait(trait_bound) = bound {
-                                if trait_bound.path.segments.len() == 1 {
-                                    return !replacing_table
-                                        .contains_key(&trait_bound.path.segments[0].ident);
-                                }
-                            }
-                            true
-                        })
-                        .cloned()
-                        .collect();
-                    if type_param.bounds.is_empty() {
-                        type_param.colon_token = None;
-                    }
-                }
-            }
-            if let Some(ref mut where_clause) = modified_g.where_clause {
-                where_clause.predicates = where_clause
-                    .predicates
-                    .iter()
-                    .filter_map(|pred| {
-                        if let WherePredicate::Type(type_pred) = pred {
-                            let new_bounds: Punctuated<TypeParamBound, Token![+]> = type_pred
-                                .bounds
-                                .iter()
-                                .filter(|bound| {
-                                    if let TypeParamBound::Trait(trait_bound) = bound {
-                                        if trait_bound.path.segments.len() == 1 {
-                                            return !replacing_table
-                                                .contains_key(&trait_bound.path.segments[0].ident);
-                                        }
-                                    }
-                                    true
-                                })
-                                .cloned()
-                                .collect();
-                            if new_bounds.is_empty() {
-                                None
-                            } else {
-                                let mut new_pred = type_pred.clone();
-                                new_pred.bounds = new_bounds;
-                                Some(WherePredicate::Type(new_pred))
-                            }
-                        } else {
-                            Some(pred.clone())
-                        }
-                    })
-                    .collect();
-                if where_clause.predicates.is_empty() {
-                    modified_g.where_clause = None;
-                }
-            }
+            strip_replaced_bounds(&mut modified_g, &replacing_table);
 
             output.extend(quote! {
                 #modified_impl

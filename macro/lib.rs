@@ -66,17 +66,27 @@ impl Parse for Args {
 #[proc_macro_error]
 #[proc_macro_attribute]
 pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
+    proc_macro_error::set_dummy(input.clone().into());
     let args = parse_macro_input!(attr as Args);
     let decycle_path = args.decycle.unwrap_or_else(|| parse_quote!(::decycle));
 
     if let Ok(module) = parse::<ItemMod>(input.clone()) {
+        let recurse_level = args.recurse_level.unwrap_or(10);
+        let support_infinite_cycle = args.support_infinite_cycle.unwrap_or(true);
+        let ret = std::panic::catch_unwind(|| {
+            process_module(module, &decycle_path, recurse_level, support_infinite_cycle)
+        })
+        .unwrap_or_else(|e| std::panic::resume_unwind(e));
+        proc_macro_error::set_dummy(quote!(#ret));
         if let Some(marker) = &args.marker {
             abort!(marker, "unsupported argument 'marker'")
         }
-        let recurse_level = args.recurse_level.unwrap_or(10);
-        let support_infinite_cycle = args.support_infinite_cycle.unwrap_or(true);
-        process_module(module, &decycle_path, recurse_level, support_infinite_cycle).into()
+        ret.into()
     } else if let Ok(item) = parse::<ItemTrait>(input.clone()) {
+        let ret =
+            std::panic::catch_unwind(|| process_trait(&item, &decycle_path, args.marker.as_ref()))
+                .unwrap_or_else(|e| std::panic::resume_unwind(e));
+        proc_macro_error::set_dummy(quote!(#ret));
         if let Some(_) = args.recurse_level {
             abort!(
                 Span::call_site(),
@@ -89,7 +99,7 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
                 "support_infinite_cycle is not supported for trait items"
             )
         }
-        process_trait(&item, &decycle_path, args.marker.as_ref()).into()
+        ret.into()
     } else if let Ok(mut item_use) = parse::<ItemUse>(input.clone()) {
         item_use.attrs.clear();
         abort!(

@@ -19,10 +19,6 @@ pub fn process_trait(
     );
     let crate_version = env!("CARGO_PKG_VERSION");
 
-    let mut leaker = Leaker::from_trait(trait_item)
-        .unwrap_or_else(|type_leak::NotInternableError(span)| abort!(span, "use absolute path"));
-    leaker.reduce_roots();
-    let referrer = leaker.finish();
     let mut modified_trait_item = trait_item.clone();
     // Randomize Ident of GenericParam in modified_trait_item.generics
     let generic_renames: Vec<(Ident, Ident)> = modified_trait_item
@@ -41,21 +37,60 @@ pub fn process_trait(
             Some((old_ident, new_ident))
         })
         .collect();
-    // Replace all usages of old generic param names with new randomized names
-    if !generic_renames.is_empty() {
-        struct GenericRenamer<'a>(&'a [(Ident, Ident)]);
-        impl VisitMut for GenericRenamer<'_> {
-            fn visit_ident_mut(&mut self, ident: &mut Ident) {
-                for (old, new) in self.0 {
-                    if ident == old {
-                        *ident = new.clone();
-                        return;
-                    }
+    struct GenericRenamer<'a>(&'a [(Ident, Ident)]);
+    impl VisitMut for GenericRenamer<'_> {
+        fn visit_ident_mut(&mut self, ident: &mut Ident) {
+            for (old, new) in self.0 {
+                if ident == old {
+                    *ident = new.clone();
+                    return;
                 }
             }
         }
-        GenericRenamer(&generic_renames).visit_item_trait_mut(&mut modified_trait_item);
     }
+    GenericRenamer(&generic_renames).visit_item_trait_mut(&mut modified_trait_item);
+    let output0 = quote! {
+        #trait_item
+
+        #[allow(unused_macros, unused_imports, dead_code, non_local_definitions)]
+        #[doc(hidden)]
+        #[macro_export]
+        macro_rules! #temporal_mac_name {
+            (#crate_version [$_:path, $wl1:path $(,$wl:path)* $(,)?] {$($trait_defs:tt)*} $($t:tt)*) => {
+                $wl1! {
+                    #crate_version
+                    [$wl1 $(,$wl)*]
+                    {
+                        #(for attr in &modified_trait_item.attrs) { #attr }
+                        #{&modified_trait_item.vis}
+                        #{&modified_trait_item.unsafety}
+                        #{&modified_trait_item.auto_token}
+                        #{&modified_trait_item.trait_token}
+                        #{&modified_trait_item.ident}
+                        #{&modified_trait_item.generics}
+                        #{&modified_trait_item.colon_token}
+                        #{&modified_trait_item.supertraits}
+                        {
+                            #(for item in &modified_trait_item.items) { #item }
+                        },
+                        $($trait_defs)*
+                    }
+                    $($t)*
+                }
+            };
+        }
+
+        #[doc(hidden)]
+        #[allow(unused_imports, unused_macros, dead_code)]
+        #{&trait_item.vis} use #temporal_mac_name as #{&trait_item.ident};
+    };
+    proc_macro_error::set_dummy(output0.clone());
+
+    let mut leaker = Leaker::from_trait(trait_item)
+        .unwrap_or_else(|type_leak::NotInternableError(span)| abort!(span, "use absolute path"));
+    leaker.reduce_roots();
+    let referrer = leaker.finish();
+
     let typeref_impls = if !referrer.is_empty() {
         let marker_path = marker_path.unwrap_or_else(|| {
             abort!(
@@ -148,43 +183,10 @@ pub fn process_trait(
         AbsolutePathChecker { generic_params }.visit_item_trait(&modified_trait_item);
     }
 
-    // TODO: ensure that all trait paths are absolute.
-    // TODO: use type-leak
     quote! {
-        #trait_item
+        #output0
+
         #typeref_impls
-
-        #[allow(unused_macros, unused_imports, dead_code, non_local_definitions)]
-        #[doc(hidden)]
-        #[macro_export]
-        macro_rules! #temporal_mac_name {
-            (#crate_version [$_:path, $wl1:path $(,$wl:path)* $(,)?] {$($trait_defs:tt)*} $($t:tt)*) => {
-                $wl1! {
-                    #crate_version
-                    [$wl1 $(,$wl)*]
-                    {
-                        #(for attr in &modified_trait_item.attrs) { #attr }
-                        #{&modified_trait_item.vis}
-                        #{&modified_trait_item.unsafety}
-                        #{&modified_trait_item.auto_token}
-                        #{&modified_trait_item.trait_token}
-                        #{&modified_trait_item.ident}
-                        #{&modified_trait_item.generics}
-                        #{&modified_trait_item.colon_token}
-                        #{&modified_trait_item.supertraits}
-                        {
-                            #(for item in &modified_trait_item.items) { #item }
-                        },
-                        $($trait_defs)*
-                    }
-                    $($t)*
-                }
-            };
-        }
-
-        #[doc(hidden)]
-        #[allow(unused_imports, unused_macros, dead_code)]
-        #{&trait_item.vis} use #temporal_mac_name as #{&trait_item.ident};
 
         #(for (num, ty) in referrer.iter().enumerate()) {
             impl #decycle_path::Repeater<#num> for #marker_path {

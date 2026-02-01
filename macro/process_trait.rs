@@ -143,7 +143,7 @@ pub fn process_trait(
                         return;
                     }
                     // Skip generic parameters
-                    if self.generic_params.iter().any(|p| *p == ident) {
+                    if self.generic_params.contains(&ident) {
                         return;
                     }
                 }

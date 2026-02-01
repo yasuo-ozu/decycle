@@ -13,7 +13,6 @@ macro_rules! parse_quote {
     };
 }
 
-use parse_quote;
 
 fn parse_comma_separated<T: Parse>(input: ParseStream) -> Result<Vec<T>> {
     let mut items = Vec::new();
@@ -408,21 +407,16 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                         let mut sig = method.sig.clone();
                         // ensure that all params are ident
                         for (num, p) in sig.inputs.iter_mut().enumerate() {
-                            match p {
-                                FnArg::Typed(PatType { pat, .. }) => {
-                                    if let Pat::Ident(_) = pat.as_ref() {
-                                        ()
-                                    } else {
-                                        *pat = Box::new(Pat::Ident(PatIdent {
-                                            attrs: vec![],
-                                            by_ref: None,
-                                            mutability: None,
-                                            ident: name(format!("param_{}_", num).as_str()),
-                                            subpat: None,
-                                        }));
-                                    }
+                            if let FnArg::Typed(PatType { pat, .. }) = p {
+                                if !matches!(pat.as_ref(), Pat::Ident(_)) {
+                                    **pat = Pat::Ident(PatIdent {
+                                        attrs: vec![],
+                                        by_ref: None,
+                                        mutability: None,
+                                        ident: name(format!("param_{}_", num).as_str()),
+                                        subpat: None,
+                                    });
                                 }
-                                _ => (),
                             }
                         }
                         quote! {

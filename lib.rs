@@ -60,8 +60,8 @@ pub use decycle_macro::__finalize;
 /// - **Trait** (defined out of `#[decycle]` module):
 ///   - `#[decycle::decycle(marker = path, decycle = path)]`
 ///   - `marker`: marker type used for internal references. Required when the
-///   trait definition contains non-absolute type paths so decycle can intern
-///   them into a stable, globally reachable form.
+///     trait definition contains non-absolute type paths so decycle can intern
+///     them into a stable, globally reachable form.
 ///   - `decycle`: override the path used to refer to this crate
 ///
 ///

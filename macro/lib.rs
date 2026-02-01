@@ -89,13 +89,13 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
             std::panic::catch_unwind(|| process_trait(&item, &decycle_path, args.marker.as_ref()))
                 .unwrap_or_else(|e| std::panic::resume_unwind(e));
         proc_macro_error::set_dummy(quote!(#ret));
-        if let Some(_) = args.recurse_level {
+        if args.recurse_level.is_some() {
             abort!(
                 Span::call_site(),
                 "recurse_level is not supported for trait items"
             )
         }
-        if let Some(_) = args.support_infinite_cycle {
+        if args.support_infinite_cycle.is_some() {
             abort!(
                 Span::call_site(),
                 "support_infinite_cycle is not supported for trait items"

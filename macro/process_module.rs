@@ -27,7 +27,7 @@ pub fn process_trait_path(item: &Item) -> Vec<Path> {
         Item::Use(ItemUse { tree, .. }) => {
             fn process_use_tree(tree: &UseTree) -> Vec<Path> {
                 match tree {
-                    UseTree::Path(UsePath { tree, .. }) => process_use_tree(&tree),
+                    UseTree::Path(UsePath { tree, .. }) => process_use_tree(tree),
                     UseTree::Name(UseName { ident })
                     | UseTree::Rename(UseRename { rename: ident, .. }) => {
                         vec![super::ident_to_path(ident)]
@@ -36,7 +36,7 @@ pub fn process_trait_path(item: &Item) -> Vec<Path> {
                         abort!(use_glob, "glob is not supported in #[decycle] use")
                     }
                     UseTree::Group(UseGroup { items, .. }) => {
-                        items.iter().map(process_use_tree).flatten().collect()
+                        items.iter().flat_map(process_use_tree).collect()
                     }
                 }
             }
@@ -68,7 +68,7 @@ pub fn process_module(
                     let mut old_attrs = std::mem::take(attrs).into_iter();
                     let mut flag = false;
                     attrs.extend((&mut old_attrs).take_while(|attr| {
-                        if super::is_decycle_attribute(&attr) {
+                        if super::is_decycle_attribute(attr) {
                             flag = true;
                         }
                         !flag

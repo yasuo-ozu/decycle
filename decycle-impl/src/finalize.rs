@@ -140,6 +140,7 @@ pub struct FinalizeArgs {
 
 impl Parse for FinalizeArgs {
     fn parse(input: ParseStream) -> Result<Self> {
+        let _crate_identity: LitStr = input.parse()?;
         let crate_version: LitStr = input.parse()?;
         let expected_version = env!("CARGO_PKG_VERSION");
         if crate_version.value() != expected_version {
@@ -181,6 +182,7 @@ impl Parse for FinalizeArgs {
 
 impl template_quote::ToTokens for FinalizeArgs {
     fn to_tokens(&self, tokens: &mut TokenStream) {
+        let crate_identity = LitStr::new(&crate::get_crate_identity(), Span::call_site());
         let crate_version = env!("CARGO_PKG_VERSION");
         let working_list = &self.working_list;
         let traits = &self.traits;
@@ -190,6 +192,7 @@ impl template_quote::ToTokens for FinalizeArgs {
         let support_infinite_cycle = &self.support_infinite_cycle;
 
         tokens.extend(quote! {
+            #crate_identity
             #crate_version
             [ #(#working_list),* ]
             { #(#traits),* }

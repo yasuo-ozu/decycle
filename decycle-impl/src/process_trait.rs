@@ -11,13 +11,18 @@ pub fn process_trait(
     trait_item: &ItemTrait,
     decycle_path: &Path,
     marker_path: Option<&Path>,
+    alter_macro_name: Option<&Ident>,
+    leaker_config: type_leak::LeakerConfig,
 ) -> TokenStream2 {
     let random_suffix = crate::get_random();
-    let temporal_mac_name = syn::Ident::new(
-        &format!("__{}_temporal_{}", &trait_item.ident, random_suffix),
-        trait_item.ident.span(),
-    );
+    let temporal_mac_name = alter_macro_name.cloned().unwrap_or_else(|| {
+        syn::Ident::new(
+            &format!("__{}_temporal_{}", &trait_item.ident, random_suffix),
+            trait_item.ident.span(),
+        )
+    });
     let crate_version = env!("CARGO_PKG_VERSION");
+    let crate_identity = LitStr::new(&crate::get_crate_identity(), Span::call_site());
 
     let mut modified_trait_item = trait_item.clone();
     // Randomize Ident of GenericParam in modified_trait_item.generics
@@ -56,8 +61,9 @@ pub fn process_trait(
         #[doc(hidden)]
         #[macro_export]
         macro_rules! #temporal_mac_name {
-            (#crate_version [$_:path, $wl1:path $(,$wl:path)* $(,)?] {$($trait_defs:tt)*} $($t:tt)*) => {
+            (#crate_identity #crate_version [$_:path, $wl1:path $(,$wl:path)* $(,)?] {$($trait_defs:tt)*} $($t:tt)*) => {
                 $wl1! {
+                    #crate_identity
                     #crate_version
                     [$wl1 $(,$wl)*]
                     {
@@ -80,15 +86,24 @@ pub fn process_trait(
             };
         }
 
-        #[doc(hidden)]
-        #[allow(unused_imports, unused_macros, dead_code)]
-        #{&trait_item.vis} use #temporal_mac_name as #{&trait_item.ident};
+        #(if alter_macro_name.is_none()) {
+            #[doc(hidden)]
+            #[allow(unused_imports, unused_macros, dead_code)]
+            #{&trait_item.vis} use #temporal_mac_name as #{&trait_item.ident};
+        } #(else) {
+            #[doc(hidden)]
+            #[allow(unused_imports, unused_macros, dead_code)]
+            pub use #temporal_mac_name;
+        }
     };
     proc_macro_error::set_dummy(output0.clone());
 
-    let mut leaker = Leaker::from_trait(trait_item)
+    let mut leaker = Leaker::from_config(leaker_config);
+    leaker
+        .intern_with(&trait_item.generics, |v| {
+            v.visit_item_trait(trait_item);
+        })
         .unwrap_or_else(|type_leak::NotInternableError(span)| abort!(span, "use absolute path"));
-    leaker.reduce_roots();
     let referrer = leaker.finish();
 
     let typeref_impls = if !referrer.is_empty() {

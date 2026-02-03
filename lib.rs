@@ -3,6 +3,13 @@
 #[doc(hidden)]
 pub use decycle_macro::__finalize;
 
+/// Low-level helper for macro crates that want to wrap `#[decycle]` on modules.
+///
+/// This re-export exists for bridging: a macro crate can provide its own attribute/derive
+/// macros, while still delegating `#[decycle]`-style module processing to decycle.
+/// For example, a library might generate trait impls via a custom macro, but still
+/// want the enclosing module to be processed by decycle to break trait cycles.
+pub use decycle_impl::process_module;
 /// Attribute macro that expands a module or trait to break circular trait
 /// obligations within the annotated module. Also see module-level documentation.
 ///
@@ -90,9 +97,21 @@ pub use decycle_macro::__finalize;
 /// ```
 pub use decycle_macro::decycle;
 
+/// Low-level helper for macro crates that want to wrap `#[decycle]` on traits.
+///
+/// This is useful when another macro crate defines or derives traits, and those traits
+/// should also be valid targets for `#[decycle]`. The wrapper macro can call into this
+/// function to apply decycle's transformation while keeping its own macro API.
+pub use decycle_impl::process_trait;
+
+pub use decycle_impl::finalize;
+
 /// Internal helper used by generated code to track staged type expansion.
 #[doc(hidden)]
 pub trait Repeater<const RANDOM: u64, const IX: usize, PARAM: ?Sized> {
     /// The resolved type at the given stage.
     type Type: ?Sized;
 }
+
+#[doc(hidden)]
+pub use decycle_impl::{proc_macro_error, type_leak};

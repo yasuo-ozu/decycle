@@ -1,4 +1,4 @@
-use proc_macro::Span;
+use proc_macro2::Span;
 use proc_macro2::TokenStream;
 use proc_macro_error::*;
 use std::collections::HashSet;
@@ -10,7 +10,7 @@ fn check_submodule(module: &ItemMod) {
     struct Visitor;
     impl<'ast> Visit<'ast> for Visitor {
         fn visit_attribute(&mut self, i: &'ast syn::Attribute) {
-            if super::is_decycle_attribute(i) {
+            if crate::is_decycle_attribute(i) {
                 abort!(&i, "#[decycle] is not supported in nested modules")
             }
             syn::visit::visit_attribute(self, i);
@@ -19,10 +19,10 @@ fn check_submodule(module: &ItemMod) {
     Visitor.visit_item_mod(module);
 }
 
-pub fn process_trait_path(item: &Item) -> Vec<Path> {
+fn process_trait_path(item: &Item) -> Vec<Path> {
     match item {
         Item::Trait(ItemTrait { ident, .. }) | Item::TraitAlias(ItemTraitAlias { ident, .. }) => {
-            vec![super::ident_to_path(ident)]
+            vec![crate::ident_to_path(ident)]
         }
         Item::Use(ItemUse { tree, .. }) => {
             fn process_use_tree(tree: &UseTree) -> Vec<Path> {
@@ -30,7 +30,7 @@ pub fn process_trait_path(item: &Item) -> Vec<Path> {
                     UseTree::Path(UsePath { tree, .. }) => process_use_tree(tree),
                     UseTree::Name(UseName { ident })
                     | UseTree::Rename(UseRename { rename: ident, .. }) => {
-                        vec![super::ident_to_path(ident)]
+                        vec![crate::ident_to_path(ident)]
                     }
                     UseTree::Glob(use_glob) => {
                         abort!(use_glob, "glob is not supported in #[decycle] use")
@@ -68,7 +68,7 @@ pub fn process_module(
                     let mut old_attrs = std::mem::take(attrs).into_iter();
                     let mut flag = false;
                     attrs.extend((&mut old_attrs).take_while(|attr| {
-                        if super::is_decycle_attribute(attr) {
+                        if crate::is_decycle_attribute(attr) {
                             flag = true;
                         }
                         !flag

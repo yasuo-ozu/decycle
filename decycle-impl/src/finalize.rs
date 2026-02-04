@@ -454,23 +454,31 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                 })
                 .collect();
 
-            let mut modified_g = g.clone();
-            strip_replaced_bounds(&mut modified_g, &replacing_table);
-
+            let mut impl_generics = impl_.generics.clone();
+            strip_replaced_bounds(&mut impl_generics, &replacing_table);
             output.extend(quote! {
                 #modified_impl
 
                 #[allow(unused_variables)]
-                impl #{modified_g.impl_generics()} #ranked_bound_end for #{&impl_.self_ty} #{&modified_g.where_clause} {
+                impl #{impl_generics.impl_generics()} #ranked_bound_end for #{&impl_.self_ty} #{&impl_generics.where_clause} {
                     #(#cycle_items)*
                 }
             });
+            let mut delegated_generics = impl_.generics.clone();
+            strip_replaced_bounds(&mut delegated_generics, &replacing_table);
+            let ranked_bound_pred: WherePredicate =
+                parse_quote!(#{&impl_.self_ty}: #ranked_bound);
+            match delegated_generics.where_clause {
+                Some(ref mut where_clause) => where_clause.predicates.push(ranked_bound_pred),
+                None => {
+                    delegated_generics.where_clause =
+                        Some(parse_quote!(where #ranked_bound_pred));
+                }
+            }
             output.extend(quote! {
                 #(for attr in &trait_.attrs) { #attr }
-                impl #{g.impl_generics()}
-                super::#ident #{g.ty_generics()} for #{&impl_.self_ty} #{&g.where_clause}
-                where
-                    #{&impl_.self_ty}: #ranked_bound
+                impl #{delegated_generics.impl_generics()}
+                super::#ident #{g.ty_generics()} for #{&impl_.self_ty} #{&delegated_generics.where_clause}
                 {
                     #(#delegated_items)*
                 }

@@ -158,6 +158,7 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
 
 #[doc(hidden)]
 #[proc_macro]
+#[proc_macro_error]
 pub fn __finalize(input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(input as decycle_impl::finalize::FinalizeArgs);
     decycle_impl::finalize::finalize(args).into()

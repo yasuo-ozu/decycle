@@ -13,7 +13,6 @@ macro_rules! parse_quote {
     };
 }
 
-
 fn parse_comma_separated<T: Parse>(input: ParseStream) -> Result<Vec<T>> {
     let mut items = Vec::new();
     while !input.is_empty() {
@@ -50,7 +49,10 @@ fn path_insert_type_arg(path: &mut Path, index: usize, ty: Type) {
 
 /// Returns `false` for trait bounds whose path is a single segment present
 /// in `replacing_table`, used to filter out bounds that will be replaced.
-fn should_keep_bound(bound: &TypeParamBound, replacing_table: &HashMap<Ident, (usize, Path)>) -> bool {
+fn should_keep_bound(
+    bound: &TypeParamBound,
+    replacing_table: &HashMap<Ident, (usize, Path)>,
+) -> bool {
     if let TypeParamBound::Trait(trait_bound) = bound {
         if trait_bound.path.segments.len() == 1 {
             return !replacing_table.contains_key(&trait_bound.path.segments[0].ident);
@@ -61,10 +63,7 @@ fn should_keep_bound(bound: &TypeParamBound, replacing_table: &HashMap<Ident, (u
 
 /// Strips bounds matching `replacing_table` from a `Generics`, removing
 /// type param bounds and where-clause predicates whose paths appear as keys.
-fn strip_replaced_bounds(
-    generics: &mut Generics,
-    replacing_table: &HashMap<Ident, (usize, Path)>,
-) {
+fn strip_replaced_bounds(generics: &mut Generics, replacing_table: &HashMap<Ident, (usize, Path)>) {
     for param in &mut generics.params {
         if let GenericParam::Type(ref mut type_param) = param {
             type_param.bounds = type_param
@@ -366,15 +365,6 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                 #(for item in &trait_.items) { #item }
             }
         });
-        output.extend(quote! {
-            #(for attr in &trait_.attrs) { #attr }
-            impl #{g.insert(loc, parse_quote!(
-                #{name("Self")}: #ranked_bound
-            )).impl_generics()}
-            super::#ident #{g.ty_generics()} for #{name("Self")} #{&g.where_clause} {
-                #(#delegated_items)*
-            }
-        });
 
         for impl_ in impls {
             let mut modified_impl = impl_.clone();
@@ -473,6 +463,16 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                 #[allow(unused_variables)]
                 impl #{modified_g.impl_generics()} #ranked_bound_end for #{&impl_.self_ty} #{&modified_g.where_clause} {
                     #(#cycle_items)*
+                }
+            });
+            output.extend(quote! {
+                #(for attr in &trait_.attrs) { #attr }
+                impl #{g.impl_generics()}
+                super::#ident #{g.ty_generics()} for #{&impl_.self_ty} #{&g.where_clause}
+                where
+                    #{&impl_.self_ty}: #ranked_bound
+                {
+                    #(#delegated_items)*
                 }
             });
         }

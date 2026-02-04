@@ -6,9 +6,7 @@ mod integration_circular {
     }
 
     #[decycle]
-    pub trait LocalTrait {
-        fn local_method(&self) -> usize;
-    }
+    pub use traitdef::LocalTrait;
 
     pub struct NodeA {
         pub name: String,
@@ -35,17 +33,13 @@ mod integration_circular {
         NodeA: TestTrait,
     {
         fn local_method(&self) -> usize {
-            let child_len = self
-                .child_a
-                .as_ref()
-                .map_or(0, |a| a.test_method().len());
+            let child_len = self.child_a.as_ref().map_or(0, |a| a.test_method().len());
             self.count + child_len
         }
     }
 }
 
 use integration_circular::*;
-use integration_circular::{LocalTrait, TestTrait};
 
 #[test]
 fn test_circular_coinduction_minimal() {

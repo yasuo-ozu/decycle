@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+decycle = { path = "../.." }
 
 [lib]
 path = "lib.rs"

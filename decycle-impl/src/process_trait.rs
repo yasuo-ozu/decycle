@@ -138,66 +138,6 @@ pub fn process_trait(
         quote!()
     };
 
-    // Check that all trait paths are absolute in modified_trait_item
-    {
-        use syn::visit::Visit;
-        struct AbsolutePathChecker<'a> {
-            generic_params: Vec<&'a Ident>,
-        }
-        impl<'ast> Visit<'ast> for AbsolutePathChecker<'_> {
-            fn visit_path(&mut self, path: &'ast Path) {
-                // Skip if path has leading :: (absolute)
-                if path.leading_colon.is_some() {
-                    return;
-                }
-                // Skip if path is a single segment that matches a generic param
-                if path.segments.len() == 1 {
-                    let ident = &path.segments[0].ident;
-                    // Skip Self
-                    if ident == "Self" {
-                        return;
-                    }
-                    // Skip generic parameters
-                    if self.generic_params.contains(&ident) {
-                        return;
-                    }
-                }
-                // For multi-segment paths without leading ::, check if first segment looks like a crate
-                if path.segments.len() > 1 {
-                    let first = &path.segments[0].ident;
-                    // Common crate names that are allowed without ::
-                    if first == "std"
-                        || first == "core"
-                        || first == "alloc"
-                        || first == "crate"
-                        || first == "super"
-                        || first == "self"
-                    {
-                        syn::visit::visit_path(self, path);
-                        return;
-                    }
-                    emit_warning!(
-                        path,
-                        "path '{}' may not be absolute; consider using '::' prefix",
-                        quote!(#path)
-                    );
-                }
-                syn::visit::visit_path(self, path);
-            }
-        }
-        let generic_params: Vec<_> = modified_trait_item
-            .generics
-            .params
-            .iter()
-            .filter_map(|p| match p {
-                GenericParam::Type(tp) => Some(&tp.ident),
-                GenericParam::Const(cp) => Some(&cp.ident),
-                GenericParam::Lifetime(_) => None,
-            })
-            .collect();
-        AbsolutePathChecker { generic_params }.visit_item_trait(&modified_trait_item);
-    }
-
     quote! {
         #output0
 

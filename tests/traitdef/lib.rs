@@ -2,6 +2,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 
 // Local trait that exists only in this crate
+#[decycle::decycle]
 pub trait LocalTrait {
     fn local_method(&self) -> usize;
 }

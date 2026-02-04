@@ -1,6 +1,6 @@
 [package]
 name = "decycle-macro"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Solve circular trait obligation"
 license = "MIT"
@@ -14,7 +14,7 @@ proc-macro = true
 path = "lib.rs"
 
 [dependencies]
-decycle-impl = { path = "../decycle-impl", version = "0.2.0" }
+decycle-impl = { path = "../decycle-impl", version = "0.2.1" }
 proc-macro2 = "1.0"
 proc-macro-error = { version = "1.0", default-features = false }
 template-quote = "0.4.0"

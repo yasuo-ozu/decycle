@@ -1,6 +1,6 @@
 [package]
 name = "decycle"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Solve circular trait obligation"
 license = "MIT"
@@ -13,8 +13,8 @@ authors = ["yasuo-ozu"]
 path = "lib.rs"
 
 [dependencies]
-decycle-macro = { path = "macro", version = "0.2.1" }
-decycle-impl = { path = "decycle-impl", version = "0.2.1" }
+decycle-macro = { path = "macro", version = "0.2.2" }
+decycle-impl = { path = "decycle-impl", version = "0.2.2" }
 
 [dev-dependencies]
 traitdef = { path = "tests/traitdef" }

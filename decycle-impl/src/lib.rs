@@ -1,4 +1,5 @@
 use syn::*;
+use syn::visit_mut::VisitMut;
 
 pub mod finalize;
 mod process_module;
@@ -9,6 +10,73 @@ pub use type_leak;
 
 pub use process_module::process_module;
 pub use process_trait::process_trait;
+
+#[derive(Clone)]
+pub(crate) struct GenericRenamer {
+    pub(crate) lifetime_renames: Vec<(Lifetime, Lifetime)>,
+    pub(crate) ident_renames: Vec<(Ident, Ident)>,
+}
+
+impl VisitMut for GenericRenamer {
+    fn visit_lifetime_mut(&mut self, lt: &mut Lifetime) {
+        for (old, new) in &self.lifetime_renames {
+            if lt == old {
+                *lt = new.clone();
+                return;
+            }
+        }
+        syn::visit_mut::visit_lifetime_mut(self, lt);
+    }
+
+    fn visit_ident_mut(&mut self, ident: &mut Ident) {
+        for (old, new) in &self.ident_renames {
+            if ident == old {
+                *ident = new.clone();
+                return;
+            }
+        }
+        syn::visit_mut::visit_ident_mut(self, ident);
+    }
+}
+
+pub(crate) fn randomize_impl_generics(
+    generics: &mut Generics,
+    random_suffix: u64,
+) -> GenericRenamer {
+    let mut lifetime_renames: Vec<(Lifetime, Lifetime)> = Vec::new();
+    let mut ident_renames: Vec<(Ident, Ident)> = Vec::new();
+
+    for param in &mut generics.params {
+        match param {
+            GenericParam::Lifetime(lt) => {
+                let old = lt.lifetime.clone();
+                let new_name = format!("'{}{}", old.ident, random_suffix);
+                let new = Lifetime::new(&new_name, old.span());
+                lt.lifetime = new.clone();
+                lifetime_renames.push((old, new));
+            }
+            GenericParam::Type(tp) => {
+                let old = tp.ident.clone();
+                let new = Ident::new(&format!("{}{}", old, random_suffix), old.span());
+                tp.ident = new.clone();
+                ident_renames.push((old, new));
+            }
+            GenericParam::Const(cp) => {
+                let old = cp.ident.clone();
+                let new = Ident::new(&format!("{}{}", old, random_suffix), old.span());
+                cp.ident = new.clone();
+                ident_renames.push((old, new));
+            }
+        }
+    }
+
+    let mut renamer = GenericRenamer {
+        lifetime_renames,
+        ident_renames,
+    };
+    renamer.visit_generics_mut(generics);
+    renamer
+}
 
 fn is_decycle_attribute(attr: &Attribute) -> bool {
     let path = &attr.path();

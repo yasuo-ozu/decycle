@@ -26,34 +26,9 @@ pub fn process_trait(
 
     let mut modified_trait_item = trait_item.clone();
     // Randomize Ident of GenericParam in modified_trait_item.generics
-    let generic_renames: Vec<(Ident, Ident)> = modified_trait_item
-        .generics
-        .params
-        .iter_mut()
-        .filter_map(|param| {
-            let ident = match param {
-                GenericParam::Type(tp) => &mut tp.ident,
-                GenericParam::Const(cp) => &mut cp.ident,
-                GenericParam::Lifetime(_) => return None,
-            };
-            let old_ident = ident.clone();
-            let new_ident = Ident::new(&format!("{}_{}", ident, random_suffix), ident.span());
-            *ident = new_ident.clone();
-            Some((old_ident, new_ident))
-        })
-        .collect();
-    struct GenericRenamer<'a>(&'a [(Ident, Ident)]);
-    impl VisitMut for GenericRenamer<'_> {
-        fn visit_ident_mut(&mut self, ident: &mut Ident) {
-            for (old, new) in self.0 {
-                if ident == old {
-                    *ident = new.clone();
-                    return;
-                }
-            }
-        }
-    }
-    GenericRenamer(&generic_renames).visit_item_trait_mut(&mut modified_trait_item);
+    let mut renamer =
+        crate::randomize_impl_generics(&mut modified_trait_item.generics, random_suffix);
+    renamer.visit_item_trait_mut(&mut modified_trait_item);
     let output0 = quote! {
         #trait_item
 

@@ -1,6 +1,6 @@
 #![allow(dead_code, private_interfaces)]
 
-#[decycle::decycle(support_infinite_cycle = true)]
+#[decycle::decycle]
 mod advanced_cycles_infinite {
     #[decycle]
     trait CycleA {
@@ -149,7 +149,7 @@ mod advanced_cycles_infinite {
     }
 }
 
-#[decycle::decycle(support_infinite_cycle = false)]
+#[decycle::decycle]
 mod advanced_cycles_finite {
     #[decycle]
     trait GammaLoop {

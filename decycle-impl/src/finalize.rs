@@ -1,6 +1,8 @@
+use crate::helper::*;
 use proc_macro2::{Span, TokenStream};
 use proc_macro_error::*;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::visit_mut::VisitMut;
@@ -11,6 +13,309 @@ macro_rules! parse_quote {
     ($($tt:tt)*) => {
         syn::parse2(::template_quote::quote!($($tt)*)).unwrap()
     };
+}
+
+macro_rules! name {
+    ($($arg:tt)*) => {
+        name(&format!($($arg)*))
+    };
+}
+
+fn name(s: &str) -> Ident {
+    static RANDOM_SUFFIX: OnceLock<String> = OnceLock::new();
+
+    let suffix = RANDOM_SUFFIX.get_or_init(|| crate::get_random().to_string());
+    Ident::new(&format!("{}{}", s, suffix), Span::call_site())
+}
+
+fn remove_cyclic_bounds(
+    generics: &Generics,
+    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+) -> Generics {
+    let mut g = generics.clone();
+    replace_constraints(&mut g, |ty, trait_path| {
+        (trait_path.segments.len() == 1
+            && replacing_table
+                .get(&trait_path.segments.last().unwrap().ident)
+                .is_none())
+        .then_some((ty, trait_path))
+    });
+    g
+}
+
+fn wrap_cyclic_bounds(
+    generics: &Generics,
+    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+) -> Generics {
+    let mut g = generics.clone();
+    replace_constraints(&mut g, |ty, trait_path| {
+        if trait_path.segments.len() != 1 {
+            return Some((ty, trait_path));
+        }
+        if let Some((trait_, ix, _)) =
+            replacing_table.get(&trait_path.segments.last().unwrap().ident)
+        {
+            Some((
+                parse_quote!(#{name!("Wrapper")}<#ty>),
+                parse_quote!(
+                    #{name!("ranked_traits")}::#{name!("{}Ranked", &trait_.ident)}
+                    #{trait_.generics.ty_generics().insert(*ix, parse_quote![#{name!("Rank")}])}
+                ),
+            ))
+        } else {
+            Some((ty, trait_path))
+        }
+    });
+    g
+}
+
+fn emit_impl_items_leaf(impl_: &ItemImpl) -> TokenStream {
+    let mut output = TokenStream::new();
+
+    for (_ix, item) in impl_.items.iter().enumerate() {
+        match item {
+            ImplItem::Fn(ImplItemFn {
+                defaultness, sig, ..
+            }) => {
+                let mut sig = sig.clone();
+                replace_self_and_desugar_impl_trait(&mut sig, &impl_.self_ty);
+
+                for (ix, input) in sig.inputs.iter_mut().enumerate() {
+                    input.reduce_pat(ix);
+                }
+                output.extend(quote! {
+                    #defaultness #sig {
+                        ::core::unimplemented!("decycle: cycle limit reached")
+                    }
+                });
+            }
+            o => output.extend(quote!(#o)),
+        }
+    }
+    output
+}
+
+fn emit_trait_items_delegate(
+    trait_: &ItemTrait,
+    path: TokenStream,
+    base_self_ty: &Type,
+) -> TokenStream {
+    let mut output = TokenStream::new();
+
+    for item in &trait_.items {
+        match item {
+            TraitItem::Fn(TraitItemFn { sig, .. }) => {
+                let mut sig = sig.clone();
+                replace_self_and_desugar_impl_trait(&mut sig, base_self_ty);
+
+                for (ix, input) in sig.inputs.iter_mut().enumerate() {
+                    input.reduce_pat(ix);
+                }
+                output.extend(quote! {
+                    #sig {
+                        #path::#{&sig.ident}(
+                            #(for input in &sig.inputs), {
+                                #{input.variable()}
+                            }
+                        )
+                    }
+                })
+            }
+            TraitItem::Type(TraitItemType {
+                ident, generics, ..
+            }) => output.extend(quote! {
+                type #ident #generics = #path::#ident;
+            }),
+            TraitItem::Const(TraitItemConst { ident, ty, .. }) => output.extend(quote! {
+                const #ident: #ty = #path::#ident;
+            }),
+            _ => unimplemented!(),
+        }
+    }
+    output
+}
+
+fn emit_impl_items_delegate(impl_: &ItemImpl, path: TokenStream) -> TokenStream {
+    let mut output = TokenStream::new();
+    for item in &impl_.items {
+        match item {
+            ImplItem::Fn(ImplItemFn {
+                sig, defaultness, ..
+            }) => {
+                let mut sig = sig.clone();
+                for (ix, input) in sig.inputs.iter_mut().enumerate() {
+                    input.reduce_pat(ix);
+                }
+                output.extend(quote! {
+                    #defaultness #sig {
+                        #path::#{&sig.ident}(
+                            #(for input in &sig.inputs), {
+                                #{input.variable()}
+                            }
+                        )
+                    }
+                })
+            }
+            ImplItem::Type(ImplItemType {
+                ident, generics, ..
+            }) => output.extend(quote! {
+                type #ident #generics = #path::#ident;
+            }),
+            ImplItem::Const(ImplItemConst { ident, ty, .. }) => output.extend(quote! {
+                const #ident: #ty = #path::#ident;
+            }),
+            _ => unimplemented!(),
+        }
+    }
+    output
+}
+
+fn emit_impl_main(trait_: &ItemTrait, impl_: &ItemImpl, base_self_ty: &Type) -> TokenStream {
+    let mut output = TokenStream::new();
+    for item in &impl_.items {
+        match item {
+            ImplItem::Fn(impl_item_fn) => {
+                if let Some(trait_item_fn) = trait_.items.iter().find_map(|item| match item {
+                    TraitItem::Fn(trait_item_fn)
+                        if &trait_item_fn.sig.ident == &impl_item_fn.sig.ident =>
+                    {
+                        Some(trait_item_fn)
+                    }
+                    _ => None,
+                }) {
+                    let impl_mock_path = quote!(
+                        #{name!("{}Mock", &trait_.ident)}
+                        #{&impl_.trait_.as_ref().unwrap().1.segments.last().unwrap().arguments}
+                    );
+                    let mut sig_with_reduced_pats = impl_item_fn.sig.clone();
+                    replace_self(&mut sig_with_reduced_pats, base_self_ty);
+                    let args = sig_with_reduced_pats
+                        .inputs
+                        .iter_mut()
+                        .enumerate()
+                        .map(|(ix, input)| {
+                            input.reduce_pat(ix);
+                            match input {
+                                FnArg::Receiver(Receiver { self_token, .. }) => {
+                                    quote!(::core::mem::transmute(#self_token))
+                                }
+                                FnArg::Typed(PatType { pat, .. }) => {
+                                    quote!(#pat)
+                                }
+                            }
+                        })
+                        .collect::<Punctuated<_, Token![,]>>();
+
+                    output.extend(quote!(
+                        #{&impl_item_fn.defaultness} #{&sig_with_reduced_pats}{
+                            trait #{name!("{}Mock", &trait_.ident)} #{trait_.generics.impl_generics()}: #{&trait_.ident} {
+                                #{
+                                    let mut ti = trait_item_fn.clone();
+                                    ti.sig.ident = name!("{}_mocked_", &ti.sig.ident);
+                                    ti.default = None;
+                                    ti.semi_token = Default::default();
+                                    ti
+                                }
+                            }
+                            impl #{impl_.generics.impl_generics()} #impl_mock_path for #base_self_ty
+                            #{&impl_.generics.where_clause} {
+                                #{
+                                    let mut ii = impl_item_fn.clone();
+                                    ii.sig.ident = name!("{}_mocked_", &ii.sig.ident);
+                                    ii
+                                }
+                            }
+                            unsafe {
+                                <#base_self_ty as #impl_mock_path>::#{name!("{}_mocked_", &impl_item_fn.sig.ident)} ( #args )
+                            }
+                        }
+                    ));
+                } else {
+                    output.extend(quote!(#item));
+                }
+            }
+            o => output.extend(quote!(#o)),
+        }
+    }
+    output
+}
+
+fn replace_self(sig: &mut Signature, base_self_ty: &Type) {
+    use syn::visit_mut::VisitMut;
+
+    struct SelfReplacer<'a> {
+        base_self_ty: &'a Type,
+    }
+
+    impl<'a> VisitMut for SelfReplacer<'a> {
+        fn visit_receiver_mut(&mut self, _receiver: &mut Receiver) {
+            // Skip visiting receiver to avoid replacing Self in receiver types
+        }
+
+        fn visit_type_mut(&mut self, ty: &mut Type) {
+            if let Type::Path(TypePath { qself: None, path }) = ty {
+                if path.is_ident("Self") {
+                    *ty = self.base_self_ty.clone();
+                    return;
+                }
+            }
+            syn::visit_mut::visit_type_mut(self, ty);
+        }
+    }
+
+    let mut replacer = SelfReplacer { base_self_ty };
+    replacer.visit_signature_mut(sig);
+}
+
+fn replace_self_and_desugar_impl_trait(sig: &mut Signature, base_self_ty: &Type) {
+    replace_self(sig, base_self_ty);
+
+    let mut param_counter = 0usize;
+
+    // Replace input-position impl Trait with type parameters
+    for input in &mut sig.inputs {
+        if let FnArg::Typed(PatType { ty, .. }) = input {
+            if let Type::ImplTrait(impl_trait) = &**ty {
+                let param_name = name!("ImplTrait{}", param_counter);
+                param_counter += 1;
+
+                let bounds = impl_trait.bounds.clone();
+                sig.generics.params.push(GenericParam::Type(TypeParam {
+                    attrs: Vec::new(),
+                    ident: param_name.clone(),
+                    colon_token: if bounds.is_empty() {
+                        None
+                    } else {
+                        Some(Default::default())
+                    },
+                    bounds,
+                    eq_token: None,
+                    default: None,
+                }));
+
+                *ty = Box::new(Type::Path(TypePath {
+                    qself: None,
+                    path: param_name.into(),
+                }));
+            }
+        }
+    }
+}
+
+fn process_trait_item_for_ranked(item: &TraitItem) -> TraitItem {
+    let mut item = item.clone();
+    if let TraitItem::Fn(TraitItemFn {
+        sig,
+        default,
+        semi_token,
+        ..
+    }) = &mut item
+    {
+        replace_self_and_desugar_impl_trait(sig, &parse_quote!(Self));
+        *default = None;
+        *semi_token = Some(Default::default());
+    }
+    item
 }
 
 fn parse_comma_separated<T: Parse>(input: ParseStream) -> Result<Vec<T>> {
@@ -24,31 +329,9 @@ fn parse_comma_separated<T: Parse>(input: ParseStream) -> Result<Vec<T>> {
     Ok(items)
 }
 
-/// Inserts a `Type` as a `GenericArgument::Type` at the given position
-/// in the last segment's arguments of `path`.
-fn path_insert_type_arg(path: &mut Path, index: usize, ty: Type) {
-    let last_seg = path.segments.last_mut().unwrap();
-    let arg = GenericArgument::Type(ty);
-    match &mut last_seg.arguments {
-        PathArguments::None => {
-            let mut args = Punctuated::new();
-            args.insert(index, arg);
-            last_seg.arguments = PathArguments::AngleBracketed(AngleBracketedGenericArguments {
-                colon2_token: None,
-                lt_token: Default::default(),
-                args,
-                gt_token: Default::default(),
-            });
-        }
-        PathArguments::AngleBracketed(ref mut angle_args) => {
-            angle_args.args.insert(index, arg);
-        }
-        PathArguments::Parenthesized(_) => {}
-    }
-}
-
 /// Returns `false` for trait bounds whose path is a single segment present
 /// in `replacing_table`, used to filter out bounds that will be replaced.
+#[allow(dead_code)]
 fn should_keep_bound(
     bound: &TypeParamBound,
     replacing_table: &HashMap<Ident, (usize, Path)>,
@@ -63,6 +346,7 @@ fn should_keep_bound(
 
 /// Strips bounds matching `replacing_table` from a `Generics`, removing
 /// type param bounds and where-clause predicates whose paths appear as keys.
+#[allow(dead_code)]
 fn strip_replaced_bounds(generics: &mut Generics, replacing_table: &HashMap<Ident, (usize, Path)>) {
     for param in &mut generics.params {
         if let GenericParam::Type(ref mut type_param) = param {
@@ -110,6 +394,7 @@ fn strip_replaced_bounds(generics: &mut Generics, replacing_table: &HashMap<Iden
 /// Replaces trait paths that have a single segment matching a key in the
 /// HashMap with the corresponding replacement Path, copying the original
 /// PathArguments and inserting the given Type at the stored position.
+#[allow(dead_code)]
 struct TraitReplacer(HashMap<Ident, (usize, Path)>, Type);
 
 impl VisitMut for TraitReplacer {
@@ -164,7 +449,6 @@ pub struct FinalizeArgs {
     pub traits: Vec<ItemTrait>,
     pub contents: Vec<ItemImpl>,
     pub recurse_level: usize,
-    pub support_infinite_cycle: bool,
 }
 
 impl Parse for FinalizeArgs {
@@ -196,15 +480,11 @@ impl Parse for FinalizeArgs {
         let lit: LitInt = input.parse()?;
         let recurse_level = lit.base10_parse()?;
 
-        let lit: LitBool = input.parse()?;
-        let support_infinite_cycle = lit.value;
-
         Ok(FinalizeArgs {
             working_list,
             traits,
             contents,
             recurse_level,
-            support_infinite_cycle,
         })
     }
 }
@@ -218,7 +498,6 @@ impl template_quote::ToTokens for FinalizeArgs {
         let contents = &self.contents;
 
         let recurse_level = &self.recurse_level;
-        let support_infinite_cycle = &self.support_infinite_cycle;
 
         tokens.extend(quote! {
             #crate_identity
@@ -227,7 +506,6 @@ impl template_quote::ToTokens for FinalizeArgs {
             { #(#traits),* }
             { #(#contents),* }
             #recurse_level
-            #support_infinite_cycle
         });
     }
 }
@@ -241,382 +519,248 @@ fn get_initial_rank(count: usize) -> Type {
     }
 }
 
-trait GenericsScheme {
-    fn insert(&self, index: usize, param: TypeParam) -> Self;
-    fn impl_generics(&self) -> TokenStream;
-    fn ty_generics(&self) -> TokenStream;
-}
+fn replace_constraints(
+    generics: &mut Generics,
+    mut f: impl FnMut(Type, Path) -> Option<(Type, Path)>,
+) {
+    let mut where_clause = WhereClause {
+        where_token: Default::default(),
+        predicates: Punctuated::new(),
+    };
+    let mut where_predicates_to_add = Vec::new();
+    let mut process_type_param_bound =
+        |param_type: &Type, bound: TypeParamBound| -> Option<TypeParamBound> {
+            match bound {
+                TypeParamBound::Trait(TraitBound {
+                    paren_token,
+                    modifier: TraitBoundModifier::None,
+                    lifetimes,
+                    path,
+                }) => {
+                    if let Some((new_ty, new_path)) = f(param_type.clone(), path.clone()) {
+                        if new_ty == *param_type {
+                            Some(TypeParamBound::Trait(TraitBound {
+                                paren_token,
+                                modifier: TraitBoundModifier::None,
+                                lifetimes,
+                                path,
+                            }))
+                        } else {
+                            where_predicates_to_add.push(WherePredicate::Type(PredicateType {
+                                lifetimes: None,
+                                bounded_ty: new_ty,
+                                colon_token: Default::default(),
+                                bounds: std::iter::once(TypeParamBound::Trait(TraitBound {
+                                    paren_token: None,
+                                    modifier: TraitBoundModifier::None,
+                                    lifetimes: None,
+                                    path: new_path,
+                                }))
+                                .collect(),
+                            }));
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                bound => Some(bound),
+            }
+        };
+    for param in &mut generics.params {
+        if let GenericParam::Type(ref mut type_param) = param {
+            let param_type = Type::Path(TypePath {
+                qself: None,
+                path: type_param.ident.clone().into(),
+            });
 
-impl GenericsScheme for Generics {
-    fn insert(&self, index: usize, param: TypeParam) -> Self {
-        let mut generics = self.clone();
-        generics.params.insert(index, GenericParam::Type(param));
-        generics
-    }
+            type_param.bounds = std::mem::take(&mut type_param.bounds)
+                .into_iter()
+                .filter_map(|bound| process_type_param_bound(&param_type, bound))
+                .collect();
 
-    fn impl_generics(&self) -> TokenStream {
-        let (impl_generics, _, _) = self.split_for_impl();
-        quote!(#impl_generics)
-    }
-
-    fn ty_generics(&self) -> TokenStream {
-        let (_, ty_generics, _) = self.split_for_impl();
-        quote!(#ty_generics)
-    }
-}
-
-impl GenericsScheme for Path {
-    fn insert(&self, index: usize, param: TypeParam) -> Self {
-        let mut path = self.clone();
-        let ty = Type::Path(TypePath {
-            qself: None,
-            path: parse_quote!(#param),
-        });
-        path_insert_type_arg(&mut path, index, ty);
-        path
-    }
-
-    fn impl_generics(&self) -> TokenStream {
-        quote!()
-    }
-
-    fn ty_generics(&self) -> TokenStream {
-        if let Some(last_segment) = self.segments.last() {
-            let args = &last_segment.arguments;
-            quote!(#args)
-        } else {
-            quote!()
+            if type_param.bounds.is_empty() {
+                type_param.colon_token = None;
+            }
         }
     }
+
+    for pred in std::mem::take(&mut generics.where_clause)
+        .map(|wc| wc.predicates)
+        .into_iter()
+        .flatten()
+    {
+        match pred {
+            WherePredicate::Type(PredicateType {
+                lifetimes,
+                bounded_ty,
+                colon_token,
+                mut bounds,
+            }) => {
+                bounds = bounds
+                    .into_iter()
+                    .filter_map(|bound| process_type_param_bound(&bounded_ty, bound))
+                    .collect();
+
+                if !bounds.is_empty() {
+                    where_clause
+                        .predicates
+                        .push(WherePredicate::Type(PredicateType {
+                            lifetimes,
+                            bounded_ty,
+                            colon_token,
+                            bounds,
+                        }));
+                }
+            }
+            o => where_clause.predicates.push(o),
+        }
+    }
+
+    where_clause.predicates.extend(where_predicates_to_add);
+
+    generics.where_clause = (!where_clause.predicates.is_empty()).then_some(where_clause);
 }
 
 pub fn finalize(args: FinalizeArgs) -> TokenStream {
-    let random_suffix = crate::get_random();
-    let name =
-        |s: &str| -> Ident { Ident::new(&format!("{}{}", s, &random_suffix), Span::call_site()) };
-
-    // Mapping which maps trait path (with no args) to corresponding impl item
-    let mut traits_impls: HashMap<Path, Vec<_>> = HashMap::new();
-
-    for item_impl in args.contents {
-        let mut trait_path = item_impl.trait_.clone().unwrap().1;
-        if let Some(last_seg) = trait_path.segments.last_mut() {
-            last_seg.arguments = PathArguments::None;
-        }
-        traits_impls.entry(trait_path).or_default().push(item_impl);
-    }
-
-    let replacing_table: HashMap<Ident, (usize, Path)> = args
+    let replacing_table: HashMap<Ident, (ItemTrait, usize, Vec<_>)> = args
         .traits
         .iter()
         .map(|trait_| {
-            let ident = &trait_.ident;
             let g = &trait_.generics;
             let loc = g
                 .params
                 .iter()
                 .position(|param| !matches!(param, GenericParam::Lifetime(_)))
                 .unwrap_or(g.params.len());
-            let ranked_ident_str = format!("{}Ranked", ident);
-            let ranked_ident = name(ranked_ident_str.as_str());
-            let ranked_path: Path = parse_quote!(#ranked_ident);
-            (ident.clone(), (loc, ranked_path))
+            let impls = args
+                .contents
+                .iter()
+                .filter(|item_impl| {
+                    item_impl
+                        .trait_
+                        .as_ref()
+                        .map(|p| p.1.is_ident(&trait_.ident))
+                        == Some(true)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if impls.is_empty() {
+                emit_warning!(
+                    &trait_.ident,
+                    "trait '{}' has no implementations",
+                    &trait_.ident
+                );
+            }
+            (trait_.ident.clone(), (trait_.clone(), loc, impls))
         })
         .collect();
 
-    let mut output = TokenStream::new();
-    for trait_ in &args.traits {
-        let ident = &trait_.ident;
-        let Some(impls) = traits_impls.get(&parse_quote!(#ident)) else {
-            emit_warning!(ident, "trait '{}' has no implementations", ident);
-            continue;
-        };
-
-        let g = &trait_.generics;
-        let &(loc, ref ranked_path) = replacing_table.get(ident).unwrap();
-        let initial_rank = get_initial_rank(args.recurse_level);
-
-        let make_delegated_items =
-            |ranked_bound: &Path, renamer: &mut crate::GenericRenamer| -> Vec<TokenStream> {
-                trait_
-                    .items
-                    .iter()
-                    .map(|item| match item {
-                        TraitItem::Fn(method) => {
-                            let mut sig = method.sig.clone();
-                            let mut sig_renamer = renamer.clone();
-                            for param in &sig.generics.params {
-                                match param {
-                                    GenericParam::Lifetime(lt) => {
-                                        let lifetime = &lt.lifetime;
-                                        sig_renamer
-                                            .lifetime_renames
-                                            .retain(|(old, _)| old != lifetime);
-                                    }
-                                    GenericParam::Type(tp) => {
-                                        let ident = &tp.ident;
-                                        sig_renamer.ident_renames.retain(|(old, _)| old != ident);
-                                    }
-                                    GenericParam::Const(cp) => {
-                                        let ident = &cp.ident;
-                                        sig_renamer.ident_renames.retain(|(old, _)| old != ident);
-                                    }
-                                }
-                            }
-                            sig_renamer.visit_signature_mut(&mut sig);
-                            let method_ident = &sig.ident;
-                            let call_args: Vec<TokenStream> = sig
-                                .inputs
-                                .iter_mut()
-                                .enumerate()
-                                .map(|(num, arg)| match arg {
-                                    FnArg::Receiver(receiver) => {
-                                        let self_token = &receiver.self_token;
-                                        quote!(#self_token)
-                                    }
-                                    FnArg::Typed(pat_type) => {
-                                        if !matches!(*pat_type.pat, Pat::Ident(_)) {
-                                            *pat_type.pat = Pat::Ident(PatIdent {
-                                                attrs: vec![],
-                                                by_ref: None,
-                                                mutability: None,
-                                                ident: name(format!("param_{}_", num).as_str()),
-                                                subpat: None,
-                                            });
-                                        }
-                                        let pat = &pat_type.pat;
-                                        quote!(#pat)
-                                    }
-                                })
-                                .collect();
-                            quote! {
-                                #sig {
-                                    <Self as #ranked_bound>::#method_ident(#(#call_args),*)
-                                }
-                            }
-                        }
-                        TraitItem::Type(assoc_type) => {
-                            let type_ident = &assoc_type.ident;
-                            let generics = &assoc_type.generics;
-                            quote! {
-                                type #type_ident #generics = <Self as #ranked_bound>::#type_ident;
-                            }
-                        }
-                        TraitItem::Const(assoc_const) => {
-                            let const_ident = &assoc_const.ident;
-                            let ty = &assoc_const.ty;
-                            quote! {
-                                const #const_ident: #ty = <Self as #ranked_bound>::#const_ident;
-                            }
-                        }
-                        _ => quote!(),
-                    })
-                    .collect()
-            };
-
-        output.extend(quote! {
-            #[allow(unused)]
-            #{&trait_.trait_token} #ranked_path #{g.insert(loc, parse_quote!(#{name("Rank")})).ty_generics()}
-            #{trait_.colon_token} #{&trait_.supertraits} {
-                #(for item in &trait_.items) { #item }
-            }
-        });
-
-        for impl_ in impls {
-            let impl_trait_path = impl_.trait_.as_ref().unwrap().1.clone();
-            let make_ranked_path_from_impl = |rank_ty: Type| -> Path {
-                let mut path: Path = parse_quote!(#ranked_path);
-                if let (Some(from), Some(to)) =
-                    (impl_trait_path.segments.last(), path.segments.last_mut())
-                {
-                    to.arguments = from.arguments.clone();
-                }
-                path_insert_type_arg(&mut path, loc, rank_ty);
-                path
-            };
-            let ranked_bound = make_ranked_path_from_impl(initial_rank.clone());
-            let ranked_bound_end = make_ranked_path_from_impl(parse_quote!(()));
-
-            let mut modified_impl = impl_.clone();
-            TraitReplacer(replacing_table.clone(), parse_quote!((#{name("Rank")},)))
-                .visit_path_mut(&mut modified_impl.trait_.as_mut().unwrap().1);
-            TraitReplacer(replacing_table.clone(), parse_quote!(#{name("Rank")}))
-                .visit_item_impl_mut(&mut modified_impl);
-            modified_impl
-                .generics
-                .params
-                .push(parse_quote!(#{name("Rank")}));
-            let ranked_bound_with_rank = make_ranked_path_from_impl(parse_quote!(#{name("Rank")}));
-            modified_impl
-                .generics
-                .where_clause
-                .get_or_insert(WhereClause {
-                    where_token: Default::default(),
-                    predicates: Default::default(),
-                })
-                .predicates
-                .push(parse_quote!(Self: #ranked_bound_with_rank));
-
-            if args.support_infinite_cycle {
-                for (num, item) in modified_impl.items.iter_mut().enumerate() {
-                    if let ImplItem::Fn(ImplItemFn { sig, block, .. }) = item {
-                        let old_block = block.clone();
-                        *block = parse_quote! {
-                            {
-                                let _ = Self::#{name("get_cell")}(#num).set( <Self as #ranked_bound>::#{&sig.ident} as _);
-                                #old_block
-                            }
-                        };
-                    }
-                }
-            }
-
-            let cycle_items: Vec<TokenStream> = impl_
-                .items
-                .iter()
-                .enumerate()
-                .map(|(id, item)| match item {
-                    ImplItem::Fn(method) => {
-                        let mut sig = method.sig.clone();
-                        // ensure that all params are ident
-                        for (num, p) in sig.inputs.iter_mut().enumerate() {
-                            if let FnArg::Typed(PatType { pat, .. }) = p {
-                                if !matches!(pat.as_ref(), Pat::Ident(_)) {
-                                    **pat = Pat::Ident(PatIdent {
-                                        attrs: vec![],
-                                        by_ref: None,
-                                        mutability: None,
-                                        ident: name(format!("param_{}_", num).as_str()),
-                                        subpat: None,
-                                    });
-                                }
-                            }
-                        }
-                        quote! {
-                            #sig {
-                                #(if args.support_infinite_cycle) {
-                                    /// SAFETY:
-                                    #[allow(unused_unsafe)]
-                                    unsafe {
-                                        ::core::mem::transmute::<
-                                            _,
-                                            #{&sig.unsafety} #{&sig.abi}
-                                            fn(
-                                                #(for p in &sig.inputs), {
-                                                    #(if let FnArg::Receiver ( Receiver { ty, .. }) = p) {
-                                                        #ty
-                                                    }
-                                                    #(if let FnArg::Typed ( PatType { ty, .. }) = p) {
-                                                        #ty
-                                                    }
-                                                }
-                                            ) #{&sig.output}
-                                        >(Self::#{name("get_cell")}(#id).get().unwrap())
-                                        (
-                                            #(for p in &sig.inputs), {
-                                                #(if let FnArg::Receiver ( Receiver { self_token, .. }) = p) {
-                                                    #self_token
-                                                }
-                                                #(if let FnArg::Typed ( PatType { pat, .. }) = p) {
-                                                    #pat
-                                                }
-                                            }
-                                        )
-                                    }
-                                }
-                                #(else) {
-                                    ::core::unimplemented!("decycle: cycle limit reached")
-                                }
-                            }
-                        }
-                    }
-                    other => quote!(#other),
-                })
-                .collect();
-
-            let mut impl_generics = impl_.generics.clone();
-            strip_replaced_bounds(&mut impl_generics, &replacing_table);
-            output.extend(quote! {
-                #modified_impl
-
-                #[allow(unused_variables)]
-                impl #{impl_generics.impl_generics()} #ranked_bound_end for #{&impl_.self_ty} #{&impl_generics.where_clause} {
-                    #(#cycle_items)*
-                }
-            });
-            let mut delegated_generics = impl_.generics.clone();
-            strip_replaced_bounds(&mut delegated_generics, &replacing_table);
-            let mut delegated_self_ty = (*impl_.self_ty).clone();
-            let mut delegated_trait_path: Path = parse_quote!(super::#ident);
-            if let Some((_, trait_path, _)) = &impl_.trait_ {
-                if let (Some(from), Some(to)) = (
-                    trait_path.segments.last(),
-                    delegated_trait_path.segments.last_mut(),
-                ) {
-                    to.arguments = from.arguments.clone();
-                }
-            }
-            let mut renamer =
-                crate::randomize_impl_generics(&mut delegated_generics, random_suffix);
-            renamer.visit_type_mut(&mut delegated_self_ty);
-            renamer.visit_path_mut(&mut delegated_trait_path);
-            let mut delegated_ranked_bound = ranked_bound.clone();
-            renamer.visit_path_mut(&mut delegated_ranked_bound);
-            let delegated_items = make_delegated_items(&delegated_ranked_bound, &mut renamer);
-            let ranked_bound_pred: WherePredicate =
-                parse_quote!(#delegated_self_ty: #delegated_ranked_bound);
-            match delegated_generics.where_clause {
-                Some(ref mut where_clause) => where_clause.predicates.push(ranked_bound_pred),
-                None => {
-                    delegated_generics.where_clause = Some(parse_quote!(where #ranked_bound_pred));
-                }
-            }
-            output.extend(quote! {
-                #(for attr in &trait_.attrs) { #attr }
-                impl #{delegated_generics.impl_generics()}
-                #delegated_trait_path for #delegated_self_ty #{&delegated_generics.where_clause}
-                {
-                    #(#delegated_items)*
-                }
-            });
-        }
-    }
+    let _output = TokenStream::new();
+    let initial_rank = get_initial_rank(args.recurse_level);
 
     quote! {
         // this module is to prevent confliction of trait method call between ranked and non-ranked
         // traits
         #[doc(hidden)]
-        mod #{name("shadowing_module")} {
+        mod #{name!("shadowing_module")} {
+
+            #[allow(unused)]
+            #[repr(transparent)]
+            struct #{name!("Wrapper")}<T: ?::core::marker::Sized>(T);
+
+            // This should be `pub` to disturb "private associated type `MyTraitRanked::AssocTy` in public interface"
+            // when deligating MyTrait
+            pub mod #{name!("ranked_traits")} {
+
+                // for ImplSelfTy
+                #[allow(unused)]
+                use super::{ super::*, #{name!("Wrapper")}};
+
+                #(for (trait_, rank_loc, impls) in replacing_table.values()) {
+
+                    // pub trait MyTraitRanked<'a, Ranked, T>
+                    #[allow(unused)]
+                    #[doc(hidden)]
+                    pub trait #{name!("{}Ranked", &trait_.ident)}
+                    #{trait_.generics.insert(*rank_loc, parse_quote!(#{name!("Rank")})).ty_generics()}
+                    #{trait_.colon_token} #{&trait_.supertraits} {
+                        #(for item in &trait_.items) { #{process_trait_item_for_ranked(item)} }
+                    }
+
+                    // impl <
+                    //     'a, Rank, T, SelfTy: MyTrait<'a, T>
+                    // > MyTraitRanked<'a, Rank, T> for SelfTy
+                    impl #{trait_.generics.insert_last(parse_quote!(
+                        #{name!("SelfTy")}: #{&trait_.ident} #{trait_.generics.ty_generics()}
+                    )).insert_last(parse_quote!(#{name!("Rank")})).impl_generics()} #{name!("{}Ranked", &trait_.ident)}
+                    #{trait_.generics.ty_generics().insert(*rank_loc, parse_quote![#{name!("Rank")}])} for #{name!("SelfTy")} {
+                        #{emit_trait_items_delegate(
+                            trait_,
+                            quote!(<Self as #{&trait_.ident} #{trait_.generics.ty_generics()}>),
+                            &parse_quote!(Self)
+                        )}
+                    }
+
+                    #(for impl_ in impls) {
+
+                        #(let g = remove_cyclic_bounds(&impl_.generics, &replacing_table)) {
+                            // impl<'a, T> MyTraitRanked<'a, (), T> for Wrapper<ImplSelfTy>
+                            #[allow(unused_variables)]
+                            impl #{impl_.generics.impl_generics()}
+                            #{name!("{}Ranked", &trait_.ident)}
+                            #{g.ty_generics().insert(*rank_loc, parse_quote![()])}
+                            for #{name!("Wrapper")}<#{&impl_.self_ty}> #{&g.where_clause} {
+                                #{emit_impl_items_leaf(impl_)}
+                            }
+
+                            // impl<'a, T> super::super::MyTrait<'a, T> for ImplSelfTy
+                            //  where Wrapper<Self>: MyTraitRanked<'a, ((((),),),), T>
+                            #(for attr in &impl_.attrs) { #attr }
+                            #{&impl_.defaultness} #{&impl_.unsafety} impl #{g.impl_generics()}
+                            #{&trait_.ident}
+                            #{&impl_.trait_.as_ref().unwrap().1.segments.last().unwrap().arguments}
+                            for #{&impl_.self_ty} #{g.push_predicate(parse_quote!(
+                                #{name!("Wrapper")}<Self>: #{name!("{}Ranked", &trait_.ident)}
+                                #{impl_.generics.ty_generics().insert(*rank_loc, initial_rank.clone())}
+                            )).where_clause}
+                            {
+                                #{emit_impl_items_delegate(impl_, quote!(
+                                    <Self as #{name!("{}Ranked", &trait_.ident)}
+                                    #{impl_.generics.ty_generics().insert(*rank_loc, initial_rank.clone())} >
+                                ))}
+                            }
+                        }
+
+                    }
+                }
+            }
+
             #[allow(unused)]
             use super::*;
 
-            // Remove the non-ranked traits from namespace to prevent conflicting
-            #(for ident in replacing_table.keys()) { trait #ident {} }
+            #(for (trait_, rank_loc, impls) in replacing_table.values()) {
+                #(for impl_ in impls) {
 
-            #(if args.support_infinite_cycle) {
-                #[allow(unused)]
-                trait #{name("GetVTableKey")} {
-                    extern "C" fn #{name("get_vtable_key")}(&self) {}
+                    #[allow(unused)]
+                    use super::super::*;
 
-                    fn #{name("get_cell")}(id: ::core::primitive::usize) -> &'static ::std::sync::OnceLock<::core::primitive::usize> {
-                        use ::std::sync::{Mutex, OnceLock};
-                        use ::std::collections::HashMap;
-                        use ::std::primitive::*;
-                        static VTABLE_MAP_PARSE: OnceLock<Mutex<HashMap<(usize, usize), OnceLock<usize>>>> = OnceLock::new();
-                        let map = VTABLE_MAP_PARSE.get_or_init(|| Mutex::new(HashMap::new()));
-                        let mut map = map.lock().unwrap();
-                        let r = map.entry((Self::#{name("get_vtable_key")} as usize, id)).or_insert(OnceLock::new());
-                        // SAFETY:
-                        unsafe {
-                            ::core::mem::transmute(r)
+                    #(let g = wrap_cyclic_bounds(&impl_.generics, &replacing_table)) {
+                        // impl<'a, Rank, T> ranked_traits::MyTraitRanked<'a, (Rank,), T> for
+                        // Wrapper<ImplSelfTy>
+                        // where
+                        //     Self: ranked_traits::MyTraitRanked<'a, Rank, T>
+                        impl #{g.insert_last(parse_quote!(#{name!("Rank")})).impl_generics()}
+                        #{name!("ranked_traits")}::#{name!("{}Ranked", &trait_.ident)}
+                        #{impl_.trait_.as_ref().unwrap().1.segments.last().unwrap().arguments.insert(*rank_loc, parse_quote!((#{name!("Rank")},)))}
+                        for #{name!("Wrapper")}<#{impl_.self_ty.as_ref()}> #{g.push_predicate(parse_quote!(
+                            Self: #{name!("ranked_traits")}::#{name!("{}Ranked", &trait_.ident)} #{&impl_.trait_.as_ref().unwrap().1.segments.last().unwrap().arguments.insert(*rank_loc, parse_quote!(#{name!("Rank")}))}
+                        )).where_clause} {
+                            #{emit_impl_main(trait_, impl_, &impl_.self_ty)}
                         }
                     }
                 }
-
-                impl<T: ?::core::marker::Sized> #{name("GetVTableKey")} for T {}
             }
-
-            #output
         }
     }
 }

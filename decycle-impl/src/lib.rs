@@ -1,6 +1,6 @@
+use std::collections::HashMap;
 use syn::visit_mut::VisitMut;
 use syn::*;
-
 
 pub mod finalize;
 mod helper;
@@ -15,29 +15,45 @@ pub use process_trait::process_trait;
 
 #[derive(Clone)]
 pub(crate) struct GenericRenamer {
-    pub(crate) lifetime_renames: Vec<(Lifetime, Lifetime)>,
-    pub(crate) ident_renames: Vec<(Ident, Ident)>,
+    pub(crate) lifetime_renames: HashMap<String, Lifetime>,
+    pub(crate) ident_renames: HashMap<String, Ident>,
 }
 
 impl VisitMut for GenericRenamer {
     fn visit_lifetime_mut(&mut self, lt: &mut Lifetime) {
-        for (old, new) in &self.lifetime_renames {
-            if lt == old {
-                *lt = new.clone();
-                return;
-            }
+        if let Some(new) = self.lifetime_renames.get(&lt.ident.to_string()) {
+            *lt = new.clone();
+            return;
         }
         syn::visit_mut::visit_lifetime_mut(self, lt);
     }
 
-    fn visit_ident_mut(&mut self, ident: &mut Ident) {
-        for (old, new) in &self.ident_renames {
-            if ident == old {
-                *ident = new.clone();
-                return;
+    fn visit_type_mut(&mut self, ty: &mut Type) {
+        if let Type::Path(type_path) = ty {
+            if type_path.qself.is_none() && type_path.path.segments.len() == 1 {
+                let segment = &mut type_path.path.segments[0];
+                if matches!(segment.arguments, PathArguments::None) {
+                    if let Some(new) = self.ident_renames.get(&segment.ident.to_string()) {
+                        segment.ident = new.clone();
+                    }
+                }
             }
         }
-        syn::visit_mut::visit_ident_mut(self, ident);
+        syn::visit_mut::visit_type_mut(self, ty);
+    }
+
+    fn visit_expr_mut(&mut self, expr: &mut Expr) {
+        if let Expr::Path(expr_path) = expr {
+            if expr_path.qself.is_none() && expr_path.path.segments.len() == 1 {
+                let segment = &mut expr_path.path.segments[0];
+                if matches!(segment.arguments, PathArguments::None) {
+                    if let Some(new) = self.ident_renames.get(&segment.ident.to_string()) {
+                        segment.ident = new.clone();
+                    }
+                }
+            }
+        }
+        syn::visit_mut::visit_expr_mut(self, expr);
     }
 }
 
@@ -45,8 +61,8 @@ pub(crate) fn randomize_impl_generics(
     generics: &mut Generics,
     random_suffix: u64,
 ) -> GenericRenamer {
-    let mut lifetime_renames: Vec<(Lifetime, Lifetime)> = Vec::new();
-    let mut ident_renames: Vec<(Ident, Ident)> = Vec::new();
+    let mut lifetime_renames: HashMap<String, Lifetime> = HashMap::new();
+    let mut ident_renames: HashMap<String, Ident> = HashMap::new();
 
     for param in &mut generics.params {
         match param {
@@ -55,19 +71,19 @@ pub(crate) fn randomize_impl_generics(
                 let new_name = format!("'{}{}", old.ident, random_suffix);
                 let new = Lifetime::new(&new_name, old.span());
                 lt.lifetime = new.clone();
-                lifetime_renames.push((old, new));
+                lifetime_renames.insert(old.ident.to_string(), new);
             }
             GenericParam::Type(tp) => {
                 let old = tp.ident.clone();
                 let new = Ident::new(&format!("{}{}", old, random_suffix), old.span());
                 tp.ident = new.clone();
-                ident_renames.push((old, new));
+                ident_renames.insert(old.to_string(), new);
             }
             GenericParam::Const(cp) => {
                 let old = cp.ident.clone();
                 let new = Ident::new(&format!("{}{}", old, random_suffix), old.span());
                 cp.ident = new.clone();
-                ident_renames.push((old, new));
+                ident_renames.insert(old.to_string(), new);
             }
         }
     }

@@ -25,10 +25,7 @@ mod generic_loops {
         Boxed<T>: GenB<T>,
     {
         fn lift(value: T) -> Self {
-            Self {
-                value,
-                next: None,
-            }
+            Self { value, next: None }
         }
 
         fn pair(&self, other: &Self, (x, y): (usize, usize)) -> usize {
@@ -299,8 +296,7 @@ mod async_like_loops {
                 RawWaker::new(core::ptr::null(), &VTABLE)
             }
             fn noop(_: *const ()) {}
-            static VTABLE: RawWakerVTable =
-                RawWakerVTable::new(noop_clone, noop, noop, noop);
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(noop_clone, noop, noop, noop);
 
             let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
             let mut cx = Context::from_waker(&waker);

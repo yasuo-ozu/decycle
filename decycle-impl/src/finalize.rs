@@ -181,17 +181,15 @@ fn wrap_cyclic_bounds(
             // - Concrete types matching a self type of a decycled impl
             // External types (e.g. Ident) and generic type parameters
             // don't have ranked impls for Wrapper<T>.
-            let ranked_trait_flag: Type = if let Type::Path(tp) = &ty {
-                if tp.path.is_ident("Self") {
-                    true
-                } else if let Some(last_seg) = tp.path.segments.last() {
-                    replacing_table.contains_key(&last_seg.ident)
-                } else {
-                    replacing_table.contains_key(&last_seg.ident)
-                }
-            } else {
-                false
-            };
+            // let ranked_trait_flag = if let Type::Path(tp) = &ty {
+            //     if tp.path.is_ident("Self") {
+            //         true
+            //     } else if let Some(last_seg) = tp.path.segments.last() {
+            //         replacing_table.contains_key(&last_seg.ident)
+            //     } else {
+            //         replacing_table.contains_key(&last_seg.ident)
+            //     }
+            // };
 
             // if should_wrap {
             return Some((
@@ -606,8 +604,12 @@ fn emit_impl_main(trait_: &ItemTrait, impl_: &ItemImpl, base_self_ty: &Type) -> 
                         ReturnType::Type(_, ty) => type_contains_self(ty),
                     };
 
+                    // let call = quote!(
+                    //     <#base_self_ty as #impl_mock_path>::#{name!("{}_mocked_", &impl_item_fn.sig.ident)}(#args)
+                    // );
+
                     let call = quote!(
-                        <#base_self_ty as #impl_mock_path>::#{name!("{}_mocked_", &impl_item_fn.sig.ident)}(#args)
+                        <#{&impl_.self_ty} as #{&impl_.trait_.as_ref().unwrap().1}>::#{&impl_item_fn.sig.ident}(#args)
                     );
 
                     // When the return type contains Self, the mock returns with
@@ -630,36 +632,42 @@ fn emit_impl_main(trait_: &ItemTrait, impl_: &ItemImpl, base_self_ty: &Type) -> 
 
                     output.extend(quote!(
                         #{&impl_item_fn.defaultness} #{&sig_outer}{
-                            trait #{name!("{}Mock", &trait_.ident)} #{trait_.generics.impl_generics()} {
-                                #(for item in &trait_.items) {
-                                    #(if !matches!(item, TraitItem::Fn(_))) {
-                                        #item
-                                    }
-                                }
-                                #{
-                                    let mut ti = trait_item_fn.clone();
-                                    ti.sig.ident = name!("{}_mocked_", &ti.sig.ident);
-                                    ti.default = None;
-                                    ti.semi_token = Default::default();
-                                    ti
-                                }
-                            }
-                            impl #{impl_.generics.impl_generics()} #impl_mock_path for #base_self_ty
-                            #{&impl_.generics.where_clause} {
-                                #(for item in &impl_.items) {
-                                    #(if !matches!(item, ImplItem::Fn(_))) {
-                                        #item
-                                    }
-                                }
-                                #{
-                                    let mut ii = impl_item_fn.clone();
-                                    ii.sig.ident = name!("{}_mocked_", &ii.sig.ident);
-                                    ii
-                                }
-                            }
                             #body
                         }
                     ));
+
+                    // output.extend(quote!(
+                    //     #{&impl_item_fn.defaultness} #{&sig_outer}{
+                    //         trait #{name!("{}Mock", &trait_.ident)} #{trait_.generics.impl_generics()} {
+                    //             #(for item in &trait_.items) {
+                    //                 #(if !matches!(item, TraitItem::Fn(_))) {
+                    //                     #item
+                    //                 }
+                    //             }
+                    //             #{
+                    //                 let mut ti = trait_item_fn.clone();
+                    //                 ti.sig.ident = name!("{}_mocked_", &ti.sig.ident);
+                    //                 ti.default = None;
+                    //                 ti.semi_token = Default::default();
+                    //                 ti
+                    //             }
+                    //         }
+                    //         impl #{impl_.generics.impl_generics()} #impl_mock_path for #base_self_ty
+                    //         #{&impl_.generics.where_clause} {
+                    //             #(for item in &impl_.items) {
+                    //                 #(if !matches!(item, ImplItem::Fn(_))) {
+                    //                     #item
+                    //                 }
+                    //             }
+                    //             #{
+                    //                 let mut ii = impl_item_fn.clone();
+                    //                 ii.sig.ident = name!("{}_mocked_", &ii.sig.ident);
+                    //                 ii
+                    //             }
+                    //         }
+                    //         #body
+                    //     }
+                    // ));
                 } else {
                     output.extend(quote!(#item));
                 }

@@ -9,6 +9,12 @@ pub trait MyTrait<'a> {
         0
     }
 }
+
+impl MyTrait<'static> for () {
+    type MyTrait = ();
+    type T = ();
+}
+
 #[decycle]
 mod m {
     #[decycle]
@@ -16,7 +22,7 @@ mod m {
     struct MyStruct<'a, 'b, const N: usize, T> {
         _marker: ::core::marker::PhantomData<(&'a T, &'b [(); N])>,
     }
-    #[automatically_derived]
+
     impl<'a, 'b, const N: usize, T> MyTrait<'a> for MyStruct<'a, 'b, N, T>
     where
         (): MyTrait<'b, MyTrait = T, T = T>,

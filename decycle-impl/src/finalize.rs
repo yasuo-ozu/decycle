@@ -128,9 +128,11 @@ fn remove_wrapper_cycle_bounds(
         {
             if let Type::Path(tp) = &ty {
                 if !tp.path.is_ident("Self") {
-                    let is_self_type = tp.path.segments.last().map_or(false, |s| {
-                        self_type_idents.contains(&s.ident.to_string())
-                    });
+                    let is_self_type = tp
+                        .path
+                        .segments
+                        .last()
+                        .map_or(false, |s| self_type_idents.contains(&s.ident.to_string()));
                     if !is_self_type && type_contains_cycle_participant(&ty, &self_type_idents) {
                         return None;
                     }
@@ -160,53 +162,46 @@ fn wrap_cyclic_bounds(
         })
         .collect();
 
-    // Collect additional ranked predicates for cycle participants found
-    // inside wrapper types.
-    let extra_predicates: std::cell::RefCell<Vec<WherePredicate>> =
-        std::cell::RefCell::new(Vec::new());
-
     let mut g = generics.clone();
     replace_constraints(&mut g, |ty, trait_path| {
         if trait_path.segments.len() != 1 {
             return Some((ty, trait_path));
         }
-        if let Some((trait_, ix, _)) =
-            replacing_table.get(&trait_path.segments.last().unwrap().ident)
-        {
-            // Only wrap bounds on path types that could have decycled impls.
-            // Non-path types ((), tuples, references, etc.) cannot participate
-            // in trait cycles, so keep their bounds as-is.
-            if !matches!(&ty, Type::Path(_)) {
-                return Some((ty, trait_path));
-            }
+        let last_ident = &trait_path.segments.last().unwrap().ident;
+        if let Some((trait_, ix, _)) = replacing_table.get(last_ident) {
+            // // Only wrap bounds on path types that could have decycled impls.
+            // // Non-path types ((), tuples, references, etc.) cannot participate
+            // // in trait cycles, so keep their bounds as-is.
+            // if !matches!(&ty, Type::Path(_)) {
+            //     return Some((ty, trait_path));
+            // }
 
             // Only wrap types that directly participate in cycles:
             // - Self keyword (refers to the impl's self type)
             // - Concrete types matching a self type of a decycled impl
             // External types (e.g. Ident) and generic type parameters
             // don't have ranked impls for Wrapper<T>.
-            let should_wrap = if let Type::Path(tp) = &ty {
+            let ranked_trait_flag: Type = if let Type::Path(tp) = &ty {
                 if tp.path.is_ident("Self") {
                     true
                 } else if let Some(last_seg) = tp.path.segments.last() {
-                    let ident_str = last_seg.ident.to_string();
-                    self_type_idents.contains(&ident_str)
+                    replacing_table.contains_key(&last_seg.ident)
                 } else {
-                    false
+                    replacing_table.contains_key(&last_seg.ident)
                 }
             } else {
                 false
             };
 
-            if should_wrap {
-                return Some((
-                    parse_quote!(#{name!("Wrapper")}<#ty>),
-                    parse_quote!(
-                        #{name!("ranked_traits")}::#{name!("{}Ranked", &trait_.ident)}
-                        #{trait_path.segments.last().unwrap().arguments.insert(*ix, parse_quote![()]).insert(*ix, parse_quote![#{name!("Rank")}])}
-                    ),
-                ));
-            }
+            // if should_wrap {
+            return Some((
+                parse_quote!(#{name!("Wrapper")}<#ty>),
+                parse_quote!(
+                    #{name!("ranked_traits")}::#{name!("{}Ranked", &trait_.ident)}
+                    #{trait_path.segments.last().unwrap().arguments.insert(*ix, parse_quote![()]).insert(*ix, parse_quote![#{name!("Rank")}])}
+                ),
+            ));
+            // }
 
             // For wrapper types containing cycle participants in their type
             // arguments (e.g., `Box<B<S>>: Parse<Atom>`): remove the bound
@@ -1179,9 +1174,9 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
 
                     #(let g = {
                         let mut g = wrap_cyclic_bounds(&impl_.generics, &replacing_table);
-                        for bound in collect_transitive_bounds(&trait_.ident, &replacing_table) {
-                            g = g.push_predicate(bound);
-                        }
+                        // for bound in collect_transitive_bounds(&trait_.ident, &replacing_table) {
+                        //     g = g.push_predicate(bound);
+                        // }
                         g
                     }) {
                         // impl<'a, Rank, T> ranked_traits::MyTraitRanked<'a, (Rank,), (), T> for

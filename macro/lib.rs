@@ -15,6 +15,7 @@ struct Args {
     alter_macro_name: Option<Ident>,
     allowed_paths: Option<Vec<Path>>,
     recurse_level: Option<usize>,
+    support_infinite_cycle: Option<bool>,
 }
 
 impl Parse for Args {
@@ -25,12 +26,14 @@ impl Parse for Args {
             alter_macro_name: None,
             allowed_paths: None,
             recurse_level: None,
+            support_infinite_cycle: None,
         };
         syn::custom_keyword!(decycle);
         syn::custom_keyword!(marker);
         syn::custom_keyword!(alter_macro_name);
         syn::custom_keyword!(allowed_paths);
         syn::custom_keyword!(recurse_level);
+        syn::custom_keyword!(support_infinite_cycle);
         while !input.is_empty() {
             let lookahead = input.lookahead1();
             if lookahead.peek(decycle) {
@@ -57,10 +60,15 @@ impl Parse for Args {
                 input.parse::<Token![=]>()?;
                 let lit: LitInt = input.parse()?;
                 args.recurse_level = Some(lit.base10_parse()?);
+            } else if lookahead.peek(support_infinite_cycle) {
+                input.parse::<support_infinite_cycle>()?;
+                input.parse::<Token![=]>()?;
+                let lit: LitBool = input.parse()?;
+                args.support_infinite_cycle = Some(lit.value);
             } else {
                 abort!(
                     input.span(),
-                    "keyword arguments should be one of 'decycle', 'marker', 'alter_macro_name', 'allowed_paths', 'recurse_level'"
+                    "keyword arguments should be one of 'decycle', 'marker', 'alter_macro_name', 'allowed_paths', 'recurse_level', 'support_infinite_cycle'"
                 )
             }
             if input.parse::<Token![,]>().is_err() {
@@ -80,8 +88,11 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
 
     if let Ok(module) = parse::<ItemMod>(input.clone()) {
         let recurse_level = args.recurse_level.unwrap_or(10);
-        let ret = std::panic::catch_unwind(|| process_module(module, &decycle_path, recurse_level))
-            .unwrap_or_else(|e| std::panic::resume_unwind(e));
+        let support_infinite_cycle = args.support_infinite_cycle.unwrap_or(true);
+        let ret = std::panic::catch_unwind(|| {
+            process_module(module, &decycle_path, recurse_level, support_infinite_cycle)
+        })
+        .unwrap_or_else(|e| std::panic::resume_unwind(e));
         set_dummy(quote!(#ret));
         if let Some(marker) = &args.marker {
             abort!(marker, "unsupported argument 'marker'")
@@ -113,6 +124,12 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
             abort!(
                 Span::call_site(),
                 "recurse_level is not supported for trait items"
+            )
+        }
+        if args.support_infinite_cycle.is_some() {
+            abort!(
+                Span::call_site(),
+                "support_infinite_cycle is not supported for trait items"
             )
         }
         ret.into()

@@ -27,6 +27,104 @@ fn name(s: &str) -> Ident {
     Ident::new(&format!("{}{}", s, suffix), Span::call_site())
 }
 
+/// Rewrites single-segment trait paths that match the replacing table to their
+/// ranked equivalents. E.g., `Evaluate` → `ranked_traits::EvaluateRanked<Rank, ()>`.
+///
+/// Applied twice per inductive impl:
+/// 1. With `rank_type = (Rank,)` on the impl's trait path only
+/// 2. With `rank_type = Rank` on the entire impl (where clause + body)
+struct TraitReplacer {
+    /// Maps original trait ident (e.g., "Evaluate") to (rank_loc, ranked_path)
+    /// where ranked_path is a multi-segment path like `ranked_traits::EvaluateRanked`
+    table: HashMap<Ident, (usize, Path)>,
+    /// The rank type to insert at rank_loc
+    rank_type: Type,
+    /// The flag type to insert at rank_loc + 1 (after rank insertion)
+    flag_type: Type,
+}
+
+impl TraitReplacer {
+    /// Try to rewrite a single-segment path that matches a trait ident in the table.
+    /// Returns true if a replacement was made.
+    fn try_replace_path(&self, path: &mut Path) -> bool {
+        if path.segments.len() == 1 {
+            if let Some((rank_loc, replacement)) = self.table.get(&path.segments[0].ident) {
+                let orig_args =
+                    std::mem::replace(&mut path.segments[0].arguments, PathArguments::None);
+                let mut new_path = replacement.clone();
+                new_path.segments.last_mut().unwrap().arguments = orig_args;
+                path_insert_type_arg(&mut new_path, *rank_loc, self.flag_type.clone());
+                path_insert_type_arg(&mut new_path, *rank_loc, self.rank_type.clone());
+                *path = new_path;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Handle paths with QSelf like `<_ as Trait>::method` or `<T as Trait>::AssocType`.
+    /// The trait name appears as the first segment(s) before the QSelf position.
+    fn try_replace_qself_path(&self, qself: &mut Option<QSelf>, path: &mut Path) -> bool {
+        if let Some(ref mut qs) = qself {
+            // In `<_ as Trait>::method`, qself.position is 1 and path is `Trait::method`.
+            // Check if the first segment is a trait in our table.
+            if qs.position > 0 && qs.position <= path.segments.len() {
+                let first_ident = &path.segments[0].ident;
+                if let Some((rank_loc, replacement)) = self.table.get(first_ident) {
+                    let orig_args =
+                        std::mem::replace(&mut path.segments[0].arguments, PathArguments::None);
+                    // Build the replacement: replace segments[0] with the ranked path segments
+                    let mut new_segments: Punctuated<PathSegment, Token![::]> = Punctuated::new();
+                    for seg in &replacement.segments {
+                        new_segments.push(seg.clone());
+                    }
+                    // Apply original type args + insert rank/flag on the last replacement segment
+                    new_segments.last_mut().unwrap().arguments = orig_args;
+                    {
+                        let last_seg = new_segments.last_mut().unwrap();
+                        let mut temp_path: Path = Path {
+                            leading_colon: None,
+                            segments: std::iter::once(last_seg.clone()).collect(),
+                        };
+                        path_insert_type_arg(&mut temp_path, *rank_loc, self.flag_type.clone());
+                        path_insert_type_arg(&mut temp_path, *rank_loc, self.rank_type.clone());
+                        *last_seg = temp_path.segments.into_iter().next().unwrap();
+                    }
+                    // Append remaining segments after the trait (e.g., `::method`)
+                    for seg in path.segments.iter().skip(1) {
+                        new_segments.push(seg.clone());
+                    }
+                    // Update QSelf position to account for the replacement having more segments
+                    qs.position = qs.position - 1 + replacement.segments.len();
+                    path.segments = new_segments;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+impl syn::visit_mut::VisitMut for TraitReplacer {
+    fn visit_path_mut(&mut self, path: &mut Path) {
+        if !self.try_replace_path(path) {
+            syn::visit_mut::visit_path_mut(self, path);
+        }
+    }
+
+    fn visit_expr_path_mut(&mut self, expr_path: &mut ExprPath) {
+        if !self.try_replace_qself_path(&mut expr_path.qself, &mut expr_path.path) {
+            syn::visit_mut::visit_expr_path_mut(self, expr_path);
+        }
+    }
+
+    fn visit_type_path_mut(&mut self, type_path: &mut TypePath) {
+        if !self.try_replace_qself_path(&mut type_path.qself, &mut type_path.path) {
+            syn::visit_mut::visit_type_path_mut(self, type_path);
+        }
+    }
+}
+
 fn remove_cyclic_bounds(
     generics: &Generics,
     replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
@@ -42,262 +140,28 @@ fn remove_cyclic_bounds(
     g
 }
 
-/// Check if a type's arguments contain any cycle participant types.
-/// Returns true if the type itself is not a cycle participant but contains
-/// cycle participants in its type arguments (e.g., `Box<B<S>>` where `B` is a
-/// cycle participant).
-fn type_contains_cycle_participant(
-    ty: &Type,
-    self_type_idents: &std::collections::HashSet<String>,
-) -> bool {
-    !find_cycle_participants_in_type(ty, self_type_idents).is_empty()
-}
-
-/// Find all cycle participant types within a type's arguments.
-/// Returns the full type paths of cycle participants found (e.g., `B<S>` from `Box<B<S>>`).
-fn find_cycle_participants_in_type(
-    ty: &Type,
-    self_type_idents: &std::collections::HashSet<String>,
-) -> Vec<Type> {
-    use syn::visit::Visit;
-    struct CycleParticipantCollector<'a> {
-        self_type_idents: &'a std::collections::HashSet<String>,
-        found: Vec<Type>,
-    }
-    impl<'ast, 'a> Visit<'ast> for CycleParticipantCollector<'a> {
-        fn visit_type_path(&mut self, tp: &'ast TypePath) {
-            if tp.qself.is_none() {
-                if let Some(last_seg) = tp.path.segments.last() {
-                    if self.self_type_idents.contains(&last_seg.ident.to_string()) {
-                        self.found.push(Type::Path(tp.clone()));
-                        return;
-                    }
-                }
-                if tp.path.is_ident("Self") {
-                    self.found.push(Type::Path(tp.clone()));
-                    return;
-                }
-            }
-            syn::visit::visit_type_path(self, tp);
-        }
-    }
-    let mut collector = CycleParticipantCollector {
-        self_type_idents,
-        found: Vec::new(),
-    };
-    // Only visit the type arguments, not the root type itself
-    if let Type::Path(tp) = ty {
-        for seg in &tp.path.segments {
-            if let PathArguments::AngleBracketed(args) = &seg.arguments {
-                for arg in &args.args {
-                    collector.visit_generic_argument(arg);
-                }
-            }
-        }
-    }
-    collector.found
-}
-
-/// Remove bounds on decycled traits where the bounded type is a wrapper
-/// containing cycle participants (e.g., `Box<B<S>>: Parse<Atom>`).
-/// These bounds create cycles through final impls that reset rank.
-fn remove_wrapper_cycle_bounds(
-    generics: &Generics,
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
-) -> Generics {
-    let self_type_idents: std::collections::HashSet<String> = replacing_table
-        .values()
-        .flat_map(|(_, _, impls)| impls.iter())
-        .filter_map(|impl_| {
-            if let Type::Path(tp) = impl_.self_ty.as_ref() {
-                tp.path.segments.last().map(|s| s.ident.to_string())
+/// Returns true if the signature has type or const generic parameters
+/// (not just lifetimes), or has `impl Trait` in argument position.
+/// Such methods can't be stored as function pointers in the vtable
+/// because they're not monomorphized yet.
+fn sig_has_type_params(sig: &Signature) -> bool {
+    sig.generics
+        .params
+        .iter()
+        .any(|p| !matches!(p, GenericParam::Lifetime(_)))
+        || sig.inputs.iter().any(|input| {
+            if let FnArg::Typed(PatType { ty, .. }) = input {
+                matches!(**ty, Type::ImplTrait(_))
             } else {
-                None
+                false
             }
         })
-        .collect();
-
-    let mut g = generics.clone();
-    replace_constraints(&mut g, |ty, trait_path| {
-        if trait_path.segments.len() != 1 {
-            return Some((ty, trait_path));
-        }
-        if replacing_table
-            .get(&trait_path.segments.last().unwrap().ident)
-            .is_some()
-        {
-            if let Type::Path(tp) = &ty {
-                if !tp.path.is_ident("Self") {
-                    let is_self_type = tp
-                        .path
-                        .segments
-                        .last()
-                        .map_or(false, |s| self_type_idents.contains(&s.ident.to_string()));
-                    if !is_self_type && type_contains_cycle_participant(&ty, &self_type_idents) {
-                        return None;
-                    }
-                }
-            }
-        }
-        Some((ty, trait_path))
-    });
-    g
 }
 
-fn wrap_cyclic_bounds(
-    generics: &Generics,
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
-) -> Generics {
-    // Collect self type root idents from all decycled impls — only these
-    // concrete types participate in cycles and need wrapping.
-    let self_type_idents: std::collections::HashSet<String> = replacing_table
-        .values()
-        .flat_map(|(_, _, impls)| impls.iter())
-        .filter_map(|impl_| {
-            if let Type::Path(tp) = impl_.self_ty.as_ref() {
-                tp.path.segments.last().map(|s| s.ident.to_string())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let mut g = generics.clone();
-    replace_constraints(&mut g, |ty, trait_path| {
-        if trait_path.segments.len() != 1 {
-            return Some((ty, trait_path));
-        }
-        let last_ident = &trait_path.segments.last().unwrap().ident;
-        if let Some((trait_, ix, _)) = replacing_table.get(last_ident) {
-            // // Only wrap bounds on path types that could have decycled impls.
-            // // Non-path types ((), tuples, references, etc.) cannot participate
-            // // in trait cycles, so keep their bounds as-is.
-            // if !matches!(&ty, Type::Path(_)) {
-            //     return Some((ty, trait_path));
-            // }
-
-            // Only wrap types that directly participate in cycles:
-            // - Self keyword (refers to the impl's self type)
-            // - Concrete types matching a self type of a decycled impl
-            // External types (e.g. Ident) and generic type parameters
-            // don't have ranked impls for Wrapper<T>.
-            // let ranked_trait_flag = if let Type::Path(tp) = &ty {
-            //     if tp.path.is_ident("Self") {
-            //         true
-            //     } else if let Some(last_seg) = tp.path.segments.last() {
-            //         replacing_table.contains_key(&last_seg.ident)
-            //     } else {
-            //         replacing_table.contains_key(&last_seg.ident)
-            //     }
-            // };
-
-            // if should_wrap {
-            return Some((
-                parse_quote!(#{name!("Wrapper")}<#ty>),
-                parse_quote!(
-                    #{name!("ranked_traits")}::#{name!("{}Ranked", &trait_.ident)}
-                    #{trait_path.segments.last().unwrap().arguments.insert(*ix, parse_quote![()]).insert(*ix, parse_quote![#{name!("Rank")}])}
-                ),
-            ));
-            // }
-
-            // For wrapper types containing cycle participants in their type
-            // arguments (e.g., `Box<B<S>>: Parse<Atom>`): remove the bound
-            // from the inductive step's WHERE clause. These bounds would
-            // create cycles through final impls (which reset rank to
-            // InitialRank). The mock impl uses the original WHERE clause
-            // and can satisfy these through the final impls' ranked chains.
-            if type_contains_cycle_participant(&ty, &self_type_idents) {
-                return None;
-            }
-
-            Some((ty, trait_path))
-        } else {
-            Some((ty, trait_path))
-        }
-    });
-    g
-}
-
-/// Collect non-cycle-participant bounds from all impls of a given trait.
-/// These bounds are needed transitively when the mock impl's cycle-participant
-/// bounds are proved through the final impl → ranked chain. By adding them
-/// to the outer inductive step's where clause, they become available in the
-/// param_env for nested trait resolution.
-fn collect_transitive_bounds(
-    trait_ident: &Ident,
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
-) -> Vec<WherePredicate> {
-    let self_type_idents: std::collections::HashSet<String> = replacing_table
-        .values()
-        .flat_map(|(_, _, impls)| impls.iter())
-        .filter_map(|impl_| {
-            if let Type::Path(tp) = impl_.self_ty.as_ref() {
-                tp.path.segments.last().map(|s| s.ident.to_string())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let mut bounds = Vec::new();
-
-    if let Some((_, _, impls)) = replacing_table.get(trait_ident) {
-        for impl_ in impls {
-            // Collect from generic param bounds (e.g., `impl<K: Hash + Eq, ...>`)
-            for param in &impl_.generics.params {
-                if let GenericParam::Type(tp) = param {
-                    let is_participant = self_type_idents.contains(&tp.ident.to_string());
-                    if !is_participant && !tp.bounds.is_empty() {
-                        bounds.push(WherePredicate::Type(PredicateType {
-                            lifetimes: None,
-                            bounded_ty: Type::Path(TypePath {
-                                qself: None,
-                                path: tp.ident.clone().into(),
-                            }),
-                            colon_token: Default::default(),
-                            bounds: tp.bounds.clone(),
-                        }));
-                    }
-                }
-            }
-
-            // Collect from where clause predicates
-            if let Some(wc) = &impl_.generics.where_clause {
-                for pred in &wc.predicates {
-                    if let WherePredicate::Type(pt) = pred {
-                        let bounded_ty = &pt.bounded_ty;
-
-                        // Skip if bounded type is a cycle participant
-                        let is_participant = if let Type::Path(tp) = bounded_ty {
-                            tp.path.is_ident("Self")
-                                || tp.path.segments.last().map_or(false, |s| {
-                                    self_type_idents.contains(&s.ident.to_string())
-                                })
-                        } else {
-                            false
-                        };
-
-                        // Skip if bounded type contains cycle participants
-                        let contains_participant =
-                            type_contains_cycle_participant(bounded_ty, &self_type_idents);
-
-                        if !is_participant && !contains_participant {
-                            bounds.push(pred.clone());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    bounds
-}
-
-fn emit_impl_items_leaf(impl_: &ItemImpl) -> TokenStream {
+fn emit_impl_items_leaf(impl_: &ItemImpl, support_infinite_cycle: bool) -> TokenStream {
     let mut output = TokenStream::new();
 
-    for (_ix, item) in impl_.items.iter().enumerate() {
+    for (ix, item) in impl_.items.iter().enumerate() {
         match item {
             ImplItem::Fn(ImplItemFn {
                 defaultness, sig, ..
@@ -308,14 +172,55 @@ fn emit_impl_items_leaf(impl_: &ItemImpl) -> TokenStream {
                 // Only desugar impl Trait (pass Self as replacement = no-op for Self).
                 replace_self_and_desugar_impl_trait(&mut sig, &parse_quote!(Self));
 
-                for (ix, input) in sig.inputs.iter_mut().enumerate() {
-                    input.reduce_pat(ix);
+                for (param_ix, input) in sig.inputs.iter_mut().enumerate() {
+                    input.reduce_pat(param_ix);
                 }
-                output.extend(quote! {
-                    #defaultness #sig {
-                        ::core::unimplemented!("decycle: cycle limit reached")
-                    }
-                });
+
+                // Can't use vtable for methods with type/const params —
+                // generic methods can't be coerced to a single function pointer.
+                if support_infinite_cycle && !sig_has_type_params(&sig) {
+                    let fn_type_params: Vec<TokenStream> = sig
+                        .inputs
+                        .iter()
+                        .map(|p| match p {
+                            FnArg::Receiver(Receiver { ty, .. }) => quote!(#ty),
+                            FnArg::Typed(PatType { ty, .. }) => quote!(#ty),
+                        })
+                        .collect();
+
+                    let fn_call_args: Vec<TokenStream> = sig
+                        .inputs
+                        .iter()
+                        .map(|p| match p {
+                            FnArg::Receiver(Receiver { self_token, .. }) => quote!(#self_token),
+                            FnArg::Typed(PatType { pat, .. }) => quote!(#pat),
+                        })
+                        .collect();
+
+                    output.extend(quote! {
+                        #defaultness #sig {
+                            #[allow(unused_unsafe)]
+                            unsafe {
+                                ::core::mem::transmute::<
+                                    _,
+                                    #{&sig.unsafety} #{&sig.abi}
+                                    fn(
+                                        #(#fn_type_params),*
+                                    ) #{&sig.output}
+                                >(Self::#{name!("get_cell")}(#ix).get().unwrap())
+                                (
+                                    #(#fn_call_args),*
+                                )
+                            }
+                        }
+                    });
+                } else {
+                    output.extend(quote! {
+                        #defaultness #sig {
+                            ::core::unimplemented!("decycle: cycle limit reached")
+                        }
+                    });
+                }
             }
             o => output.extend(quote!(#o)),
         }
@@ -398,336 +303,6 @@ fn emit_impl_items_delegate(impl_: &ItemImpl, path: TokenStream) -> TokenStream 
     output
 }
 
-/// Like `emit_impl_items_delegate` but delegates through `Wrapper<Self>`,
-/// using pointer casts since `Wrapper` is `#[repr(transparent)]`.
-fn emit_impl_items_delegate_via_wrapper(
-    trait_: &ItemTrait,
-    impl_: &ItemImpl,
-    path: TokenStream,
-) -> TokenStream {
-    let mut output = TokenStream::new();
-    for item in &impl_.items {
-        match item {
-            ImplItem::Fn(ImplItemFn {
-                sig, defaultness, ..
-            }) => {
-                // Find corresponding trait method to check Self in types
-                let trait_item_fn = trait_.items.iter().find_map(|ti| match ti {
-                    TraitItem::Fn(tif) if tif.sig.ident == sig.ident => Some(tif),
-                    _ => None,
-                });
-                let trait_inputs: Vec<_> = trait_item_fn
-                    .map(|tif| tif.sig.inputs.iter().collect())
-                    .unwrap_or_default();
-
-                let mut sig = sig.clone();
-                let wrapper_name = name!("Wrapper");
-                let args = sig
-                    .inputs
-                    .iter_mut()
-                    .enumerate()
-                    .map(|(ix, input)| {
-                        input.reduce_pat(ix);
-                        match input {
-                            FnArg::Receiver(Receiver {
-                                reference,
-                                mutability,
-                                self_token,
-                                ty,
-                                ..
-                            }) => {
-                                // Wrap Self → Wrapper<Self> via repr(transparent) pointer cast
-                                if reference.is_some() {
-                                    if mutability.is_some() {
-                                        quote!(unsafe { &mut *(#self_token as *mut Self as *mut #wrapper_name<Self>) })
-                                    } else {
-                                        quote!(unsafe { &*(#self_token as *const Self as *const #wrapper_name<Self>) })
-                                    }
-                                } else if is_plain_self_type(ty) {
-                                    quote!(#wrapper_name(#self_token))
-                                } else {
-                                    // Complex receiver like Box<Self>: use ptr::read + forget
-                                    let wrapped_ty: Type = replace_self_in_type(ty, &parse_quote!(#wrapper_name<Self>));
-                                    quote!(unsafe {
-                                        let __raw = &#self_token as *const _ as *const #wrapped_ty;
-                                        let __result = ::core::ptr::read(__raw);
-                                        ::core::mem::forget(#self_token);
-                                        __result
-                                    })
-                                }
-                            }
-                            FnArg::Typed(PatType { pat, .. }) => {
-                                // Check trait's corresponding arg for Self
-                                if let Some(FnArg::Typed(PatType { ty: trait_ty, .. })) =
-                                    trait_inputs.get(ix).copied()
-                                {
-                                    if type_contains_self(trait_ty) {
-                                        quote!(unsafe { &*(#pat as *const _ as *const #wrapper_name<Self>) })
-                                    } else {
-                                        quote!(#pat)
-                                    }
-                                } else {
-                                    quote!(#pat)
-                                }
-                            }
-                        }
-                    })
-                    .collect::<Punctuated<_, Token![,]>>();
-
-                // Check if return type contains Self
-                let return_contains_self = trait_item_fn
-                    .map(|tif| match &tif.sig.output {
-                        ReturnType::Default => false,
-                        ReturnType::Type(_, ty) => type_contains_self(ty),
-                    })
-                    .unwrap_or(false);
-
-                let call = quote!(#path::#{&sig.ident}(#args));
-                // When the return type contains Self, the ranked method returns
-                // with Self=Wrapper<SelfTy> but we need Self=SelfTy.
-                // Since Wrapper is repr(transparent), they have identical
-                // layout, so we reinterpret via ptr::read + forget.
-                let body = if return_contains_self {
-                    quote!({
-                        let __ranked_result = unsafe { #call };
-                        unsafe {
-                            let __raw = &__ranked_result as *const _ as *const _;
-                            let __converted = ::core::ptr::read(__raw);
-                            ::core::mem::forget(__ranked_result);
-                            __converted
-                        }
-                    })
-                } else {
-                    quote!(unsafe { #call })
-                };
-
-                output.extend(quote! {
-                    #defaultness #sig {
-                        #body
-                    }
-                })
-            }
-            ImplItem::Type(ImplItemType {
-                ident, generics, ..
-            }) => output.extend(quote! {
-                type #ident #generics = #path::#ident;
-            }),
-            ImplItem::Const(ImplItemConst { ident, ty, .. }) => output.extend(quote! {
-                const #ident: #ty = #path::#ident;
-            }),
-            _ => unimplemented!(),
-        }
-    }
-    output
-}
-
-fn emit_impl_main(trait_: &ItemTrait, impl_: &ItemImpl, base_self_ty: &Type) -> TokenStream {
-    let mut output = TokenStream::new();
-    for item in &impl_.items {
-        match item {
-            ImplItem::Fn(impl_item_fn) => {
-                if let Some(trait_item_fn) = trait_.items.iter().find_map(|item| match item {
-                    TraitItem::Fn(trait_item_fn)
-                        if &trait_item_fn.sig.ident == &impl_item_fn.sig.ident =>
-                    {
-                        Some(trait_item_fn)
-                    }
-                    _ => None,
-                }) {
-                    let impl_mock_path = quote!(
-                        #{name!("{}Mock", &trait_.ident)}
-                        #{&impl_.trait_.as_ref().unwrap().1.segments.last().unwrap().arguments}
-                    );
-                    // Don't replace Self in outer sig — the inductive step impl is
-                    // for Wrapper<SelfTy>, so Self = Wrapper<SelfTy>.
-                    let mut sig_outer = impl_item_fn.sig.clone();
-                    replace_self_and_desugar_impl_trait(&mut sig_outer, &parse_quote!(Self));
-
-                    // Build args: convert from Wrapper<SelfTy> to SelfTy for mock call
-                    let trait_inputs: Vec<_> = trait_item_fn.sig.inputs.iter().collect();
-                    let args = sig_outer
-                        .inputs
-                        .iter_mut()
-                        .enumerate()
-                        .map(|(ix, input)| {
-                            input.reduce_pat(ix);
-                            match input {
-                                FnArg::Receiver(Receiver {
-                                    reference,
-                                    mutability,
-                                    self_token,
-                                    ty,
-                                    ..
-                                }) => {
-                                    // Unwrap Wrapper<SelfTy> → SelfTy
-                                    if reference.is_some() {
-                                        if mutability.is_some() {
-                                            quote!(&mut #self_token.0)
-                                        } else {
-                                            quote!(&#self_token.0)
-                                        }
-                                    } else if is_plain_self_type(ty) {
-                                        quote!(#self_token.0)
-                                    } else {
-                                        // Complex receiver like Box<Self>: use ptr::read + forget
-                                        let unwrapped_ty = replace_self_in_type(ty, base_self_ty);
-                                        quote!(unsafe {
-                                            let __raw = &#self_token as *const _ as *const #unwrapped_ty;
-                                            let __result = ::core::ptr::read(__raw);
-                                            ::core::mem::forget(#self_token);
-                                            __result
-                                        })
-                                    }
-                                }
-                                FnArg::Typed(PatType { pat, .. }) => {
-                                    // Check trait's corresponding arg for Self
-                                    if let Some(FnArg::Typed(PatType { ty: trait_ty, .. })) =
-                                        trait_inputs.get(ix).copied()
-                                    {
-                                        if type_contains_self(trait_ty) {
-                                            // Convert Wrapper-based to bare via .0
-                                            quote!(unsafe { &*(#pat as *const _ as *const #base_self_ty) })
-                                        } else {
-                                            quote!(#pat)
-                                        }
-                                    } else {
-                                        quote!(#pat)
-                                    }
-                                }
-                            }
-                        })
-                        .collect::<Punctuated<_, Token![,]>>();
-
-                    // Check if return type contains Self
-                    let return_contains_self = match &trait_item_fn.sig.output {
-                        ReturnType::Default => false,
-                        ReturnType::Type(_, ty) => type_contains_self(ty),
-                    };
-
-                    // let call = quote!(
-                    //     <#base_self_ty as #impl_mock_path>::#{name!("{}_mocked_", &impl_item_fn.sig.ident)}(#args)
-                    // );
-
-                    let call = quote!(
-                        <#{&impl_.self_ty} as #{&impl_.trait_.as_ref().unwrap().1}>::#{&impl_item_fn.sig.ident}(#args)
-                    );
-
-                    // When the return type contains Self, the mock returns with
-                    // Self=base_self_ty but we need Self=Wrapper<base_self_ty>.
-                    // Since Wrapper is repr(transparent), they have identical
-                    // layout, so we reinterpret via ptr::read + forget.
-                    let body = if return_contains_self {
-                        quote!({
-                            let __mock_result = #call;
-                            unsafe {
-                                let __raw = &__mock_result as *const _ as *const _;
-                                let __converted = ::core::ptr::read(__raw);
-                                ::core::mem::forget(__mock_result);
-                                __converted
-                            }
-                        })
-                    } else {
-                        call
-                    };
-
-                    output.extend(quote!(
-                        #{&impl_item_fn.defaultness} #{&sig_outer}{
-                            #body
-                        }
-                    ));
-
-                    // output.extend(quote!(
-                    //     #{&impl_item_fn.defaultness} #{&sig_outer}{
-                    //         trait #{name!("{}Mock", &trait_.ident)} #{trait_.generics.impl_generics()} {
-                    //             #(for item in &trait_.items) {
-                    //                 #(if !matches!(item, TraitItem::Fn(_))) {
-                    //                     #item
-                    //                 }
-                    //             }
-                    //             #{
-                    //                 let mut ti = trait_item_fn.clone();
-                    //                 ti.sig.ident = name!("{}_mocked_", &ti.sig.ident);
-                    //                 ti.default = None;
-                    //                 ti.semi_token = Default::default();
-                    //                 ti
-                    //             }
-                    //         }
-                    //         impl #{impl_.generics.impl_generics()} #impl_mock_path for #base_self_ty
-                    //         #{&impl_.generics.where_clause} {
-                    //             #(for item in &impl_.items) {
-                    //                 #(if !matches!(item, ImplItem::Fn(_))) {
-                    //                     #item
-                    //                 }
-                    //             }
-                    //             #{
-                    //                 let mut ii = impl_item_fn.clone();
-                    //                 ii.sig.ident = name!("{}_mocked_", &ii.sig.ident);
-                    //                 ii
-                    //             }
-                    //         }
-                    //         #body
-                    //     }
-                    // ));
-                } else {
-                    output.extend(quote!(#item));
-                }
-            }
-            o => output.extend(quote!(#o)),
-        }
-    }
-    output
-}
-
-fn type_contains_self(ty: &Type) -> bool {
-    use syn::visit::Visit;
-    struct SelfFinder {
-        found: bool,
-    }
-    impl<'ast> Visit<'ast> for SelfFinder {
-        fn visit_type_path(&mut self, tp: &'ast TypePath) {
-            if tp.qself.is_none() && tp.path.is_ident("Self") {
-                self.found = true;
-                return;
-            }
-            // Don't recurse into qualified paths like Self::Error —
-            // associated types resolve to the same concrete type regardless
-            // of wrapping, so they don't need conversion.
-            if tp.qself.is_some() {
-                return;
-            }
-            syn::visit::visit_type_path(self, tp);
-        }
-    }
-    let mut finder = SelfFinder { found: false };
-    finder.visit_type(ty);
-    finder.found
-}
-
-fn is_plain_self_type(ty: &Type) -> bool {
-    matches!(ty, Type::Path(TypePath { qself: None, path }) if path.is_ident("Self"))
-}
-
-fn replace_self_in_type(ty: &Type, replacement: &Type) -> Type {
-    use syn::visit_mut::VisitMut;
-    struct SelfReplacer<'a> {
-        replacement: &'a Type,
-    }
-    impl<'a> VisitMut for SelfReplacer<'a> {
-        fn visit_type_mut(&mut self, ty: &mut Type) {
-            if let Type::Path(TypePath { qself: None, path }) = ty {
-                if path.is_ident("Self") {
-                    *ty = self.replacement.clone();
-                    return;
-                }
-            }
-            syn::visit_mut::visit_type_mut(self, ty);
-        }
-    }
-    let mut ty = ty.clone();
-    SelfReplacer { replacement }.visit_type_mut(&mut ty);
-    ty
-}
-
 fn replace_self(sig: &mut Signature, base_self_ty: &Type) {
     use syn::visit_mut::VisitMut;
 
@@ -781,10 +356,10 @@ fn replace_self_and_desugar_impl_trait(sig: &mut Signature, base_self_ty: &Type)
                     default: None,
                 }));
 
-                *ty = Box::new(Type::Path(TypePath {
+                **ty = Type::Path(TypePath {
                     qself: None,
                     path: param_name.into(),
-                }));
+                });
             }
         }
     }
@@ -884,6 +459,7 @@ pub struct FinalizeArgs {
     pub traits: Vec<ItemTrait>,
     pub contents: Vec<ItemImpl>,
     pub recurse_level: usize,
+    pub support_infinite_cycle: bool,
 }
 
 impl Parse for FinalizeArgs {
@@ -915,11 +491,19 @@ impl Parse for FinalizeArgs {
         let lit: LitInt = input.parse()?;
         let recurse_level = lit.base10_parse()?;
 
+        let support_infinite_cycle = if input.is_empty() {
+            false
+        } else {
+            let lit: LitBool = input.parse()?;
+            lit.value
+        };
+
         Ok(FinalizeArgs {
             working_list,
             traits,
             contents,
             recurse_level,
+            support_infinite_cycle,
         })
     }
 }
@@ -933,6 +517,7 @@ impl template_quote::ToTokens for FinalizeArgs {
         let contents = &self.contents;
 
         let recurse_level = &self.recurse_level;
+        let support_infinite_cycle = &self.support_infinite_cycle;
 
         tokens.extend(quote! {
             #crate_identity
@@ -941,6 +526,7 @@ impl template_quote::ToTokens for FinalizeArgs {
             { #(#traits),* }
             { #(#contents),* }
             #recurse_level
+            #support_infinite_cycle
         });
     }
 }
@@ -1094,15 +680,45 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
     let _output = TokenStream::new();
     let initial_rank = get_initial_rank(args.recurse_level);
 
+    // Build the TraitReplacer table: maps trait ident → (rank_loc, ranked_path)
+    let trait_replacer_table: HashMap<Ident, (usize, Path)> = replacing_table
+        .iter()
+        .map(|(ident, (_, rank_loc, _))| {
+            let ranked_path: Path = parse_quote!(
+                #{name!("ranked_traits")}::#{name!("{}Ranked", ident)}
+            );
+            (ident.clone(), (*rank_loc, ranked_path))
+        })
+        .collect();
+
     quote! {
         // this module is to prevent confliction of trait method call between ranked and non-ranked
         // traits
         #[doc(hidden)]
         mod #{name!("shadowing_module")} {
 
-            #[allow(unused)]
-            #[repr(transparent)]
-            pub struct #{name!("Wrapper")}<T: ?::core::marker::Sized>(T);
+            #(if args.support_infinite_cycle) {
+                trait #{name!("GetVTableKey")} {
+                    extern "C" fn #{name!("get_vtable_key")}(&self) {}
+
+                    fn #{name!("get_cell")}(id: ::core::primitive::usize) -> &'static ::std::sync::OnceLock<::core::primitive::usize> {
+                        use ::std::sync::{Mutex, OnceLock};
+                        use ::std::collections::HashMap;
+                        use ::std::primitive::*;
+                        static #{name!("VTABLE_MAP")}: OnceLock<Mutex<HashMap<(usize, usize), OnceLock<usize>>>> = OnceLock::new();
+                        let map = #{name!("VTABLE_MAP")}.get_or_init(|| Mutex::new(HashMap::new()));
+                        let mut map = map.lock().unwrap();
+                        let r = map.entry((Self::#{name!("get_vtable_key")} as usize, id)).or_insert(OnceLock::new());
+                        // SAFETY: The OnceLock lives in a leaked HashMap entry,
+                        // so the &'static lifetime is valid.
+                        unsafe {
+                            ::core::mem::transmute(r)
+                        }
+                    }
+                }
+
+                impl<T: ?::core::marker::Sized> #{name!("GetVTableKey")} for T {}
+            }
 
             // This should be `pub` to disturb "private associated type `MyTraitRanked::AssocTy` in public interface"
             // when deligating MyTrait
@@ -1110,7 +726,12 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
 
                 // for ImplSelfTy
                 #[allow(unused)]
-                use super::{ super::*, #{name!("Wrapper")}};
+                use super::super::*;
+
+                #(if args.support_infinite_cycle) {
+                    #[allow(unused)]
+                    use super::#{name!("GetVTableKey")};
+                }
 
                 #(for (trait_, rank_loc, impls) in replacing_table.values()) {
 
@@ -1123,7 +744,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                         #(for item in &trait_.items) { #{process_trait_item_for_ranked(item)} }
                     }
 
-                    // impl <
+                    // Base case: impl <
                     //     'a, Rank, T, SelfTy: MyTrait<'a, T>
                     // > MyTraitRanked<'a, Rank, ((),), T> for SelfTy
                     impl #{trait_.generics.insert_last(parse_quote!(
@@ -1140,30 +761,33 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                     #(for impl_ in impls) {
 
                         #(let g = remove_cyclic_bounds(&impl_.generics, &replacing_table)) {
-                            // impl<'a, T> MyTraitRanked<'a, (), (), T> for Wrapper<ImplSelfTy>
+                            // Leaf: impl<'a, T> MyTraitRanked<'a, (), (), T> for ImplSelfTy
                             #[allow(unused_variables)]
                             impl #{impl_.generics.impl_generics()}
                             #{name!("{}Ranked", &trait_.ident)}
                             #{impl_.trait_.as_ref().unwrap().1.ty_generics().insert(*rank_loc, parse_quote![()]).insert(*rank_loc, parse_quote![()])}
-                            for #{name!("Wrapper")}<#{&impl_.self_ty}> #{&g.where_clause} {
-                                #{emit_impl_items_leaf(impl_)}
+                            for #{&impl_.self_ty} #{&g.where_clause} {
+                                #{emit_impl_items_leaf(impl_, args.support_infinite_cycle)}
                             }
 
-                            // impl<'a, T> super::super::MyTrait<'a, T, ()> for ImplSelfTy
-                            //  where Wrapper<Self>: MyTraitRanked<'a, ((((),),),), (), T>
+                            // Final: impl<'a, T> MyTrait<'a, T> for ImplSelfTy
+                            //  where Self: MyTraitRanked<'a, InitialRank, (), T>
                             #(for attr in &impl_.attrs) { #attr }
                             #{&impl_.defaultness} #{&impl_.unsafety} impl #{g.impl_generics()}
                             #{&trait_.ident}
                             #{&impl_.trait_.as_ref().unwrap().1.segments.last().unwrap().arguments}
                             for #{&impl_.self_ty} #{g.push_predicate(parse_quote!(
-                                #{name!("Wrapper")}<Self>: #{name!("{}Ranked", &trait_.ident)}
+                                Self: #{name!("{}Ranked", &trait_.ident)}
                                 #{impl_.trait_.as_ref().unwrap().1.ty_generics().insert(*rank_loc, parse_quote![()]).insert(*rank_loc, initial_rank.clone())}
                             )).where_clause}
                             {
-                                #{emit_impl_items_delegate_via_wrapper(trait_, impl_, quote!(
-                                    <#{name!("Wrapper")}<Self> as #{name!("{}Ranked", &trait_.ident)}
-                                    #{impl_.trait_.as_ref().unwrap().1.ty_generics().insert(*rank_loc, parse_quote![()]).insert(*rank_loc, initial_rank.clone())} >
-                                ))}
+                                #{emit_impl_items_delegate(
+                                    impl_,
+                                    quote!(
+                                        <Self as #{name!("{}Ranked", &trait_.ident)}
+                                        #{impl_.trait_.as_ref().unwrap().1.ty_generics().insert(*rank_loc, parse_quote![()]).insert(*rank_loc, initial_rank.clone())} >
+                                    )
+                                )}
                             }
                         }
 
@@ -1174,31 +798,110 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
             #[allow(unused)]
             use super::*;
 
+            // Shadow original cycle-participant trait names with dummy empty traits.
+            // This prevents method calls in the inductive step body from resolving
+            // to the Final impls (which would reset rank to InitialRank).
+            // Local definitions shadow glob imports in Rust.
+            #(for trait_ in replacing_table.keys()) {
+                #[allow(non_camel_case_types)]
+                trait #trait_ {}
+            }
+
+            // Bring ranked traits into scope so method calls resolve to ranked versions
+            // via where clause bounds.
+            #[allow(unused)]
+            use #{name!("ranked_traits")}::*;
+
             #(for (trait_, rank_loc, impls) in replacing_table.values()) {
                 #(for impl_ in impls) {
 
                     #[allow(unused)]
                     use super::super::*;
 
-                    #(let g = {
-                        let mut g = wrap_cyclic_bounds(&impl_.generics, &replacing_table);
-                        // for bound in collect_transitive_bounds(&trait_.ident, &replacing_table) {
-                        //     g = g.push_predicate(bound);
-                        // }
-                        g
-                    }) {
-                        // impl<'a, Rank, T> ranked_traits::MyTraitRanked<'a, (Rank,), (), T> for
-                        // Wrapper<ImplSelfTy>
-                        // where
-                        //     Self: ranked_traits::MyTraitRanked<'a, Rank, (), T>
-                        impl #{g.insert_last(parse_quote!(#{name!("Rank")})).impl_generics()}
-                        #{name!("ranked_traits")}::#{name!("{}Ranked", &trait_.ident)}
-                        #{impl_.trait_.as_ref().unwrap().1.segments.last().unwrap().arguments.insert(*rank_loc, parse_quote![()]).insert(*rank_loc, parse_quote!((#{name!("Rank")},)))}
-                        for #{name!("Wrapper")}<#{impl_.self_ty.as_ref()}> #{g.push_predicate(parse_quote!(
-                            Self: #{name!("ranked_traits")}::#{name!("{}Ranked", &trait_.ident)} #{&impl_.trait_.as_ref().unwrap().1.segments.last().unwrap().arguments.insert(*rank_loc, parse_quote![()]).insert(*rank_loc, parse_quote!(#{name!("Rank")}))}
-                        )).where_clause} {
-                            #{emit_impl_main(trait_, impl_, &impl_.self_ty)}
+                    // Inductive step: clone user's impl with trait paths rewritten
+                    // to ranked versions via TraitReplacer.
+                    // Trait path gets rank=(Rank,), body/where-clause gets rank=Rank.
+                    #{
+                        use syn::visit_mut::VisitMut;
+
+                        let mut modified_impl = impl_.clone();
+
+                        // Desugar `impl Trait` in method signatures to match the ranked
+                        // trait definition (which also desugars via process_trait_item_for_ranked).
+                        // This must happen BEFORE TraitReplacer so bounds inside `impl Trait`
+                        // get rewritten too.
+                        for item in &mut modified_impl.items {
+                            if let ImplItem::Fn(ImplItemFn { sig, .. }) = item {
+                                replace_self_and_desugar_impl_trait(sig, &parse_quote!(Self));
+                            }
                         }
+
+                        // Step 1: Rewrite the impl's trait path with rank=(Rank,)
+                        TraitReplacer {
+                            table: trait_replacer_table.clone(),
+                            rank_type: parse_quote!((#{name!("Rank")},)),
+                            flag_type: parse_quote!(()),
+                        }.visit_path_mut(&mut modified_impl.trait_.as_mut().unwrap().1);
+
+                        // Step 2: Rewrite all trait paths in body + where clause with rank=Rank
+                        TraitReplacer {
+                            table: trait_replacer_table.clone(),
+                            rank_type: parse_quote!(#{name!("Rank")}),
+                            flag_type: parse_quote!(()),
+                        }.visit_item_impl_mut(&mut modified_impl);
+
+                        // Add Rank as a generic parameter
+                        modified_impl.generics.params.push(parse_quote!(#{name!("Rank")}));
+                        if modified_impl.generics.lt_token.is_none() {
+                            modified_impl.generics.lt_token = Some(Default::default());
+                            modified_impl.generics.gt_token = Some(Default::default());
+                        }
+
+                        // Add Self: TraitRanked<Rank, ()> bound
+                        let self_ranked_bound: WherePredicate = parse_quote!(
+                            Self: #{name!("ranked_traits")}::#{name!("{}Ranked", &trait_.ident)}
+                            #{impl_.trait_.as_ref().unwrap().1.segments.last().unwrap().arguments
+                                .insert(*rank_loc, parse_quote![()]).insert(*rank_loc, parse_quote!(#{name!("Rank")}))}
+                        );
+                        modified_impl.generics
+                            .where_clause
+                            .get_or_insert(WhereClause {
+                                where_token: Default::default(),
+                                predicates: Default::default(),
+                            })
+                            .predicates
+                            .push(self_ranked_bound);
+
+                        // If support_infinite_cycle, prepend vtable registration to each method body
+                        if args.support_infinite_cycle {
+                            let ranked_bound_for_reg: Path = parse_quote!(
+                                #{name!("ranked_traits")}::#{name!("{}Ranked", &trait_.ident)}
+                                #{impl_.trait_.as_ref().unwrap().1.segments.last().unwrap().arguments
+                                    .insert(*rank_loc, parse_quote![()])
+                                    .insert(*rank_loc, parse_quote!(#{name!("Rank")}))}
+                            );
+                            for (num, item) in modified_impl.items.iter_mut().enumerate() {
+                                if let ImplItem::Fn(ImplItemFn { sig, block, .. }) = item {
+                                    if !sig_has_type_params(sig) {
+                                        let old_block = block.clone();
+                                        let method_ident = &sig.ident;
+                                        *block = parse_quote! {
+                                            {
+                                                let _ = Self::#{name!("get_cell")}(#num).set(
+                                                    <Self as #ranked_bound_for_reg>::#method_ident as _
+                                                );
+                                                #old_block
+                                            }
+                                        };
+                                    }
+                                }
+                            }
+                        }
+
+                        quote!(
+                            #[allow(unused_variables, unused_unsafe)]
+                            #modified_impl
+                        )
                     }
                 }
             }

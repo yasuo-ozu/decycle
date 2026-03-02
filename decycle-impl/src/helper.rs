@@ -26,26 +26,6 @@ pub fn path_insert_type_arg(path: &mut Path, index: usize, ty: Type) {
     }
 }
 
-pub trait TraitItemScheme {
-    fn remove_default_body(&self) -> Self;
-}
-
-impl TraitItemScheme for TraitItem {
-    fn remove_default_body(&self) -> Self {
-        let mut ret = self.clone();
-        if let TraitItem::Fn(TraitItemFn {
-            default,
-            semi_token,
-            ..
-        }) = &mut ret
-        {
-            *default = None;
-            *semi_token = Some(Default::default());
-        }
-        ret
-    }
-}
-
 pub trait FnArgScheme {
     fn reduce_pat(&mut self, ix: usize);
     fn variable(&self) -> TokenStream;
@@ -55,13 +35,13 @@ impl FnArgScheme for FnArg {
     fn reduce_pat(&mut self, ix: usize) {
         if let FnArg::Typed(PatType { pat, .. }) = self {
             if !matches!(pat.as_ref(), Pat::Ident(_)) {
-                *pat = Box::new(Pat::Ident(PatIdent {
+                **pat = Pat::Ident(PatIdent {
                     ident: Ident::new(&format!("__arg_{ix}_"), Span::call_site()),
                     attrs: vec![],
                     by_ref: None,
                     mutability: None,
                     subpat: None,
-                }));
+                });
             }
         }
     }

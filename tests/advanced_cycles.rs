@@ -98,7 +98,11 @@ mod advanced_cycles_infinite {
         const OFFSET: i32 = 7;
 
         fn make(flag: bool) -> Vec<i32> {
-            if flag { vec![1, 2, 3] } else { vec![4] }
+            if flag {
+                vec![1, 2, 3]
+            } else {
+                vec![4]
+            }
         }
 
         fn compute(&self, (a, b): (i32, i32)) -> i32 {
@@ -136,9 +140,15 @@ mod advanced_cycles_infinite {
         fn test_assoc_type_and_patterns_infinite() {
             let node_a = NodeA {
                 value: 1,
-                child: Some(Box::new(NodeB { value: 2, child: None })),
+                child: Some(Box::new(NodeB {
+                    value: 2,
+                    child: None,
+                })),
             };
-            let node_b = NodeB { value: 5, child: None };
+            let node_b = NodeB {
+                value: 5,
+                child: None,
+            };
 
             let wrapped = node_a.wrap();
             assert!(wrapped.1.contains('A'));

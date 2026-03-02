@@ -14,7 +14,7 @@ pub use process_module::process_module;
 pub use process_trait::process_trait;
 
 #[derive(Clone)]
-pub(crate) struct GenericRenamer {
+struct GenericRenamer {
     pub(crate) lifetime_renames: HashMap<String, Lifetime>,
     pub(crate) ident_renames: HashMap<String, Ident>,
 }

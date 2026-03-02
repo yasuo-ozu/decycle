@@ -46,7 +46,12 @@ fn process_trait_path(item: &Item) -> Vec<Path> {
     }
 }
 
-pub fn process_module(mut module: ItemMod, decycle: &Path, recurse_level: usize) -> TokenStream {
+pub fn process_module(
+    mut module: ItemMod,
+    decycle: &Path,
+    recurse_level: usize,
+    support_infinite_cycle: bool,
+) -> TokenStream {
     let contents = &mut module
         .content
         .as_mut()
@@ -141,6 +146,7 @@ pub fn process_module(mut module: ItemMod, decycle: &Path, recurse_level: usize)
         traits,
         contents,
         recurse_level,
+        support_infinite_cycle,
     };
     args.working_list.push(parse_quote!(#decycle::__finalize));
     quote! {

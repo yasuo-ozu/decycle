@@ -71,6 +71,38 @@ pub use decycle_impl::process_module;
 ///     them into a stable, globally reachable form.
 ///   - `decycle`: override the path used to refer to this crate
 ///
+/// ### Impl where-clause bounds
+/// In `impl` blocks inside a `#[decycle]` module, avoid constraining
+/// `#[decycle]` traits on non-local bounded types with associated constraints.
+/// For example, this is rejected:
+///
+/// ```rust,compile_fail
+/// # use decycle::decycle;
+/// #[decycle]
+/// pub trait MyTrait<'a> {
+///     type Assoc;
+/// }
+///
+/// #[decycle]
+/// mod m {
+///     #[decycle]
+///     use super::MyTrait;
+///
+///     pub struct MyStruct<T>(::core::marker::PhantomData<T>);
+///
+///     impl<'a, T> MyTrait<'a> for MyStruct<T>
+///     where
+///         (): MyTrait<'a, Assoc = T>,
+///     {
+///         type Assoc = T;
+///     }
+/// }
+/// # fn main() {}
+/// ```
+///
+/// Prefer `Self` or an internal type defined in the same `#[decycle]` module
+/// as the bounded type in such constraints.
+///
 ///
 /// ### Recursion limits
 /// `recurse_level` limits how many expansion stages are used to break the cycle.

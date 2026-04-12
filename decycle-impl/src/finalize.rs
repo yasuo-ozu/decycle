@@ -39,8 +39,6 @@ struct TraitReplacer {
     table: HashMap<Ident, (usize, Path)>,
     /// The rank type to insert at rank_loc
     rank_type: Type,
-    /// The flag type to insert at rank_loc + 1 (after rank insertion)
-    flag_type: Type,
 }
 
 impl TraitReplacer {
@@ -53,7 +51,6 @@ impl TraitReplacer {
                     std::mem::replace(&mut path.segments[0].arguments, PathArguments::None);
                 let mut new_path = replacement.clone();
                 new_path.segments.last_mut().unwrap().arguments = orig_args;
-                path_insert_type_arg(&mut new_path, *rank_loc, self.flag_type.clone());
                 path_insert_type_arg(&mut new_path, *rank_loc, self.rank_type.clone());
                 *path = new_path;
                 return true;
@@ -78,7 +75,7 @@ impl TraitReplacer {
                     for seg in &replacement.segments {
                         new_segments.push(seg.clone());
                     }
-                    // Apply original type args + insert rank/flag on the last replacement segment
+                    // Apply original type args + insert rank on the last replacement segment
                     new_segments.last_mut().unwrap().arguments = orig_args;
                     {
                         let last_seg = new_segments.last_mut().unwrap();
@@ -86,7 +83,6 @@ impl TraitReplacer {
                             leading_colon: None,
                             segments: std::iter::once(last_seg.clone()).collect(),
                         };
-                        path_insert_type_arg(&mut temp_path, *rank_loc, self.flag_type.clone());
                         path_insert_type_arg(&mut temp_path, *rank_loc, self.rank_type.clone());
                         *last_seg = temp_path.segments.into_iter().next().unwrap();
                     }
@@ -205,46 +201,6 @@ fn emit_impl_items_leaf(impl_: &ItemImpl, support_infinite_cycle: bool) -> Token
                 }
             }
             o => output.extend(quote!(#o)),
-        }
-    }
-    output
-}
-
-fn emit_trait_items_delegate(
-    trait_: &ItemTrait,
-    path: TokenStream,
-    base_self_ty: &Type,
-) -> TokenStream {
-    let mut output = TokenStream::new();
-
-    for item in &trait_.items {
-        match item {
-            TraitItem::Fn(TraitItemFn { sig, .. }) => {
-                let mut sig = sig.clone();
-                replace_self_and_desugar_impl_trait(&mut sig, base_self_ty);
-
-                for (ix, input) in sig.inputs.iter_mut().enumerate() {
-                    input.reduce_pat(ix);
-                }
-                output.extend(quote! {
-                    #sig {
-                        #path::#{&sig.ident}(
-                            #(for input in &sig.inputs), {
-                                #{input.variable()}
-                            }
-                        )
-                    }
-                })
-            }
-            TraitItem::Type(TraitItemType {
-                ident, generics, ..
-            }) => output.extend(quote! {
-                type #ident #generics = #path::#ident;
-            }),
-            TraitItem::Const(TraitItemConst { ident, ty, .. }) => output.extend(quote! {
-                const #ident: #ty = #path::#ident;
-            }),
-            _ => unimplemented!(),
         }
     }
     output
@@ -702,8 +658,8 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                 impl<T: ?::core::marker::Sized> #{name!("GetVTableKey")} for T {}
             }
 
-            // This should be `pub` to disturb "private associated type `MyTraitRanked::AssocTy` in public interface"
-            // when deligating MyTrait
+            // This should be `pub` to prevent "private associated type `MyTraitRanked::AssocTy` in public interface"
+            // when delegating MyTrait
             pub mod #{name!("ranked_traits")} {
 
                 // for ImplSelfTy
@@ -717,59 +673,25 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
 
                 #(for (trait_, rank_loc, impls) in replacing_table.values()) {
 
-                    // pub trait MyTraitRanked<'a, Ranked, Flag, T>
+                    // pub trait MyTraitRanked<'a, Rank, T>
                     #[allow(unused)]
                     #[doc(hidden)]
                     pub trait #{name!("{}Ranked", &trait_.ident)}
-                    #{trait_.generics.insert(*rank_loc, parse_quote!(#{name!("Flag")})).insert(*rank_loc, parse_quote!(#{name!("Rank")})).ty_generics()}
+                    #{trait_.generics.insert(*rank_loc, parse_quote!(#{name!("Rank")})).ty_generics()}
                     #{trait_.colon_token} #{&trait_.supertraits} {
                         #(for item in &trait_.items) { #{process_trait_item_for_ranked(item)} }
-                    }
-
-                    // Base case: impl <
-                    //     'a, Rank, T, SelfTy: MyTrait<'a, T>
-                    // > MyTraitRanked<'a, Rank, ((),), T> for SelfTy
-                    impl #{trait_.generics.insert_last(parse_quote!(
-                        #{name!("SelfTy")}: #{&trait_.ident} #{trait_.generics.ty_generics()}
-                    )).insert_last(parse_quote!(#{name!("Rank")})).impl_generics()} #{name!("{}Ranked", &trait_.ident)}
-                    #{trait_.generics.ty_generics().insert(*rank_loc, parse_quote![((),)]).insert(*rank_loc, parse_quote![#{name!("Rank")}])} for #{name!("SelfTy")} {
-                        #{emit_trait_items_delegate(
-                            trait_,
-                            quote!(<Self as #{&trait_.ident} #{trait_.generics.ty_generics()}>),
-                            &parse_quote!(Self)
-                        )}
                     }
 
                     #(for impl_ in impls) {
 
                         #(let g = remove_cyclic_bounds(&impl_.generics, &replacing_table)) {
-                            // Leaf: impl<'a, T> MyTraitRanked<'a, (), (), T> for ImplSelfTy
+                            // Leaf: impl<'a, T> MyTraitRanked<'a, (), T> for ImplSelfTy
                             #[allow(unused_variables)]
                             impl #{impl_.generics.impl_generics()}
                             #{name!("{}Ranked", &trait_.ident)}
-                            #{impl_.trait_.as_ref().unwrap().1.ty_generics().insert(*rank_loc, parse_quote![()]).insert(*rank_loc, parse_quote![()])}
+                            #{impl_.trait_.as_ref().unwrap().1.ty_generics().insert(*rank_loc, parse_quote![()])}
                             for #{&impl_.self_ty} #{&g.where_clause} {
                                 #{emit_impl_items_leaf(impl_, args.support_infinite_cycle)}
-                            }
-
-                            // Final: impl<'a, T> MyTrait<'a, T> for ImplSelfTy
-                            //  where Self: MyTraitRanked<'a, InitialRank, (), T>
-                            #(for attr in &impl_.attrs) { #attr }
-                            #{&impl_.defaultness} #{&impl_.unsafety} impl #{g.impl_generics()}
-                            #{&trait_.ident}
-                            #{&impl_.trait_.as_ref().unwrap().1.segments.last().unwrap().arguments}
-                            for #{&impl_.self_ty} #{g.push_predicate(parse_quote!(
-                                Self: #{name!("{}Ranked", &trait_.ident)}
-                                #{impl_.trait_.as_ref().unwrap().1.ty_generics().insert(*rank_loc, parse_quote![()]).insert(*rank_loc, initial_rank.clone())}
-                            )).where_clause}
-                            {
-                                #{emit_impl_items_delegate(
-                                    impl_,
-                                    quote!(
-                                        <Self as #{name!("{}Ranked", &trait_.ident)}
-                                        #{impl_.trait_.as_ref().unwrap().1.ty_generics().insert(*rank_loc, parse_quote![()]).insert(*rank_loc, initial_rank.clone())} >
-                                    )
-                                )}
                             }
                         }
 
@@ -822,14 +744,12 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                         TraitReplacer {
                             table: trait_replacer_table.clone(),
                             rank_type: parse_quote!((#{name!("Rank")},)),
-                            flag_type: parse_quote!(()),
                         }.visit_path_mut(&mut modified_impl.trait_.as_mut().unwrap().1);
 
                         // Step 2: Rewrite all trait paths in body + where clause with rank=Rank
                         TraitReplacer {
                             table: trait_replacer_table.clone(),
                             rank_type: parse_quote!(#{name!("Rank")}),
-                            flag_type: parse_quote!(()),
                         }.visit_item_impl_mut(&mut modified_impl);
 
                         // Add Rank as a generic parameter
@@ -839,11 +759,11 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                             modified_impl.generics.gt_token = Some(Default::default());
                         }
 
-                        // Add Self: TraitRanked<Rank, ()> bound
+                        // Add Self: TraitRanked<Rank> bound
                         let self_ranked_bound: WherePredicate = parse_quote!(
                             Self: #{name!("ranked_traits")}::#{name!("{}Ranked", &trait_.ident)}
                             #{impl_.trait_.as_ref().unwrap().1.segments.last().unwrap().arguments
-                                .insert(*rank_loc, parse_quote![()]).insert(*rank_loc, parse_quote!(#{name!("Rank")}))}
+                                .insert(*rank_loc, parse_quote!(#{name!("Rank")}))}
                         );
                         modified_impl.generics
                             .where_clause
@@ -859,7 +779,6 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                             let ranked_bound_for_reg: Path = parse_quote!(
                                 #{name!("ranked_traits")}::#{name!("{}Ranked", &trait_.ident)}
                                 #{impl_.trait_.as_ref().unwrap().1.segments.last().unwrap().arguments
-                                    .insert(*rank_loc, parse_quote![()])
                                     .insert(*rank_loc, parse_quote!(#{name!("Rank")}))}
                             );
                             for (num, item) in modified_impl.items.iter_mut().enumerate() {
@@ -889,6 +808,32 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                             #[allow(unused_variables, unused_unsafe)]
                             #modified_impl
                         )
+                    }
+                }
+            }
+        }
+
+        // Final impls: implement original traits by delegating to ranked traits.
+        // These are outside shadowing_module so original trait names are visible.
+        #(for (trait_, rank_loc, impls) in replacing_table.values()) {
+            #(for impl_ in impls) {
+                #(let g = remove_cyclic_bounds(&impl_.generics, &replacing_table)) {
+                    #(for attr in &impl_.attrs) { #attr }
+                    #{&impl_.defaultness} #{&impl_.unsafety} impl #{g.impl_generics()}
+                    #{&trait_.ident}
+                    #{&impl_.trait_.as_ref().unwrap().1.segments.last().unwrap().arguments}
+                    for #{&impl_.self_ty} #{g.push_predicate(parse_quote!(
+                        Self: #{name!("shadowing_module")}::#{name!("ranked_traits")}::#{name!("{}Ranked", &trait_.ident)}
+                        #{impl_.trait_.as_ref().unwrap().1.ty_generics().insert(*rank_loc, initial_rank.clone())}
+                    )).where_clause}
+                    {
+                        #{emit_impl_items_delegate(
+                            impl_,
+                            quote!(
+                                <Self as #{name!("shadowing_module")}::#{name!("ranked_traits")}::#{name!("{}Ranked", &trait_.ident)}
+                                #{impl_.trait_.as_ref().unwrap().1.ty_generics().insert(*rank_loc, initial_rank.clone())} >
+                            )
+                        )}
                     }
                 }
             }

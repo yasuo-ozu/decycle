@@ -88,7 +88,6 @@ impl PathArgumentsScheme for PathArguments {
 pub trait GenericsScheme {
     fn push_predicate(&self, predicate: WherePredicate) -> Self;
     fn insert(&self, index: usize, param: TypeParam) -> Self;
-    fn insert_last(&self, param: TypeParam) -> Self;
     fn impl_generics(&self) -> TokenStream;
     fn ty_generics(&self) -> PathArguments;
 }
@@ -114,22 +113,6 @@ impl GenericsScheme for Generics {
             generics.gt_token = Some(Default::default());
         }
         generics
-    }
-
-    fn insert_last(&self, param: TypeParam) -> Self {
-        let ix = self
-            .params
-            .iter()
-            .take_while(|p| {
-                matches!(
-                    p,
-                    GenericParam::Lifetime(_)
-                        | GenericParam::Type(TypeParam { eq_token: None, .. })
-                        | GenericParam::Const(ConstParam { eq_token: None, .. })
-                )
-            })
-            .count();
-        self.insert(ix, param)
     }
 
     fn impl_generics(&self) -> TokenStream {
@@ -180,10 +163,6 @@ impl GenericsScheme for Path {
         });
         path_insert_type_arg(&mut path, index, ty);
         path
-    }
-
-    fn insert_last(&self, _param: TypeParam) -> Self {
-        unimplemented!()
     }
 
     fn impl_generics(&self) -> TokenStream {

@@ -140,24 +140,6 @@ fn remove_cyclic_bounds(
     g
 }
 
-/// Returns true if the signature has type or const generic parameters
-/// (not just lifetimes), or has `impl Trait` in argument position.
-/// Such methods can't be stored as function pointers in the vtable
-/// because they're not monomorphized yet.
-fn sig_has_type_params(sig: &Signature) -> bool {
-    sig.generics
-        .params
-        .iter()
-        .any(|p| !matches!(p, GenericParam::Lifetime(_)))
-        || sig.inputs.iter().any(|input| {
-            if let FnArg::Typed(PatType { ty, .. }) = input {
-                matches!(**ty, Type::ImplTrait(_))
-            } else {
-                false
-            }
-        })
-}
-
 fn emit_impl_items_leaf(impl_: &ItemImpl, support_infinite_cycle: bool) -> TokenStream {
     let mut output = TokenStream::new();
 
@@ -178,7 +160,7 @@ fn emit_impl_items_leaf(impl_: &ItemImpl, support_infinite_cycle: bool) -> Token
 
                 // Can't use vtable for methods with type/const params —
                 // generic methods can't be coerced to a single function pointer.
-                if support_infinite_cycle && !sig_has_type_params(&sig) {
+                if support_infinite_cycle {
                     let fn_type_params: Vec<TokenStream> = sig
                         .inputs
                         .iter()
@@ -882,18 +864,23 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                             );
                             for (num, item) in modified_impl.items.iter_mut().enumerate() {
                                 if let ImplItem::Fn(ImplItemFn { sig, block, .. }) = item {
-                                    if !sig_has_type_params(sig) {
-                                        let old_block = block.clone();
-                                        let method_ident = &sig.ident;
-                                        *block = parse_quote! {
-                                            {
-                                                let _ = Self::#{name!("get_cell")}(#num).set(
-                                                    <Self as #ranked_bound_for_reg>::#method_ident as _
-                                                );
-                                                #old_block
-                                            }
-                                        };
-                                    }
+                                    let old_block = block.clone();
+                                    let method_ident = &sig.ident;
+                                    let mut reduced_generics = sig.generics.clone();
+                                    reduced_generics.params = reduced_generics.params.into_iter().filter(|p| !matches!(p, GenericParam::Lifetime(_))).collect();
+
+                                    *block = parse_quote! {
+                                        {
+                                            let _ = Self::#{name!("get_cell")}(#num).set(
+                                                <Self as #ranked_bound_for_reg>::#method_ident
+                                                #(if reduced_generics.params.len() > 0) {
+                                                    :: #{reduced_generics.split_for_impl().1}
+                                                }
+                                                as _
+                                            );
+                                            #old_block
+                                        }
+                                    };
                                 }
                             }
                         }

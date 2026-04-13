@@ -581,6 +581,70 @@ fn replace_constraints(
     generics.where_clause = (!where_clause.predicates.is_empty()).then_some(where_clause);
 }
 
+fn is_self_type(ty: &Type) -> bool {
+    matches!(ty, Type::Path(TypePath { qself: None, path }) if path.is_ident("Self"))
+}
+
+/// Check for `type Assoc = Self;` in impl blocks where the trait's associated type
+/// has a bound referencing a `#[decycle]` trait. This creates an infinite recursive
+/// definition because the ranked trait's associated type bound refers to the original
+/// trait, causing a cycle through the Final impl.
+fn check_assoc_type_self(
+    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+) {
+    let decycle_idents: std::collections::HashSet<&Ident> = replacing_table.keys().collect();
+
+    for (_trait_ident, (trait_, _, impls)) in replacing_table {
+        for trait_item in &trait_.items {
+            let TraitItem::Type(TraitItemType {
+                ident: assoc_ident,
+                bounds,
+                ..
+            }) = trait_item
+            else {
+                continue;
+            };
+
+            // Check if any bound on this associated type references a decycle trait
+            let has_decycle_bound = bounds.iter().any(|bound| {
+                if let TypeParamBound::Trait(TraitBound { path, .. }) = bound {
+                    if let Some(seg) = path.segments.last() {
+                        return decycle_idents.contains(&seg.ident);
+                    }
+                }
+                false
+            });
+
+            if !has_decycle_bound {
+                continue;
+            }
+
+            // Check impls for `type Assoc = Self;`
+            for impl_ in impls {
+                for impl_item in &impl_.items {
+                    let ImplItem::Type(ImplItemType { ident, ty, .. }) = impl_item else {
+                        continue;
+                    };
+                    if ident != assoc_ident {
+                        continue;
+                    }
+                    if is_self_type(ty) {
+                        abort!(
+                            ty,
+                            "infinite recursive definition: `type {} = Self;` with #[decycle] trait bound",
+                            assoc_ident;
+                            help = assoc_ident.span() =>
+                            "associated type `{}` has a bound on a #[decycle] trait, \
+                             and assigning `Self` creates a cycle in the ranking mechanism",
+                            assoc_ident
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn finalize(args: FinalizeArgs) -> TokenStream {
     let replacing_table: HashMap<Ident, (ItemTrait, usize, Vec<_>)> = args
         .traits
@@ -614,6 +678,8 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
             (trait_.ident.clone(), (trait_.clone(), loc, impls))
         })
         .collect();
+
+    check_assoc_type_self(&replacing_table);
 
     let _output = TokenStream::new();
     let initial_rank = get_initial_rank(args.recurse_level);

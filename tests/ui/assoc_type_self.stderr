@@ -1,0 +1,51 @@
+error: infinite recursive definition: `type Assoc = Self;` with #[decycle] trait bound
+  --> tests/ui/assoc_type_self.rs:17:22
+   |
+17 |         type Assoc = Self;
+   |                      ^^^^
+   |
+help: associated type `Assoc` has a bound on a #[decycle] trait, and assigning `Self` creates a cycle in the ranking mechanism
+  --> tests/ui/assoc_type_self.rs:5:14
+   |
+ 5 |         type Assoc: Foo;
+   |              ^^^^^
+
+error[E0275]: overflow evaluating the requirement `S: Bar`
+  --> tests/ui/assoc_type_self.rs:17:22
+   |
+17 |         type Assoc = Self;
+   |                      ^^^^
+   |
+note: required for `S` to implement `Foo`
+  --> tests/ui/assoc_type_self.rs:13:10
+   |
+13 |     impl Foo for S
+   |          ^^^     ^
+14 |     where
+15 |         S: Bar,
+   |            --- unsatisfied trait bound introduced here
+note: required by a bound in `Foo::Assoc`
+  --> tests/ui/assoc_type_self.rs:5:21
+   |
+ 5 |         type Assoc: Foo;
+   |                     ^^^ required by this bound in `Foo::Assoc`
+
+error[E0275]: overflow evaluating the requirement `S: Bar`
+  --> tests/ui/assoc_type_self.rs:20:26
+   |
+20 |     impl Bar for S where S: Foo {}
+   |                          ^^^^^^
+   |
+note: required for `S` to implement `Foo`
+  --> tests/ui/assoc_type_self.rs:13:10
+   |
+13 |     impl Foo for S
+   |          ^^^     ^
+14 |     where
+15 |         S: Bar,
+   |            --- unsatisfied trait bound introduced here
+   = help: see issue #48214
+help: add `#![feature(trivial_bounds)]` to the crate attributes to enable
+   |
+ 1 + #![feature(trivial_bounds)]
+   |

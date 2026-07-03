@@ -88,17 +88,27 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
 
     if let Ok(module) = parse::<ItemMod>(input.clone()) {
         let recurse_level = args.recurse_level.unwrap_or(10);
+        if recurse_level == 0 {
+            abort!(
+                Span::call_site(),
+                "recurse_level must be at least 1";
+                hint = "at level 0 the delegating impl would dispatch straight to the rank floor"
+            )
+        }
         let support_infinite_cycle = args.support_infinite_cycle.unwrap_or(true);
-        let ret = std::panic::catch_unwind(|| {
-            process_module(module, &decycle_path, recurse_level, support_infinite_cycle)
-        })
-        .unwrap_or_else(|e| std::panic::resume_unwind(e));
+        let ret = process_module(module, &decycle_path, recurse_level, support_infinite_cycle);
         set_dummy(quote!(#ret));
         if let Some(marker) = &args.marker {
             abort!(marker, "unsupported argument 'marker'")
         }
         if let Some(alter_macro_name) = &args.alter_macro_name {
             abort!(alter_macro_name, "unsupported argument 'alter_macro_name'")
+        }
+        if args.allowed_paths.is_some() {
+            abort!(
+                Span::call_site(),
+                "allowed_paths is not supported for modules"
+            )
         }
         ret.into()
     } else if let Ok(item) = parse::<ItemTrait>(input.clone()) {
@@ -109,16 +119,13 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
             config.allow_crate();
             config.allow_primitive();
         }
-        let ret = std::panic::catch_unwind(|| {
-            process_trait(
-                &item,
-                &decycle_path,
-                args.marker.as_ref(),
-                args.alter_macro_name.as_ref(),
-                config,
-            )
-        })
-        .unwrap_or_else(|e| std::panic::resume_unwind(e));
+        let ret = process_trait(
+            &item,
+            &decycle_path,
+            args.marker.as_ref(),
+            args.alter_macro_name.as_ref(),
+            config,
+        );
         set_dummy(quote!(#ret));
         if args.recurse_level.is_some() {
             abort!(

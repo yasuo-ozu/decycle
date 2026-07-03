@@ -1,0 +1,41 @@
+error: #[decycle] is not supported on a trait alias
+  --> tests/ui/trait_alias.rs:12:11
+   |
+12 |     trait CaAlias = Ca;
+   |           ^^^^^^^
+
+error: cannot find attribute `decycle` in this scope
+ --> tests/ui/trait_alias.rs:6:7
+  |
+6 |     #[decycle]
+  |       ^^^^^^^
+  |
+  = note: `decycle` is in scope, but it is a crate, not an attribute
+help: consider importing one of these attribute macros
+  |
+6 +     use decycle::decycle;
+  |
+6 +     use decycle_macro::decycle;
+  |
+
+error: cannot find attribute `decycle` in this scope
+  --> tests/ui/trait_alias.rs:11:7
+   |
+11 |     #[decycle]
+   |       ^^^^^^^
+   |
+   = note: `decycle` is in scope, but it is a crate, not an attribute
+help: consider importing one of these attribute macros
+   |
+ 6 +     use decycle::decycle;
+   |
+ 6 +     use decycle_macro::decycle;
+   |
+
+error[E0658]: trait aliases are experimental
+  --> tests/ui/trait_alias.rs:12:5
+   |
+12 |     trait CaAlias = Ca;
+   |     ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: see issue #41517 <https://github.com/rust-lang/rust/issues/41517> for more information

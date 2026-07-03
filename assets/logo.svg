@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <!-- decycle: a trait-obligation cycle, broken — the ring escapes on a tangent. -->
+  <!-- Ring: 290-degree arc, gap at the top-right -->
+  <path d="M 103.4 57.1 A 40 40 0 1 1 70.9 24.6"
+        fill="none" stroke="#CE422B" stroke-width="13" stroke-linecap="round"/>
+  <!-- Escape: the tangent continuation that no longer curves back -->
+  <path d="M 70.9 24.6 L 106.4 30.9"
+        fill="none" stroke="#F74C00" stroke-width="13" stroke-linecap="round"/>
+  <polygon points="122.2,33.7 103.9,41.8 106.7,22.1" fill="#F74C00"/>
+</svg>

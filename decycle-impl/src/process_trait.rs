@@ -16,8 +16,19 @@ pub fn process_trait(
 ) -> TokenStream2 {
     let random_suffix = crate::get_random();
     let temporal_mac_name = alter_macro_name.cloned().unwrap_or_else(|| {
+        // `random_suffix` is deterministic (hashed from the fixed crate identity string),
+        // so two `#[decycle] trait Foo` items in one crate (different modules) would
+        // otherwise compute the exact same `#[macro_export]` name here and collide
+        // (E0428). Fold a per-item discriminant — hashed from the trait's own tokens —
+        // into THIS name only; `random_suffix` itself must stay untouched everywhere
+        // else, since it's the key the leaker's `Repeater` impls (built independently,
+        // elsewhere in this fn) are pinned to.
+        let discriminant = crate::identity_to_u64(&quote!(#trait_item).to_string());
         syn::Ident::new(
-            &format!("__{}_temporal_{}", &trait_item.ident, random_suffix),
+            &format!(
+                "__{}_temporal_{}_{}",
+                &trait_item.ident, random_suffix, discriminant
+            ),
             trait_item.ident.span(),
         )
     });

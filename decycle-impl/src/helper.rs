@@ -1,7 +1,23 @@
 use proc_macro2::{Span, TokenStream};
+use proc_macro_error::*;
 use syn::punctuated::Punctuated;
 use syn::*;
 use template_quote::quote;
+
+/// Strips a leading, argument-less `self` segment (`self::Trait` -> `Trait`,
+/// `self::Trait::method` -> `Trait::method`) so a `self::`-qualified reference to a
+/// #[decycle] trait is recognized the same way the bare name is. A leading `self` is only
+/// ever a no-op module-path prefix (it can't itself carry generic arguments), so stripping
+/// it is always semantics-preserving.
+pub fn strip_leading_self(path: &mut Path) {
+    if path.leading_colon.is_none()
+        && path.segments.len() > 1
+        && path.segments[0].ident == "self"
+        && matches!(path.segments[0].arguments, PathArguments::None)
+    {
+        path.segments = path.segments.iter().skip(1).cloned().collect();
+    }
+}
 
 /// Inserts a `Type` as a `GenericArgument::Type` at the given position
 /// in the last segment's arguments of `path`.
@@ -22,7 +38,19 @@ pub fn path_insert_type_arg(path: &mut Path, index: usize, ty: Type) {
         PathArguments::AngleBracketed(ref mut angle_args) => {
             angle_args.args.insert(index, arg);
         }
-        PathArguments::Parenthesized(_) => {}
+        // A #[decycle] trait referenced with `Fn(...)`-sugar (`where B: Cb(usize) -> usize`)
+        // reaches here through `TraitReplacer` (the where-clause/body rewriter): it steals
+        // the ORIGINAL `Parenthesized` arguments onto the ranked-trait replacement path
+        // before this call is meant to insert the Rank argument. Silently doing nothing
+        // (the old behavior) left the Rank argument out entirely, producing a ranked-trait
+        // reference desugared as `CbRanked<(usize,), Output = usize>` — missing its Rank
+        // parameter — which cascades into confusing, seemingly unrelated errors downstream
+        // (E0658/E0220/E0277) instead of naming the actual problem. Abort here instead,
+        // matching `PathArgumentsScheme::insert`'s identical rejection for an impl's own
+        // (syntactically distinct, but equally unsupported) parenthesized trait reference.
+        PathArguments::Parenthesized(pa) => {
+            abort!(pa, "unsupported parenthesized generic arguments on a #[decycle] trait")
+        }
     }
 }
 
@@ -34,14 +62,24 @@ pub trait FnArgScheme {
 impl FnArgScheme for FnArg {
     fn reduce_pat(&mut self, ix: usize) {
         if let FnArg::Typed(PatType { pat, .. }) = self {
-            if !matches!(pat.as_ref(), Pat::Ident(_)) {
-                **pat = Pat::Ident(PatIdent {
-                    ident: Ident::new(&format!("__arg_{ix}_"), Span::call_site()),
-                    attrs: vec![],
-                    by_ref: None,
-                    mutability: None,
-                    subpat: None,
-                });
+            match pat.as_mut() {
+                // Keep the ident (and its `mut`, which is signature-only and doesn't
+                // affect the caller), but drop `by_ref`/subpatterns — those bind
+                // additional names that only make sense in the original body, not at
+                // the call-argument position `variable()` quotes this pat into.
+                Pat::Ident(pat_ident) => {
+                    pat_ident.by_ref = None;
+                    pat_ident.subpat = None;
+                }
+                _ => {
+                    **pat = Pat::Ident(PatIdent {
+                        ident: Ident::new(&format!("__arg_{ix}_"), Span::call_site()),
+                        attrs: vec![],
+                        by_ref: None,
+                        mutability: None,
+                        subpat: None,
+                    });
+                }
             }
         }
     }
@@ -49,8 +87,13 @@ impl FnArgScheme for FnArg {
     fn variable(&self) -> TokenStream {
         match self {
             FnArg::Typed(PatType { pat, .. }) => {
-                assert!(matches!(pat.as_ref(), Pat::Ident(_)));
-                quote!(#pat)
+                let Pat::Ident(pat_ident) = pat.as_ref() else {
+                    unreachable!("reduce_pat always leaves a bare Pat::Ident");
+                };
+                // Emit only the ident: `mut`/`by_ref`/subpatterns are signature
+                // decorations, not valid in a call-argument expression position.
+                let ident = &pat_ident.ident;
+                quote!(#ident)
             }
             FnArg::Receiver(Receiver { self_token, .. }) => {
                 quote!(#self_token)
@@ -80,7 +123,12 @@ impl PathArgumentsScheme for PathArguments {
                 angle_args.args.insert(index, GenericArgument::Type(ty));
                 PathArguments::AngleBracketed(angle_args)
             }
-            PathArguments::Parenthesized(_) => panic!(),
+            // Only reachable when a #[decycle] trait is named with `Fn(...)`-sugar syntax
+            // (`impl FnLike(A) -> B for X`), which isn't a supported form of a decycle
+            // trait bound — a clean compile error instead of an internal panic.
+            PathArguments::Parenthesized(pa) => {
+                abort!(pa, "unsupported parenthesized generic arguments on a #[decycle] trait")
+            }
         }
     }
 }

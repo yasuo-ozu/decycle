@@ -1,0 +1,43 @@
+error: unsupported item in an impl of a #[decycle] trait
+  --> tests/ui/unsupported_impl_item.rs:38:9
+   |
+38 |         some_unsupported_macro!();
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: cannot find macro `some_unsupported_macro` in this scope
+  --> tests/ui/unsupported_impl_item.rs:38:9
+   |
+38 |         some_unsupported_macro!();
+   |         ^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0275]: overflow evaluating the requirement `A: m::Loop`
+  --> tests/ui/unsupported_impl_item.rs:16:9
+   |
+16 |         B: Loop,
+   |         ^^^^^^^
+   |
+note: required for `B` to implement `m::Loop`
+  --> tests/ui/unsupported_impl_item.rs:27:10
+   |
+27 |     impl Loop for B
+   |          ^^^^     ^
+28 |     where
+29 |         A: Loop,
+   |            ---- unsatisfied trait bound introduced here
+   = help: see issue #48214
+
+error[E0275]: overflow evaluating the requirement `B: m::Loop`
+  --> tests/ui/unsupported_impl_item.rs:29:9
+   |
+29 |         A: Loop,
+   |         ^^^^^^^
+   |
+note: required for `A` to implement `m::Loop`
+  --> tests/ui/unsupported_impl_item.rs:14:10
+   |
+14 |     impl Loop for A
+   |          ^^^^     ^
+15 |     where
+16 |         B: Loop,
+   |            ---- unsatisfied trait bound introduced here
+   = help: see issue #48214

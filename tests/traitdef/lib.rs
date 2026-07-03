@@ -143,6 +143,6 @@ where
         use std::hash::Hasher;
         let mut hasher = DefaultHasher::new();
         self.0.hash(&mut hasher);
-        hasher.finish() % 2 == 0
+        hasher.finish().is_multiple_of(2)
     }
 }

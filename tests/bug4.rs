@@ -1,4 +1,10 @@
-#![allow(unused, non_camel_case_types)]
+// `crate_in_macro_def`: decycle's macro-carrier ping-pong re-quotes `Unparse` verbatim
+// inside a generated `macro_rules!`, which is what trips the lint below (on tokens
+// generated from this file, not on an item an inner `#[allow]` could attach to) — but
+// `TraitA` is defined in THIS (the trait-defining) crate, not in decycle, so `$crate`
+// inside the carrier would resolve against whatever crate re-invokes it instead, the
+// wrong target for a locally-defined trait. `crate::` here is intentional.
+#![allow(unused, non_camel_case_types, clippy::crate_in_macro_def)]
 
 pub trait TraitA<A> {
     type S;

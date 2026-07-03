@@ -1,16 +1,8 @@
-error: unsupported #[decycle] bound with associated constraints on non-local type
+error: associated-type constraints in #[decycle] impl where-clauses are only supported on `Self` or the impl's own type parameters
+
+         = help: use `Self` or one of this `impl`'s own type parameters, such as `T`
+
   --> tests/ui/bad_bounds.rs:30:13
    |
 30 |         (): MyTrait<'b, MyTrait = T, T = T>,
    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   |
-help: this `where`-clause bound in the `impl` block targets a non-local type
-  --> tests/ui/bad_bounds.rs:30:9
-   |
-30 |         (): MyTrait<'b, MyTrait = T, T = T>,
-   |         ^^
-help: use `Self` or an internal type defined within the `#[decycle]` module, such as `MyStruct`
-  --> tests/ui/bad_bounds.rs:30:9
-   |
-30 |         (): MyTrait<'b, MyTrait = T, T = T>,
-   |         ^^

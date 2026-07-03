@@ -108,15 +108,67 @@ fn is_decycle_attribute(attr: &Attribute) -> bool {
 fn is_renamed_decycle_crate(ident: &proc_macro2::Ident) -> bool {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
 
-    if let Ok(cargo_toml) = std::fs::read_to_string(format!("{}/Cargo.toml", manifest_dir)) {
-        if cargo_toml.contains(&format!("{} = {{ package = \"decycle\"", ident))
-            || cargo_toml.contains(&format!("{} = {{ package = 'decycle'", ident))
-        {
-            return true;
-        }
+    let Ok(cargo_toml) = std::fs::read_to_string(format!("{}/Cargo.toml", manifest_dir)) else {
+        return false;
+    };
+
+    let ident_str = ident.to_string();
+    // Fast pre-check: skip the TOML parse when the ident can't possibly be a dependency
+    // key at all. The real match below never trusts textual proximity beyond this.
+    if !cargo_toml.contains(&ident_str) {
+        return false;
     }
 
-    false
+    // `toml::Value`'s `FromStr` expects a single bare value, not a whole document (it
+    // errors "unexpected content, expected nothing" on any real Cargo.toml) — the
+    // top-level table needs `toml::Table`'s own `FromStr` instead, which is exactly what
+    // `dependency_tables_of` is typed to walk.
+    let Ok(doc) = cargo_toml.parse::<toml::Table>() else {
+        return false;
+    };
+
+    let found = dependency_tables_of(&doc).any(|deps| dep_is_renamed_decycle(deps, &ident_str));
+    found
+}
+
+/// A dependency spec `ident = { package = "decycle", ... }` (any inline-table key order,
+/// since it's parsed rather than text-matched).
+fn dep_is_renamed_decycle(deps: &toml::Table, ident_str: &str) -> bool {
+    matches!(
+        deps.get(ident_str),
+        Some(toml::Value::Table(spec))
+            if spec.get("package").and_then(toml::Value::as_str) == Some("decycle")
+    )
+}
+
+/// Every `[dependencies]`-shaped table reachable from the manifest root: the three
+/// top-level kinds, plus the same three nested under each `[target.'cfg(...)'.*]`.
+fn dependency_tables_of(doc: &toml::Table) -> impl Iterator<Item = &toml::Table> {
+    const DEP_KEYS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+
+    let top_level = DEP_KEYS.iter().filter_map(|key| match doc.get(*key) {
+        Some(toml::Value::Table(t)) => Some(t),
+        _ => None,
+    });
+
+    let per_target = match doc.get("target") {
+        Some(toml::Value::Table(targets)) => Some(targets),
+        _ => None,
+    }
+    .into_iter()
+    .flat_map(|targets| targets.values())
+    .filter_map(|v| match v {
+        toml::Value::Table(t) => Some(t),
+        _ => None,
+    })
+    .flat_map(|target_table| {
+        DEP_KEYS.iter().filter_map(move |key| match target_table.get(*key) {
+            Some(toml::Value::Table(t)) => Some(t),
+            _ => None,
+        })
+    });
+
+    top_level.chain(per_target)
 }
 
 fn ident_to_path(ident: &Ident) -> Path {

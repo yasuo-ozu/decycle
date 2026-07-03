@@ -1,20 +1,22 @@
 [package]
 name = "decycle"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
+rust-version = "1.87"
 description = "Solve circular trait obligation"
 license = "MIT"
 repository = "https://github.com/yasuo-ozu/decycle"
 keywords = ["macro", "trait", "recursive", "circular", "obligation"]
 categories = ["rust-patterns", "development-tools::procedural-macro-helpers"]
 authors = ["yasuo-ozu"]
+exclude = ["docs/"]
 
 [lib]
 path = "lib.rs"
 
 [dependencies]
-decycle-macro = { path = "macro", version = "0.3.0" }
-decycle-impl = { path = "decycle-impl", version = "0.3.0" }
+decycle-macro = { path = "macro", version = "0.4.0" }
+decycle-impl = { path = "decycle-impl", version = "0.4.0" }
 
 [dev-dependencies]
 traitdef = { path = "tests/traitdef" }

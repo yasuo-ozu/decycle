@@ -174,6 +174,9 @@ mod advanced_cycles_finite {
     trait DeltaLoop {
         const SCALE: i32;
 
+        // `new` here is an ordinary associated fn under test (an assoc-fn-shaped decycle
+        // method, not a constructor), not the `Self`-returning convention clippy expects.
+        #[allow(clippy::new_ret_no_self)]
         fn new(seed: i32) -> Option<i32>;
         fn total(&self) -> i32;
         fn take(self) -> i32;

@@ -1,0 +1,69 @@
+error: a #[decycle] trait cannot be a supertrait of another #[decycle] trait
+  --> tests/ui/decycle_supertrait.rs:12:24
+   |
+12 |     pub trait Derived: Base {
+   |                        ^^^^
+
+error[E0275]: overflow evaluating the requirement `A: Base`
+  --> tests/ui/decycle_supertrait.rs:21:9
+   |
+21 |         B: Base,
+   |         ^^^^^^^
+   |
+note: required for `B` to implement `Base`
+  --> tests/ui/decycle_supertrait.rs:27:10
+   |
+27 |     impl Base for B
+   |          ^^^^     ^
+28 |     where
+29 |         A: Base,
+   |            ---- unsatisfied trait bound introduced here
+   = help: see issue #48214
+
+error[E0275]: overflow evaluating the requirement `B: Base`
+  --> tests/ui/decycle_supertrait.rs:29:9
+   |
+29 |         A: Base,
+   |         ^^^^^^^
+   |
+note: required for `A` to implement `Base`
+  --> tests/ui/decycle_supertrait.rs:19:10
+   |
+19 |     impl Base for A
+   |          ^^^^     ^
+20 |     where
+21 |         B: Base,
+   |            ---- unsatisfied trait bound introduced here
+   = help: see issue #48214
+
+error[E0275]: overflow evaluating the requirement `A: Derived`
+  --> tests/ui/decycle_supertrait.rs:37:9
+   |
+37 |         B: Derived,
+   |         ^^^^^^^^^^
+   |
+note: required for `B` to implement `Derived`
+  --> tests/ui/decycle_supertrait.rs:43:10
+   |
+43 |     impl Derived for B
+   |          ^^^^^^^     ^
+44 |     where
+45 |         A: Derived,
+   |            ------- unsatisfied trait bound introduced here
+   = help: see issue #48214
+
+error[E0275]: overflow evaluating the requirement `B: Derived`
+  --> tests/ui/decycle_supertrait.rs:45:9
+   |
+45 |         A: Derived,
+   |         ^^^^^^^^^^
+   |
+note: required for `A` to implement `Derived`
+  --> tests/ui/decycle_supertrait.rs:35:10
+   |
+35 |     impl Derived for A
+   |          ^^^^^^^     ^
+36 |     where
+37 |         B: Derived,
+   |            ------- unsatisfied trait bound introduced here
+   = help: see issue #48214

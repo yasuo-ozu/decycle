@@ -1,0 +1,65 @@
+error: unsupported parenthesized generic arguments on a #[decycle] trait
+  --> tests/ui/fn_sugar_bound.rs:24:14
+   |
+24 |         B: Cb(usize) -> usize,
+   |              ^^^^^^^^^^^^^^^^
+
+error[E0658]: parenthetical notation is only stable when used with `Fn`-family traits
+  --> tests/ui/fn_sugar_bound.rs:24:12
+   |
+24 |         B: Cb(usize) -> usize,
+   |            ^^^^^^^^^^^^^^^^^^
+   |
+   = note: see issue #29625 <https://github.com/rust-lang/rust/issues/29625> for more information
+
+error[E0107]: trait takes 0 generic arguments but 1 generic argument was supplied
+  --> tests/ui/fn_sugar_bound.rs:24:12
+   |
+24 |         B: Cb(usize) -> usize,
+   |            ^^------- help: remove the unnecessary parenthetical generics
+   |            |
+   |            expected 0 generic arguments
+   |
+note: trait defined here, with 0 generic parameters
+  --> tests/ui/fn_sugar_bound.rs:17:15
+   |
+17 |     pub trait Cb {
+   |               ^^
+
+error[E0220]: associated type `Output` not found for `Cb`
+  --> tests/ui/fn_sugar_bound.rs:24:25
+   |
+24 |         B: Cb(usize) -> usize,
+   |                         ^^^^^ associated type `Output` not found
+
+error[E0275]: overflow evaluating the requirement `A: Ca`
+  --> tests/ui/fn_sugar_bound.rs:24:9
+   |
+24 |         B: Cb(usize) -> usize,
+   |         ^^^^^^^^^^^^^^^^^^^^^
+   |
+note: required for `B` to implement `Cb`
+  --> tests/ui/fn_sugar_bound.rs:34:10
+   |
+34 |     impl Cb for B
+   |          ^^     ^
+35 |     where
+36 |         A: Ca,
+   |            -- unsatisfied trait bound introduced here
+   = help: see issue #48214
+
+error[E0275]: overflow evaluating the requirement `B: Cb`
+  --> tests/ui/fn_sugar_bound.rs:36:9
+   |
+36 |         A: Ca,
+   |         ^^^^^
+   |
+note: required for `A` to implement `Ca`
+  --> tests/ui/fn_sugar_bound.rs:22:10
+   |
+22 |     impl Ca for A
+   |          ^^     ^
+23 |     where
+24 |         B: Cb(usize) -> usize,
+   |            ------------------ unsatisfied trait bound introduced here
+   = help: see issue #48214

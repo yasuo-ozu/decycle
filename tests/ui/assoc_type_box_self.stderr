@@ -1,0 +1,59 @@
+error: infinite recursive definition: `type Assoc = ...` referencing `Self` with #[decycle] trait bound
+
+         = help: associated type `Assoc` has a bound on a #[decycle] trait, and this assignment references `Self`, creating a cycle in the ranking mechanism
+
+  --> tests/ui/assoc_type_box_self.rs:19:22
+   |
+19 |         type Assoc = Box<Self>;
+   |                      ^^^^^^^^^
+
+error[E0277]: the trait bound `std::boxed::Box<A>: m::Loop` is not satisfied
+  --> tests/ui/assoc_type_box_self.rs:19:22
+   |
+19 |         type Assoc = Box<Self>;
+   |                      ^^^^^^^^^ the trait `m::Loop` is not implemented for `std::boxed::Box<A>`
+   |
+   = help: the following other types implement trait `m::Loop`:
+             A
+             B
+note: required by a bound in `m::Loop::Assoc`
+  --> tests/ui/assoc_type_box_self.rs:8:21
+   |
+ 8 |         type Assoc: Loop;
+   |                     ^^^^ required by this bound in `Loop::Assoc`
+
+error[E0275]: overflow evaluating the requirement `A: m::Loop`
+  --> tests/ui/assoc_type_box_self.rs:17:9
+   |
+17 |         B: Loop,
+   |         ^^^^^^^
+   |
+note: required for `B` to implement `m::Loop`
+  --> tests/ui/assoc_type_box_self.rs:29:10
+   |
+29 |     impl Loop for B
+   |          ^^^^     ^
+30 |     where
+31 |         A: Loop,
+   |            ---- unsatisfied trait bound introduced here
+   = help: see issue #48214
+
+error[E0275]: overflow evaluating the requirement `A: m::Loop`
+  --> tests/ui/assoc_type_box_self.rs:33:22
+   |
+33 |         type Assoc = B;
+   |                      ^
+   |
+note: required for `B` to implement `m::Loop`
+  --> tests/ui/assoc_type_box_self.rs:29:10
+   |
+29 |     impl Loop for B
+   |          ^^^^     ^
+30 |     where
+31 |         A: Loop,
+   |            ---- unsatisfied trait bound introduced here
+note: required by a bound in `m::Loop::Assoc`
+  --> tests/ui/assoc_type_box_self.rs:8:21
+   |
+ 8 |         type Assoc: Loop;
+   |                     ^^^^ required by this bound in `Loop::Assoc`

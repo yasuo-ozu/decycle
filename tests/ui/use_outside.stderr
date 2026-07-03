@@ -1,17 +1,18 @@
 error: place it inside module annotated with #[decycle]
+
+         = help:
+                   Example:
+                   #[decycle]
+                   mod some_module {
+                       #[decycle]
+                       use core :: fmt :: Debug;
+                   }
+
  --> tests/ui/use_outside.rs:1:1
   |
 1 | #[decycle::decycle]
   | ^^^^^^^^^^^^^^^^^^^
   |
-  = help:
-                      Example:
-                      #[decycle]
-                      mod some_module {
-                          #[decycle]
-                          use core :: fmt :: Debug;
-                      }
-
   = note: this error originates in the attribute macro `decycle::decycle` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 warning: unused import: `core::fmt::Debug`
@@ -20,4 +21,4 @@ warning: unused import: `core::fmt::Debug`
 2 | use core::fmt::Debug;
   |     ^^^^^^^^^^^^^^^^
   |
-  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+  = note: `#[warn(unused_imports)]` on by default

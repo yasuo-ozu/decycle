@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Full workspace suite: unit tests, integration tests, and doctests.
+      # `--skip ui` excludes the trybuild snapshot test (`fn ui` in tests/trybuild.rs
+      # is the only `#[test]` named `ui` in the workspace) so channel-sensitive
+      # .stderr drift can never fail this required step; trybuild runs separately below.
+      - name: cargo test (skip trybuild snapshots)
+        run: cargo test --workspace -- --skip ui
+      # The trybuild UI .stderr snapshots are blessed on stable rustc and are
+      # channel/version-sensitive. A future rustc release can legitimately drift them,
+      # which is expected occasionally, so this step is allowed to fail without failing
+      # the job. To re-bless the snapshots: TRYBUILD=overwrite cargo test --test trybuild
+      - name: cargo test --test trybuild (UI snapshots, may drift)
+        run: cargo test --test trybuild
+        continue-on-error: true
+
+  msrv:
+    name: test (1.87.0 MSRV)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.87.0
+      - uses: Swatinem/rust-cache@v2
+      # Skip the trybuild snapshot test (`fn ui`): its .stderr snapshots are blessed on
+      # stable and are not guaranteed to match on the pinned MSRV compiler. Everything
+      # else in the workspace (including doctests) must pass on the declared MSRV.
+      - name: cargo test (skip trybuild snapshots)
+        run: cargo test --workspace -- --skip ui
+
+  clippy:
+    name: clippy (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  doc:
+    name: doc (stable)
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps

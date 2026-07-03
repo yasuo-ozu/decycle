@@ -1,0 +1,53 @@
+error: paths with multiple super segments are not supported inside #[decycle] modules; use crate::-rooted paths
+  --> tests/ui/super_super_path.rs:22:25
+   |
+22 |                         super::super::helper() + B.step(n - 1)
+   |                         ^^^^^^^^^^^^^^^^^^^^
+
+error[E0425]: cannot find function `helper` in module `super::super`
+  --> tests/ui/super_super_path.rs:22:39
+   |
+22 |                         super::super::helper() + B.step(n - 1)
+   |                                       ^^^^^^ not found in `super::super`
+   |
+help: consider importing this function
+   |
+ 9 +             use crate::outer::inner::helper;
+   |
+help: if you import `helper`, refer to it directly
+   |
+22 -                         super::super::helper() + B.step(n - 1)
+22 +                         helper() + B.step(n - 1)
+   |
+
+error[E0275]: overflow evaluating the requirement `A: m::Loop`
+  --> tests/ui/super_super_path.rs:16:17
+   |
+16 |                 B: Loop,
+   |                 ^^^^^^^
+   |
+note: required for `B` to implement `m::Loop`
+  --> tests/ui/super_super_path.rs:26:18
+   |
+26 |             impl Loop for B
+   |                  ^^^^     ^
+27 |             where
+28 |                 A: Loop,
+   |                    ---- unsatisfied trait bound introduced here
+   = help: see issue #48214
+
+error[E0275]: overflow evaluating the requirement `B: m::Loop`
+  --> tests/ui/super_super_path.rs:28:17
+   |
+28 |                 A: Loop,
+   |                 ^^^^^^^
+   |
+note: required for `A` to implement `m::Loop`
+  --> tests/ui/super_super_path.rs:14:18
+   |
+14 |             impl Loop for A
+   |                  ^^^^     ^
+15 |             where
+16 |                 B: Loop,
+   |                    ---- unsatisfied trait bound introduced here
+   = help: see issue #48214

@@ -1,7 +1,8 @@
 [package]
 name = "decycle-impl"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
+rust-version = "1.87"
 description = "Internal implementation for decycle macros"
 license = "MIT"
 repository = "https://github.com/yasuo-ozu/decycle"
@@ -17,6 +18,7 @@ proc-macro2 = "1.0"
 proc-macro-error = { version = "1.0", default-features = false }
 type-leak = "0.6.0"
 template-quote = "0.4.0"
+toml = "0.9"
 
 [dependencies.syn]
 version = "2.0"

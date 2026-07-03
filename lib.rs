@@ -61,7 +61,7 @@ pub use decycle_impl::process_module;
 ///
 /// - **Module**:
 ///   - `#[decycle::decycle(recurse_level = N, support_infinite_cycle = true|false, decycle = path)]`
-///   - `recurse_level`: expansion depth (default 10)
+///   - `recurse_level`: expansion depth (default 10, must be at least 1)
 ///   - `support_infinite_cycle`: enables/disable infinite cycle handling (default true)
 ///   - `decycle`: override the path used to refer to this crate
 /// - **Trait** (defined out of `#[decycle]` module):
@@ -100,19 +100,40 @@ pub use decycle_impl::process_module;
 /// # fn main() {}
 /// ```
 ///
-/// Prefer `Self` or an internal type defined in the same `#[decycle]` module
-/// as the bounded type in such constraints.
+/// Prefer `Self` or one of the `impl`'s own type parameters as the bounded
+/// type in such constraints.
 ///
 ///
 /// ### Recursion limits
-/// `recurse_level` limits how many expansion stages are used to break the cycle.
-/// When the limit is reached:
-/// - `support_infinite_cycle = true` switches to a runtime indirection that
-///   caches function pointers to allow deeper cycles.
-/// - `support_infinite_cycle = false` stops with `unimplemented!` in the
-///   generated code.
-/// - `support_infinite_cycle = false` removes runtime shim and it makes zero-cost abstraction
-///   instead of the restriction of recursion limit.
+/// `recurse_level` (must be at least 1) limits how many expansion stages are
+/// used to break the cycle at compile time. What happens once real recursion
+/// runs deeper than that depends on `support_infinite_cycle`:
+///
+/// - `support_infinite_cycle = true` (the default) does **not** stop at
+///   `recurse_level`: the deepest compile-time stage (the "floor") re-enters
+///   the *original* trait impl at full height through a type-erased fn
+///   pointer held in a **thread-local** registry (keyed by a generated
+///   per-(trait, method, instantiation) marker type plus a layout
+///   fingerprint). Every inductive frame idempotently registers the
+///   re-entry fns it and its cyclic-bound siblings need before descending,
+///   so the floor's lookup always finds its target on the thread that needs
+///   it. Recursion depth is then bounded only by the OS stack, like any
+///   ordinary recursive-descent code — which also means a genuinely
+///   non-terminating cycle overflows the stack instead of being cut off.
+///   Two shapes intentionally fail closed with an actionable, isolated
+///   panic instead of silently misbehaving: a generic method's floor
+///   reached before any frame of that exact instantiation ran on the
+///   current thread (e.g. a first descent at cycle width greater than
+///   `recurse_level`), and any floor reached through an impl whose cyclic
+///   bound targets a bare type parameter or a heterogeneous side-bound
+///   graph the registering frame can't prove (`impl<T: Cb> Ca for
+///   Wrap<T>`-shaped cycles, and cross-impl side bounds not covered by the
+///   registering impl's own bounds) — such impls simply never register,
+///   compile cleanly, and panic (rather than corrupt memory) if their floor
+///   is ever actually reached.
+/// - `support_infinite_cycle = false` emits no runtime machinery at all
+///   (zero-cost) and instead stops with an `unimplemented!` panic once
+///   `recurse_level` is reached.
 ///
 /// ## Example with markers
 /// Use `marker` when the trait contains non-absolute paths (e.g. `super::Type`,
@@ -136,6 +157,14 @@ pub use decycle_macro::decycle;
 /// function to apply decycle's transformation while keeping its own macro API.
 pub use decycle_impl::process_trait;
 
+/// Internal bridging fn for the `#[decycle]` macro ping-pong protocol.
+///
+/// Unlike [`process_module`] and [`process_trait`], `FinalizeArgs` is not meant to be
+/// hand-constructed: it is `Parse`d from the specific token shape the generated carrier
+/// macros feed back into `__finalize` (crate identity, crate version, working list, …).
+/// Exposed (rather than fully private) only so a wrapper macro crate's own `__finalize`-style
+/// re-export can delegate to it; ordinary consumers never call this directly.
+#[doc(hidden)]
 pub use decycle_impl::finalize;
 
 /// Internal helper used by generated code to track staged type expansion.
@@ -143,6 +172,68 @@ pub use decycle_impl::finalize;
 pub trait Repeater<const RANDOM: u64, const IX: usize, PARAM: ?Sized> {
     /// The resolved type at the given stage.
     type Type: ?Sized;
+}
+
+/// Runtime fn-pointer registry backing unbounded `support_infinite_cycle` re-entry.
+///
+/// The generated rank floor, instead of erroring, re-enters the original trait impl at full
+/// height through a type-erased fn pointer stored here. Keys are `type_name::<K>()` *string
+/// content* of generated per-(trait, method, instantiation) marker ZSTs — robust against
+/// linker identical-code-folding and `-Zshare-generics` (string identity, not address
+/// identity) — paired with a layout fingerprint (`type_name` is non-injective: e.g. two
+/// closures declared in one fn share a `{{closure}}` name, so the fold over each key type's
+/// size/align keeps different-layout instantiations on distinct keys — an ABI-mismatched
+/// transmute-call is thereby unreachable). The map is **thread-local**: every registration a
+/// floor depends on is emitted on the same call stack (register-before-descend), hence the
+/// same thread — so a thread-local map preserves the coverage guarantee while making
+/// cross-thread interleaving physically unable to cross-contaminate keys, and there is no
+/// lock to poison and no contention. Registration is an idempotent insert: the same key
+/// always maps to the same fn, so overwrite is harmless.
+#[doc(hidden)]
+pub mod __reentry {
+    use std::any::type_name;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    thread_local! {
+        static REG: RefCell<HashMap<(&'static str, u64), usize>> = RefCell::new(HashMap::new());
+    }
+
+    /// FNV-1a offset basis: the seed of every generated fingerprint fold.
+    pub const FP_SEED: u64 = 0xcbf29ce484222325;
+
+    const FP_PRIME: u64 = 0x100000001b3;
+
+    /// Fold one type's layout into a fingerprint (FNV-style, deterministic).
+    pub const fn fp_fold(acc: u64, size: usize, align: usize) -> u64 {
+        let acc = (acc ^ (size as u64)).wrapping_mul(FP_PRIME);
+        (acc ^ (align as u64)).wrapping_mul(FP_PRIME)
+    }
+
+    /// Fold one const-generic value (cast to `u64`; wider values truncate) into a fingerprint.
+    pub const fn fp_fold_word(acc: u64, w: u64) -> u64 {
+        (acc ^ w).wrapping_mul(FP_PRIME)
+    }
+
+    /// Register the full-height re-entry fn (as `fn`-pointer-cast-to-`usize`) for key
+    /// `(K, fp)` on this thread.
+    pub fn register<K: ?Sized>(fp: u64, f: usize) {
+        REG.with(|reg| reg.borrow_mut().insert((type_name::<K>(), fp), f));
+    }
+
+    /// Look up the re-entry fn for key `(K, fp)`, copied out as `usize`. The value is copied
+    /// and the `RefCell` borrow released before the not-registered panic can fire.
+    pub fn lookup<K: ?Sized>(fp: u64) -> usize {
+        let found = REG.with(|reg| reg.borrow().get(&(type_name::<K>(), fp)).copied());
+        found.expect(
+            "decycle: re-entry fn not registered before the floor was reached. This floor's \
+             key had no same-instantiation frame run on this thread's descent first — e.g. a \
+             generic method's first descent at cycle width > recurse_level (including \
+             self-recursion consuming ranks before the first generic cross-edge call), or an \
+             impl whose cyclic bound targets a bare type parameter. Increase recurse_level; \
+             if two same-signature closures are involved, give them distinct named types.",
+        )
+    }
 }
 
 #[doc(hidden)]

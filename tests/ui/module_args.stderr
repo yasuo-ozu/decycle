@@ -1,0 +1,7 @@
+error: allowed_paths is not supported for modules
+ --> tests/ui/module_args.rs:5:1
+  |
+5 | #[decycle::decycle(allowed_paths = [::core::primitive::u32])]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `decycle::decycle` (in Nightly builds, run with -Z macro-backtrace for more info)

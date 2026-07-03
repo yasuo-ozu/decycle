@@ -1,0 +1,32 @@
+error: recurse_level must be at least 1
+
+         = help: at level 0 the delegating impl would dispatch straight to the rank floor
+
+ --> tests/ui/recurse_level_zero.rs:3:1
+  |
+3 | #[decycle::decycle(recurse_level = 0)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `decycle::decycle` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: cannot find attribute `decycle` in this scope
+ --> tests/ui/recurse_level_zero.rs:5:7
+  |
+5 |     #[decycle]
+  |       ^^^^^^^
+  |
+  = note: `decycle` is in scope, but it is a crate, not an attribute
+help: consider importing one of these attribute macros
+  |
+5 +     use decycle::decycle;
+  |
+5 +     use decycle_macro::decycle;
+  |
+
+error[E0275]: overflow evaluating the requirement `X: A`
+  --> tests/ui/recurse_level_zero.rs:12:9
+   |
+12 |         X: A,
+   |         ^^^^
+   |
+   = help: see issue #48214

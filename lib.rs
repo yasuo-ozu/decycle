@@ -1,3 +1,5 @@
+#![doc(html_logo_url = "https://raw.githubusercontent.com/yasuo-ozu/decycle/main/assets/logo.svg")]
+#![doc(html_favicon_url = "https://raw.githubusercontent.com/yasuo-ozu/decycle/main/assets/logo.svg")]
 #![doc = include_str!("README.md")]
 
 #[doc(hidden)]
@@ -120,17 +122,19 @@ pub use decycle_impl::process_module;
 ///   it. Recursion depth is then bounded only by the OS stack, like any
 ///   ordinary recursive-descent code — which also means a genuinely
 ///   non-terminating cycle overflows the stack instead of being cut off.
-///   Two shapes intentionally fail closed with an actionable, isolated
-///   panic instead of silently misbehaving: a generic method's floor
+///   Three floors intentionally fail closed with an actionable, isolated
+///   panic instead of silently misbehaving: (a) a generic method's floor
 ///   reached before any frame of that exact instantiation ran on the
 ///   current thread (e.g. a first descent at cycle width greater than
-///   `recurse_level`), and any floor reached through an impl whose cyclic
-///   bound targets a bare type parameter or a heterogeneous side-bound
-///   graph the registering frame can't prove (`impl<T: Cb> Ca for
-///   Wrap<T>`-shaped cycles, and cross-impl side bounds not covered by the
-///   registering impl's own bounds) — such impls simply never register,
-///   compile cleanly, and panic (rather than corrupt memory) if their floor
-///   is ever actually reached.
+///   `recurse_level`); (b) any floor of an impl whose cyclic bound targets
+///   a bare type parameter (`impl<T: Cb> Ca for Wrap<T>` — its re-entry
+///   registration is not expressible, so the cycle is unbounded only
+///   through its other impls); and (c) a heterogeneous side-bound cycle
+///   where the registering impl's own bounds don't cover every bound a
+///   reachable sibling impl needs (its registration is skipped rather than
+///   risk naming an unprovable obligation). Such impls simply never
+///   register, compile cleanly, and panic (rather than corrupt memory) if
+///   their floor is ever actually reached.
 /// - `support_infinite_cycle = false` emits no runtime machinery at all
 ///   (zero-cost) and instead stops with an `unimplemented!` panic once
 ///   `recurse_level` is reached.
@@ -155,17 +159,47 @@ pub use decycle_macro::decycle;
 /// This is useful when another macro crate defines or derives traits, and those traits
 /// should also be valid targets for `#[decycle]`. The wrapper macro can call into this
 /// function to apply decycle's transformation while keeping its own macro API.
+///
+/// Requires the (default-on) `type-leak` feature; a `finalize`-only consumer that builds with
+/// `default-features = false` does not get this re-export (see the `type-leak` feature doc).
+#[cfg(feature = "type-leak")]
 pub use decycle_impl::process_trait;
 
-/// Internal bridging fn for the `#[decycle]` macro ping-pong protocol.
+/// Programmatic entry point for the `#[decycle]` transformation.
 ///
-/// Unlike [`process_module`] and [`process_trait`], `FinalizeArgs` is not meant to be
-/// hand-constructed: it is `Parse`d from the specific token shape the generated carrier
-/// macros feed back into `__finalize` (crate identity, crate version, working list, …).
-/// Exposed (rather than fully private) only so a wrapper macro crate's own `__finalize`-style
-/// re-export can delegate to it; ordinary consumers never call this directly.
-#[doc(hidden)]
+/// A wrapper macro crate (e.g. syan's `#[recurse]`) constructs [`finalize::FinalizeArgs`]
+/// directly and calls [`finalize::finalize`], bypassing the token-carrier ping-pong entirely
+/// (and its `crate_version` assertion, which only guards the `Parse` carrier path). This
+/// surface is **semver-committed**: `FinalizeArgs`' fields and `finalize`'s signature are part
+/// of the public API.
+///
+/// (The macro ping-pong protocol used by `#[decycle]` itself also delegates here, `Parse`ing
+/// `FinalizeArgs` from the specific token shape the generated carrier macros feed back into
+/// `__finalize`; that path is unaffected by un-hiding this module.)
 pub use decycle_impl::finalize;
+
+/// D1 bridge (impl-spec §C.4): convenience root re-export of
+/// [`decycle_impl::finalize::ranked_trait_name`] — the exact ident mangling `finalize` uses for
+/// a `#[decycle]` trait's synthesized ranked counterpart. A programmatic caller (e.g. syan's
+/// `#[recurse]`) needs this to spell a rank-PRESERVING wrapper impl BEFORE calling `finalize`,
+/// since such a wrapper must be emitted outside `finalize`'s own output (see
+/// [`finalize::AlsoRank`]'s docs on the rank-preserving wrapper constraint, and
+/// [`finalize::ranked_trait_path`] for the full path form). This surface is
+/// **semver-committed** alongside `finalize`/`FinalizeArgs`.
+pub use decycle_impl::finalize::ranked_trait_name;
+
+/// D1 bridge: convenience root re-export of [`decycle_impl::finalize::ranked_trait_path`] — the
+/// full path to a trait's ranked counterpart as seen from the scope a rank-preserving wrapper
+/// must be emitted into (a sibling of `finalize`'s own `shadowing_module`). See
+/// [`ranked_trait_name`] and [`finalize::ranked_trait_path`] for details and a usage example.
+pub use decycle_impl::finalize::ranked_trait_path;
+
+/// D1 bridge (E3 replan §1.2): rank encoding + registration emitters, re-exported like
+/// [`ranked_trait_name`]/[`ranked_trait_path`]. **Semver-committed.**
+pub use decycle_impl::finalize::{
+    emit_registration, fingerprint_expr, floor_rank, initial_rank, is_syntactically_unsized,
+    method_is_generic, rank_succ, reentry_alias_name, reentry_fn_name, reentry_marker_name,
+};
 
 /// Internal helper used by generated code to track staged type expansion.
 #[doc(hidden)]
@@ -189,7 +223,16 @@ pub trait Repeater<const RANDOM: u64, const IX: usize, PARAM: ?Sized> {
 /// cross-thread interleaving physically unable to cross-contaminate keys, and there is no
 /// lock to poison and no contention. Registration is an idempotent insert: the same key
 /// always maps to the same fn, so overwrite is harmless.
-#[doc(hidden)]
+///
+/// **Semver-committed bridge surface (D1, E3 replan §1.2).** `FP_SEED`, `fp_fold`,
+/// `fp_fold_word`, `register`, and `lookup` — together with the key construction
+/// `(type_name::<Mk<Target, targs…, margs…>>(), fp)`, where `Mk` is the per-(trait × method)
+/// marker [`decycle_impl::finalize::reentry_marker_name`] names and `fp` is
+/// [`decycle_impl::finalize::fingerprint_expr`]'s fold — are a stable library API: a
+/// programmatic `finalize` caller (syan's `#[recurse]`) hand-emits registrations that a
+/// `finalize`-emitted floor must find. Any change to the key construction, the fold
+/// constants, or these signatures is a breaking change to such callers, `__` prefix
+/// notwithstanding.
 pub mod __reentry {
     use std::any::type_name;
     use std::cell::RefCell;
@@ -237,4 +280,7 @@ pub mod __reentry {
 }
 
 #[doc(hidden)]
-pub use decycle_impl::{proc_macro_error, type_leak};
+pub use decycle_impl::proc_macro_error;
+#[cfg(feature = "type-leak")]
+#[doc(hidden)]
+pub use decycle_impl::type_leak;

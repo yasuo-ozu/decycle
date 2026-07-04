@@ -1,0 +1,18 @@
+[package]
+name = "alsorank_bridge"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+proc-macro = true
+path = "lib.rs"
+
+[dependencies]
+decycle-impl = { path = "../../decycle-impl", version = "0.4.0", default-features = false }
+template-quote = "0.4.0"
+proc-macro2 = "1.0"
+
+[dependencies.syn]
+version = "2.0"
+features = ["full", "extra-traits"]

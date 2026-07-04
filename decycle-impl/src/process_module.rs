@@ -208,11 +208,15 @@ fn validate_impl_where_bounds(item_impl: &ItemImpl, all_traits: &HashSet<Ident>)
             }
             let last_segment = &path.segments[0];
             if all_traits.contains(&last_segment.ident) && has_assoc_constraints(&path) {
+                // F6: the earlier wording ("...on non-local type") described what the check
+                // rejects, but the check doesn't actually key on locality — a bound on a
+                // module-LOCAL struct/enum (anything other than `Self` or one of this impl's
+                // own type parameters) is rejected exactly the same way. State what's
+                // ACCEPTED instead, which is unambiguous either way.
                 let help_message = local_types_help_message(&impl_type_params);
                 abort!(
                     path,
-                    "unsupported #[decycle] bound with associated constraints on non-local type";
-                    help = bounded_ty.span() => "this `where`-clause bound in the `impl` block targets a non-local type";
+                    "associated-type constraints in #[decycle] impl where-clauses are only supported on `Self` or the impl's own type parameters";
                     help = bounded_ty.span() => "{}", help_message
                 );
             }
@@ -343,6 +347,12 @@ pub fn process_module(
         recurse_level,
         support_infinite_cycle,
         renames,
+        // C2: this path keeps the working-list convention (only a direct, programmatic
+        // caller of `finalize` sets `also_rank`).
+        also_rank: Vec::new(),
+        // D1: this path keeps the working-list convention (only a direct, programmatic
+        // caller of `finalize` sets `decycle_path`).
+        decycle_path: None,
     };
     args.working_list.push(parse_quote!(#decycle::__finalize));
     quote! {

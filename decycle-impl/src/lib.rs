@@ -5,12 +5,15 @@ use syn::*;
 pub mod finalize;
 mod helper;
 mod process_module;
+#[cfg(feature = "type-leak")]
 mod process_trait;
 
 pub use proc_macro_error;
+#[cfg(feature = "type-leak")]
 pub use type_leak;
 
 pub use process_module::process_module;
+#[cfg(feature = "type-leak")]
 pub use process_trait::process_trait;
 
 #[derive(Clone)]

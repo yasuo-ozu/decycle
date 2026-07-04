@@ -16,10 +16,18 @@ path = "src/lib.rs"
 [dependencies]
 proc-macro2 = "1.0"
 proc-macro-error = { version = "1.0", default-features = false }
-type-leak = "0.6.0"
+type-leak = { version = "0.6.0", optional = true }
 template-quote = "0.4.0"
 toml = "0.9"
 
 [dependencies.syn]
 version = "2.0"
 features = ["full", "derive", "printing", "extra-traits", "visit", "visit-mut"]
+
+[features]
+# `process_trait` (the `#[decycle]`-on-a-trait attribute) interns paths via type-leak; the
+# programmatic `finalize` entry (the bridge a wrapper macro crate like syan's `#[recurse]`
+# uses) does not. Default keeps the attribute working; a `finalize`-only consumer sets
+# `default-features = false`.
+default = ["type-leak"]
+type-leak = ["dep:type-leak"]

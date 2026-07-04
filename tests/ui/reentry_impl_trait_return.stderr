@@ -1,0 +1,41 @@
+error: decycle: cannot build unbounded re-entry (`support_infinite_cycle = true`) for method `ca`: it returns `impl Trait`, whose erased fn-pointer type is not nameable. Return a concrete or boxed type (e.g. `Box<dyn Trait>`), or set `support_infinite_cycle = false` for this cycle.
+  --> tests/ui/reentry_impl_trait_return.rs:11:32
+   |
+11 |         fn ca(&self, n: usize) -> impl Iterator<Item = u8>;
+   |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0275]: overflow evaluating the requirement `A: Ca`
+  --> tests/ui/reentry_impl_trait_return.rs:23:35
+   |
+23 |         fn ca(&self, n: usize) -> impl Iterator<Item = u8> {
+   |                                   ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+note: required for `B` to implement `Cb`
+  --> tests/ui/reentry_impl_trait_return.rs:28:10
+   |
+28 |     impl Cb for B
+   |          ^^     ^
+29 |     where
+30 |         A: Ca,
+   |            -- unsatisfied trait bound introduced here
+note: required by a bound in `<A as Ca>`
+  --> tests/ui/reentry_impl_trait_return.rs:21:12
+   |
+21 |         B: Cb,
+   |            ^^ required by this bound in `<A as Ca>`
+
+error[E0275]: overflow evaluating the requirement `B: Cb`
+  --> tests/ui/reentry_impl_trait_return.rs:30:9
+   |
+30 |         A: Ca,
+   |         ^^^^^
+   |
+note: required for `A` to implement `Ca`
+  --> tests/ui/reentry_impl_trait_return.rs:19:10
+   |
+19 |     impl Ca for A
+   |          ^^     ^
+20 |     where
+21 |         B: Cb,
+   |            -- unsatisfied trait bound introduced here
+   = help: see issue #48214

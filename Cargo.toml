@@ -2,7 +2,7 @@
 name = "decycle"
 version = "0.4.0"
 edition = "2021"
-rust-version = "1.87"
+rust-version = "1.71"
 description = "Solve circular trait obligation"
 license = "MIT"
 repository = "https://github.com/yasuo-ozu/decycle"

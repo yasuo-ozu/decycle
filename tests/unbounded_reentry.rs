@@ -694,7 +694,7 @@ mod rankeater {
         fn a(&self, n: usize) -> usize {
             if n == 0 {
                 0
-            } else if n.is_multiple_of(3) {
+            } else if n % 3 == 0 {
                 B0.bg::<u8>(n - 1) + 1
             } else {
                 A0.a(n - 1) + 1

@@ -2,7 +2,7 @@
 name = "decycle-impl"
 version = "0.4.0"
 edition = "2021"
-rust-version = "1.87"
+rust-version = "1.71"
 description = "Internal implementation for decycle macros"
 license = "MIT"
 repository = "https://github.com/yasuo-ozu/decycle"
@@ -16,9 +16,11 @@ path = "src/lib.rs"
 [dependencies]
 proc-macro2 = "1.0"
 proc-macro-error = { version = "1.0", default-features = false }
-type-leak = { version = "0.6.0", optional = true }
+# type-leak 0.7 (safegraph-backed, MSRV 1.56) replaces 0.6 (gotgraph-backed, empirical
+# MSRV 1.87) — this is the sole reason the default-feature build's floor dropped. Optional:
+# a `finalize`-only consumer (`default-features = false`) sheds it entirely.
+type-leak = { version = "0.7.0", optional = true }
 template-quote = "0.4.0"
-toml = "0.9"
 
 [dependencies.syn]
 version = "2.0"

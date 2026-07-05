@@ -31,17 +31,27 @@ jobs:
         continue-on-error: true
 
   msrv:
-    name: test (1.87.0 MSRV)
+    name: build (1.71.0 MSRV)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.87.0
+      - uses: dtolnay/rust-toolchain@1.71.0
       - uses: Swatinem/rust-cache@v2
-      # Skip the trybuild snapshot test (`fn ui`): its .stderr snapshots are blessed on
-      # stable and are not guaranteed to match on the pinned MSRV compiler. Everything
-      # else in the workspace (including doctests) must pass on the declared MSRV.
-      - name: cargo test (skip trybuild snapshots)
-        run: cargo test --workspace -- --skip ui
+      # The declared MSRV (rust-version = 1.71) covers *building the published library*, not
+      # the test suite: the dev-dependency `trybuild` requires rustc 1.76+, so `cargo test`
+      # cannot run on the 1.71 floor. Cargo.lock is gitignored, so this resolves fresh with
+      # 1.71's cargo — the 1.71 floor is set by the latest release of the core proc-macro deps
+      # (syn 2.0, quote, unicode-ident all declare rust-version 1.71). If one of those bumps
+      # its own MSRV above 1.71 in a future release, this job will flag it and the floor here
+      # (and in the three `rust-version` fields) must move with it.
+      #
+      # Build both feature configurations: the default (type-leak, backed by safegraph) and
+      # the `default-features = false` finalize-only bridge that downstream wrappers (e.g.
+      # syan's `#[recurse]`) depend on — the latter is the whole reason the floor is this low.
+      - name: cargo build (default features — decycle + macro + impl)
+        run: cargo build -p decycle -p decycle-macro -p decycle-impl
+      - name: cargo build (decycle-impl, no default features)
+        run: cargo build -p decycle-impl --no-default-features
 
   clippy:
     name: clippy (stable)

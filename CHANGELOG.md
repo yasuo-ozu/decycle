@@ -45,8 +45,9 @@ crashes (SIGSEGV). Workaround on old versions: `support_infinite_cycle = false`.
   longer stripped; defaulted trait methods no longer cause E0046.
 - `self::`-qualified and two-segment `Trait::method` references are rewritten like
   bare names; same-named `#[decycle]` traits in one crate no longer collide (E0428).
-- `mut`-pattern method params, GAT delegation, and renamed-crate detection (real
-  TOML parse) fixed; `super::super::` paths, trait aliases, and `Fn(...)`-sugar
+- `mut`-pattern method params and GAT delegation fixed; renamed-crate detection now
+  matches the name passed as `#[decycle(decycle = ::my_rename)]` (it no longer reads the
+  consumer's `Cargo.toml`); `super::super::` paths, trait aliases, and `Fn(...)`-sugar
   bounds now get clean compile errors instead of misbehavior or panics.
 - `allowed_paths` on a `#[decycle]` module is now a clean compile error (previously
   silently ignored); the associated-constraint bound diagnostic now states what is
@@ -56,7 +57,11 @@ crashes (SIGSEGV). Workaround on old versions: `support_infinite_cycle = false`.
 ### Packaging
 
 - `decycle` / `decycle-macro` / `decycle-impl` versioned in lockstep at 0.4.0;
-  `rust-version = "1.87"` (empirical MSRV via `type-leak` → `gotgraph`); `docs/`
-  excluded from the published crate.
+  `rust-version = "1.71"` — the floor for any `syn 2.0`-based proc-macro crate, set by the
+  latest `syn` / `quote` / `unicode-ident`. Down from a would-be 1.87 by switching to
+  `type-leak 0.7` (backed by `safegraph`, MSRV 1.56) from `type-leak 0.6` (backed by
+  `gotgraph`, empirical MSRV 1.87), and by dropping the `toml` dependency (renamed-crate
+  detection no longer parses the consumer's `Cargo.toml`). `docs/` excluded from the
+  published crate.
 
 [0.4.0]: https://github.com/yasuo-ozu/decycle/releases/tag/v0.4.0

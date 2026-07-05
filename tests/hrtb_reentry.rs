@@ -48,6 +48,9 @@ mod hrtb_concrete {
     // A generic Final impl over the binder lifetime, matching what the register-once fn's
     // elided-lifetime `Re::<Wrap<&'__dcl_hr_0 A>> as usize` cast needs: `Wrap<&'a A>: Cb` holds
     // for every `'a`, not just one concrete instantiation.
+    // The named `'a` binder is the point of this test (a binder-generic Final impl); clippy's
+    // elision suggestion would defeat it.
+    #[allow(clippy::needless_lifetimes)]
     impl<'a> Cb for Wrap<&'a A>
     where
         A: Ca,

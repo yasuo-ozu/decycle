@@ -40,18 +40,20 @@ fn check_no_deep_super_paths(contents: &[Item]) {
     }
 }
 
-fn check_submodule(module: &ItemMod) {
+fn check_submodule(module: &ItemMod, decycle_crate: &Ident) {
     use syn::visit::Visit;
-    struct Visitor;
-    impl<'ast> Visit<'ast> for Visitor {
+    struct Visitor<'a> {
+        decycle_crate: &'a Ident,
+    }
+    impl<'ast, 'a> Visit<'ast> for Visitor<'a> {
         fn visit_attribute(&mut self, i: &'ast syn::Attribute) {
-            if crate::is_decycle_attribute(i) {
+            if crate::is_decycle_attribute(i, self.decycle_crate) {
                 abort!(&i, "#[decycle] is not supported in nested modules")
             }
             syn::visit::visit_attribute(self, i);
         }
     }
-    Visitor.visit_item_mod(module);
+    Visitor { decycle_crate }.visit_item_mod(module);
 }
 
 fn process_trait_path(item: &Item) -> Vec<Path> {
@@ -235,6 +237,9 @@ pub fn process_module(
         .as_mut()
         .unwrap_or_else(|| abort!(&module.semi, "needs content"))
         .1;
+    // The decycle crate name as passed to the macro (leading segment of `decycle = …`, default
+    // `decycle`) — used to match `#[<crate>::decycle]` on inner items without reading the manifest.
+    let decycle_crate = &decycle.segments.first().unwrap().ident;
     let (traits, working_list, renames): (Vec<_>, Vec<_>, Vec<_>) = contents.iter_mut().fold(
         Default::default(),
         |(mut traits, mut working_list, mut renames), item| {
@@ -246,7 +251,7 @@ pub fn process_module(
                     let mut old_attrs = std::mem::take(attrs).into_iter();
                     let mut flag = false;
                     attrs.extend((&mut old_attrs).take_while(|attr| {
-                        if crate::is_decycle_attribute(attr) {
+                        if crate::is_decycle_attribute(attr, decycle_crate) {
                             flag = true;
                         }
                         !flag
@@ -276,7 +281,7 @@ pub fn process_module(
     for item in contents.iter() {
         match item {
             Item::Mod(item_mod) => {
-                check_submodule(item_mod);
+                check_submodule(item_mod, decycle_crate);
             }
             Item::Macro(_) => abort!(&item, "macro is not supported in #[decycle] module"),
             _ => (),

@@ -1970,6 +1970,9 @@ fn rule1_registration_ok(
 /// D1 bridge (semver-committed): the third emission site — a programmatic `finalize` caller
 /// (syan's `#[recurse]` E3 path) splicing registrations alongside `finalize`'s output (the C4
 /// scope; pass `rt_path = quote!(#{shadowing_module_name()}::#{ranked_traits_module_name()})`).
+// The parameter list is the semver-committed bridge signature; bundling it into a struct
+// would be a breaking change, so the arity is intentional.
+#[allow(clippy::too_many_arguments)]
 pub fn emit_registration(
     decycle: &Path,
     rt_path: &TokenStream,

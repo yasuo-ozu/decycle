@@ -3,6 +3,11 @@
 //! call a generated floor performs; registration is idempotent and per-instantiation; the
 //! FNV fold constants are locked.
 
+// This test hand-simulates the reentry registry, whose values ARE function addresses stored as
+// `usize` (exactly what the macro emits: `Re::<..> as usize`). The `fn as usize` casts are the
+// mechanism under test, not an accident.
+#![allow(function_casts_as_integer)]
+
 use decycle::__reentry::{fp_fold, fp_fold_word, lookup, register, FP_SEED};
 
 /// A syan-style marker ZST — the same shape `emit_reentry_items` mints

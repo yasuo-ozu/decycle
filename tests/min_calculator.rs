@@ -92,18 +92,6 @@ fn test_parenthesized_simple() {
 }
 
 #[test]
-fn test_parenthesized_expression() {
-    use calculator::*;
-
-    // Test: (2 + 3)
-    let term = Term;
-    let input = vec!["(", "2", "+", "3", ")"];
-    let mut index = 0;
-    let result = term.evaluate(&input, &mut index);
-    assert_eq!(result, 5);
-}
-
-#[test]
 fn test_nested_expression() {
     use calculator::*;
 

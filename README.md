@@ -25,12 +25,6 @@ Add this to your `Cargo.toml`:
 decycle = "0.4.0"
 ```
 
-> **Advisory:** versions prior to 0.4.0 (including 0.3.0) have a broken
-> `support_infinite_cycle = true` (the default): any recursion deeper than
-> `recurse_level` jumps through an incorrectly-transmuted pointer and crashes
-> (SIGSEGV). Upgrade to 0.4.0 or later, or set `support_infinite_cycle = false`
-> on older versions. See `CHANGELOG.md` for details.
-
 ## Why Decycle?
 
 Without decycle, circular trait obligations cause compilation errors. Here's

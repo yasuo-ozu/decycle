@@ -1428,10 +1428,58 @@ fn side_predicate_strings(
 /// established syntactically: an unknown trait, no matching impl, more than one matching impl
 /// (ambiguous — treated as needing the union, but an actual mismatch between them still fails
 /// via `merge_subst`/string comparison), or an impl type param left unresolved by unification.
+/// Unify a candidate impl against a concrete obligation, matching BOTH the impl's self type and
+/// its trait own-arguments (`impl<T> Cast<T> for A` against the obligation `A: Cast<i64>` binds
+/// `T = i64`). A trait's own type-generic is determined by the trait argument, NOT the self type,
+/// so unifying the self type alone (as this used to) leaves such a `T` forever unbound and wrongly
+/// rejects the whole registration. Const/lifetime trait args match by the same rules
+/// `unify_type_pattern` uses inside a path's argument list.
+fn unify_impl_against_obligation(
+    pattern_vars: &std::collections::HashSet<Ident>,
+    cand_self: &Type,
+    cand_targs: &[GenericArgument],
+    obl_self: &Type,
+    obl_targs: &[GenericArgument],
+) -> Option<HashMap<Ident, Type>> {
+    let mut subst = unify_type_pattern(pattern_vars, cand_self, obl_self)?;
+    if cand_targs.len() != obl_targs.len() {
+        return None;
+    }
+    for (pg, cg) in cand_targs.iter().zip(obl_targs.iter()) {
+        match (pg, cg) {
+            (GenericArgument::Type(pt), GenericArgument::Type(ct)) => {
+                merge_subst(&mut subst, unify_type_pattern(pattern_vars, pt, ct)?)?;
+            }
+            (GenericArgument::Lifetime(_), GenericArgument::Lifetime(_)) => {}
+            (GenericArgument::Const(pe), GenericArgument::Const(ce)) => {
+                if quote!(#pe).to_string() != quote!(#ce).to_string() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(subst)
+}
+
+/// Apply a type substitution to every `GenericArgument::Type` in a trait arg list (const/lifetime
+/// args pass through), so a reachable-bound's trait args carry the same substitution its target
+/// type does when the reachability walk descends through a cross-edge.
+fn apply_targs_subst(targs: &[GenericArgument], subst: &HashMap<Ident, Type>) -> Vec<GenericArgument> {
+    targs
+        .iter()
+        .map(|g| match g {
+            GenericArgument::Type(t) => GenericArgument::Type(apply_type_subst(t, subst)),
+            other => other.clone(),
+        })
+        .collect()
+}
+
 fn reachable_side_bounds_ok(
     registering_impl: &ItemImpl,
     target_ty: &Type,
     target_trait: &Ident,
+    target_targs: &[GenericArgument],
     replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
 ) -> bool {
     let own_side: std::collections::HashSet<String> =
@@ -1440,12 +1488,22 @@ fn reachable_side_bounds_ok(
             .collect();
 
     let mut visited: std::collections::HashSet<(Ident, String)> = Default::default();
-    let mut queue: std::collections::VecDeque<(Ident, Type)> = Default::default();
-    queue.push_back((target_trait.clone(), target_ty.clone()));
+    let mut queue: std::collections::VecDeque<(Ident, Type, Vec<GenericArgument>)> =
+        Default::default();
+    queue.push_back((
+        target_trait.clone(),
+        target_ty.clone(),
+        target_targs.to_vec(),
+    ));
     let mut needed: Vec<String> = Vec::new();
 
-    while let Some((trait_ident, ty)) = queue.pop_front() {
-        let key = (trait_ident.clone(), quote!(#ty).to_string());
+    while let Some((trait_ident, ty, targs)) = queue.pop_front() {
+        // The visited key includes the trait args: two obligations on the same (trait, self type)
+        // but different trait args are genuinely distinct and must each be checked.
+        let key = (
+            trait_ident.clone(),
+            format!("{}|{}", quote!(#ty), quote!(#(#targs),*)),
+        );
         if !visited.insert(key) {
             continue;
         }
@@ -1463,7 +1521,16 @@ fn reachable_side_bounds_ok(
                     _ => None,
                 })
                 .collect();
-            let Some(subst) = unify_type_pattern(&pattern_vars, &cand.self_ty, &ty) else {
+            let cand_targs = cand
+                .trait_
+                .as_ref()
+                .map(|(_, path, _)| {
+                    nonlifetime_path_args(&path.segments.last().unwrap().arguments)
+                })
+                .unwrap_or_default();
+            let Some(subst) =
+                unify_impl_against_obligation(&pattern_vars, &cand.self_ty, &cand_targs, &ty, &targs)
+            else {
                 continue;
             };
             if pattern_vars.iter().any(|v| !subst.contains_key(v)) {
@@ -1476,7 +1543,11 @@ fn reachable_side_bounds_ok(
                 Some(&subst),
             ));
             for cb in cyclic_where_bounds(cand, replacing_table) {
-                queue.push_back((cb.trait_ident, apply_type_subst(&cb.target, &subst)));
+                queue.push_back((
+                    cb.trait_ident,
+                    apply_type_subst(&cb.target, &subst),
+                    apply_targs_subst(&cb.targs, &subst),
+                ));
             }
         }
         if !matched_any {
@@ -1955,8 +2026,22 @@ fn rule1_registration_ok(
     impl_: &ItemImpl,
     replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
 ) -> bool {
+    // The impl's own trait own-args (`impl<T> Cast<T> for A` -> `[T]`) are part of the obligation
+    // its rule-1 registration proves — the reachability walk must bind them (they may not appear
+    // in the self type at all), so thread them in rather than starting the walk arg-blind.
+    let self_targs = impl_
+        .trait_
+        .as_ref()
+        .map(|(_, path, _)| nonlifetime_path_args(&path.segments.last().unwrap().arguments))
+        .unwrap_or_default();
     !impl_has_bare_param_cyclic_bound(impl_, replacing_table)
-        && reachable_side_bounds_ok(impl_, &impl_.self_ty, &trait_.ident, replacing_table)
+        && reachable_side_bounds_ok(
+            impl_,
+            &impl_.self_ty,
+            &trait_.ident,
+            &self_targs,
+            replacing_table,
+        )
 }
 
 /// One `register::<Mk<...>>(fp, Re::<...> as usize);` statement.
@@ -2175,7 +2260,7 @@ fn build_shared_registrations(
         let Some((sibling_trait, _, _)) = replacing_table.get(&cb.trait_ident) else {
             continue;
         };
-        if !reachable_side_bounds_ok(impl_, &cb.target, &cb.trait_ident, replacing_table) {
+        if !reachable_side_bounds_ok(impl_, &cb.target, &cb.trait_ident, &cb.targs, replacing_table) {
             continue; // skipped bound => do NOT declare its binder (would be unused-but-harmless,
                        // but keeping the sets aligned avoids a stray param on a no-op fn)
         }

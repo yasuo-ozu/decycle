@@ -7,19 +7,23 @@ use std::collections::HashMap;
 use syn::visit_mut::VisitMut;
 use syn::*;
 
-pub mod finalize;
-mod helper;
-mod process_module;
+// ===== Existing algorithm: the `type-leak` ranked engine (finalize ping-pong) =====
+mod ranked;
+// Re-exports keeping the historical public paths (`decycle_impl::process_module`,
+// `decycle_impl::finalize`, …) and the crate-internal `crate::finalize` / `crate::helper` stable.
+pub use ranked::finalize;
+pub(crate) use ranked::helper;
+pub use ranked::process_module::process_module;
 #[cfg(feature = "type-leak")]
-mod process_trait;
+pub use ranked::process_trait::process_trait;
+
+// ===== Structural unroll: per-member `#[repr(transparent)]` terminators (`#[decycle(structural)]`) =====
+mod structural;
+pub use structural::process_module_structural;
 
 pub use proc_macro_error;
 #[cfg(feature = "type-leak")]
 pub use type_leak;
-
-pub use process_module::process_module;
-#[cfg(feature = "type-leak")]
-pub use process_trait::process_trait;
 
 #[cfg(feature = "type-leak")]
 #[derive(Clone)]

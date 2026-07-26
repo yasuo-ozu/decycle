@@ -12,6 +12,9 @@ pub use decycle_macro::__finalize;
 /// For example, a library might generate trait impls via a custom macro, but still
 /// want the enclosing module to be processed by decycle to break trait cycles.
 pub use decycle_impl::process_module;
+/// Bridging entry for the **structural unroll** algorithm (`#[decycle(structural)]`) — the
+/// per-member `#[repr(transparent)]` terminator approach, with no runtime and no type-leak.
+pub use decycle_impl::process_module_structural;
 /// Attribute macro that expands a module or trait to break circular trait
 /// obligations within the annotated module. Also see module-level documentation.
 ///

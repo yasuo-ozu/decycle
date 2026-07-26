@@ -7,6 +7,7 @@ use syn::*;
 use template_quote::quote;
 
 use decycle_impl::process_module;
+use decycle_impl::process_module_structural;
 use decycle_impl::process_trait;
 
 struct Args {
@@ -16,6 +17,7 @@ struct Args {
     allowed_paths: Option<Vec<Path>>,
     recurse_level: Option<usize>,
     support_infinite_cycle: Option<bool>,
+    structural: bool,
 }
 
 impl Parse for Args {
@@ -27,6 +29,7 @@ impl Parse for Args {
             allowed_paths: None,
             recurse_level: None,
             support_infinite_cycle: None,
+            structural: false,
         };
         syn::custom_keyword!(decycle);
         syn::custom_keyword!(marker);
@@ -34,9 +37,13 @@ impl Parse for Args {
         syn::custom_keyword!(allowed_paths);
         syn::custom_keyword!(recurse_level);
         syn::custom_keyword!(support_infinite_cycle);
+        syn::custom_keyword!(structural);
         while !input.is_empty() {
             let lookahead = input.lookahead1();
-            if lookahead.peek(decycle) {
+            if lookahead.peek(structural) {
+                input.parse::<structural>()?;
+                args.structural = true;
+            } else if lookahead.peek(decycle) {
                 input.parse::<decycle>()?;
                 input.parse::<Token![=]>()?;
                 args.decycle = Some(input.parse()?);
@@ -68,7 +75,7 @@ impl Parse for Args {
             } else {
                 abort!(
                     input.span(),
-                    "keyword arguments should be one of 'decycle', 'marker', 'alter_macro_name', 'allowed_paths', 'recurse_level', 'support_infinite_cycle'"
+                    "keyword arguments should be one of 'decycle', 'marker', 'alter_macro_name', 'allowed_paths', 'recurse_level', 'support_infinite_cycle', 'structural'"
                 )
             }
             if input.parse::<Token![,]>().is_err() {
@@ -87,16 +94,29 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
     let decycle_path = args.decycle.unwrap_or_else(|| parse_quote!(::decycle));
 
     if let Ok(module) = parse::<ItemMod>(input.clone()) {
-        let recurse_level = args.recurse_level.unwrap_or(10);
-        if recurse_level == 0 {
-            abort!(
-                Span::call_site(),
-                "recurse_level must be at least 1";
-                hint = "at level 0 the delegating impl would dispatch straight to the rank floor"
-            )
-        }
-        let support_infinite_cycle = args.support_infinite_cycle.unwrap_or(true);
-        let ret = process_module(module, &decycle_path, recurse_level, support_infinite_cycle);
+        let ret = if args.structural {
+            // The structural unroll has no rank floor, so the depth/infinite knobs don't apply.
+            if args.recurse_level.is_some() || args.support_infinite_cycle.is_some() {
+                abort!(
+                    Span::call_site(),
+                    "recurse_level / support_infinite_cycle are not supported with `structural`"
+                )
+            }
+            process_module_structural(module, &decycle_path)
+        } else {
+            let recurse_level = args.recurse_level.unwrap_or(10);
+            if recurse_level == 0 {
+                abort!(
+                    Span::call_site(),
+                    "recurse_level must be at least 1";
+                    hint = "at level 0 the delegating impl would dispatch straight to the rank floor"
+                )
+            }
+            let support_infinite_cycle = args.support_infinite_cycle.unwrap_or(true);
+            process_module(module, &decycle_path, recurse_level, support_infinite_cycle)
+        };
+        // Process FIRST so the dummy fallback is the (valid) expanded module, THEN reject unsupported
+        // args — matching the original ordering so an unsupported-arg abort doesn't cascade.
         set_dummy(quote!(#ret));
         if let Some(marker) = &args.marker {
             abort!(marker, "unsupported argument 'marker'")

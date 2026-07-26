@@ -21,6 +21,8 @@ proc-macro-error = { version = "1.0", default-features = false }
 # a `finalize`-only consumer (`default-features = false`) sheds it entirely.
 type-leak = { version = "0.7.0", optional = true }
 template-quote = "0.4.0"
+# Used only by the `structural` unroll (the ranked engine uses `template-quote`).
+quote = "1.0"
 
 [dependencies.syn]
 version = "2.0"

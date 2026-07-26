@@ -4,6 +4,47 @@ Notable changes, following [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/). Full defect analysis and design notes
 for 0.4.0 live in `docs/unbounded-reentry-plan.md` (repository only).
 
+## [Unreleased]
+
+### Added — structural unroll mode (`#[decycle(structural)]`)
+
+- A second, self-contained algorithm for breaking method-recursion cycles, selected with the new
+  `structural` flag: `#[decycle(structural)] mod … { … }`. It has **no runtime** (no registry, no
+  re-entry fn pointers, no `type_name` keys) and **no `type-leak` dependency** — everything is
+  resolved at compile time.
+- Mechanism: per cycle-member type it emits a `#[repr(transparent)]` terminator `__XxxTerm(pub Xxx)`
+  (matching `Xxx`'s visibility) and puts each trait impl on the terminator via a *trait-def-inside-body*
+  pattern (a private local trait whose method holds the original body verbatim, implemented for the
+  natural type so `self`/`Self`/constructors resolve unchanged); the natural type's impl delegates to
+  the terminator by a same-layout `transmute_copy`. The obligation cycle is broken by stripping the
+  cyclic `where`-bounds; a bare cyclic bound is kept on the local body impl so it still pins otherwise-
+  uninferable generics (`B: Frob<N>` for `B.frob(n)`), while resolving on sight through the natural impl.
+- Scope: like the ranked engine it only unrolls impls of traits annotated `#[decycle]` in the module.
+  Supports self-cycles, multi-type and multiroot cycles, **cross-trait** cycles (`Expr: Eval → Expr:
+  Size → Expr: Eval`, keyed on a `(type, trait)`-pair obligation graph), all receiver shapes
+  (`&self`/`&mut self`/owned/`self: Box<Self>`), method generics, argument-position `impl Trait`,
+  associated types/consts, and multiple `#[decycle]` traits per type. When a *wrapped* cyclic bound is
+  stripped (`Box<Stmt>: Tr`) it emits a compile-time forwarding assertion `for<T: Tr> Box<T>: Tr`.
+- Not supported (use the default ranked engine): **growing-type-argument** recursion — a return-position
+  `impl Trait` or a backtracking `Dup<…>`-style stream whose type grows one wrapper per descent level.
+  `recurse_level` / `support_infinite_cycle` are rejected with `structural` (there is no rank floor —
+  depth is bounded only by the OS call stack). Unbounded by construction.
+
+### Added — `impl Trait` arguments bounded by a cyclic trait
+
+- Input-position `impl Trait` in `#[decycle]` trait methods now works when the bound names
+  a *cyclic* `#[decycle]` trait defined in the same module (`fn sink(&self, other: impl Feed, ..)`
+  with `Feed` decycled). Previously this failed to compile (E0276 + E0277): the desugared
+  method-generic bound was rank-lowered to `FeedRanked<Rank>` in the inductive impls but kept
+  public on the ranked trait definition, and neither spelling is satisfiable for an argument
+  that is a value from outside the cycle (threaded through every rank, and only ever `T: Feed`
+  at the public boundary). The bound is now kept on the **public** trait consistently across the
+  ranked trait definition, the inductive impls, the leaf impls, and the re-entry fn — the
+  inductive impls qualify it with `super::` to escape the `shadowing_module` dummy that rebinds
+  the bare trait name. Works in both modes and past the floor; the cyclic trait may be generic
+  (`impl Feed<u8>`). Non-cyclic APIT bounds (`impl Fn(..)`, HRTB, multiple params) are unchanged;
+  return-position `impl Trait` remains a clean compile error in unbounded mode.
+
 ## [0.4.0]
 
 ### Advisory

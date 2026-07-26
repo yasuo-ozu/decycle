@@ -318,6 +318,20 @@ When it is `false`, no runtime machinery is emitted (zero-cost) and decycle
 stops at the configured `recurse_level` with an `unimplemented!` panic once the
 limit is reached.
 
+### `impl Trait` in method arguments
+
+Input-position `impl Trait` (APIT) in a `#[decycle]` trait method is desugared to a
+method-level generic on the ranked traits — `fn m(&self, x: impl Bound)` becomes
+`fn m<T: Bound>(&self, x: T)` — so it participates in ranking and re-entry like any
+generic method (each instantiation gets its own registry key). Multiple APIT
+parameters and HRTB bounds (`impl for<'a> Fn(&'a T)`) are supported, in both bounded
+and unbounded modes. The bound may itself name a *cyclic* `#[decycle]` trait
+(`fn sink(&self, other: impl Feed, ..)` where `Feed` is decycled): such an argument is
+a value supplied from outside the cycle, so its bound is kept on the **public** trait
+(never rank-lowered) and remains provable at the public boundary. Return-position
+`impl Trait` stays unsupported in unbounded mode (its erased fn-pointer type is not
+nameable — E0562) and produces a clean compile error.
+
 ### Coinduction
 
 Decycle is often compared with the [coinduction](https://crates.io/crates/coinduction)

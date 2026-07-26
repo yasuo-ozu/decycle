@@ -148,6 +148,17 @@ impl syn::visit_mut::VisitMut for TraitReplacer {
             syn::visit_mut::visit_type_path_mut(self, type_path);
         }
     }
+
+    /// Do not rank-lower trait paths that appear inside an input-position `impl Trait`
+    /// bound. Such a bound belongs to a desugared method generic (`desugar_impl_trait_inputs`)
+    /// and must stay on the PUBLIC trait: the argument is a value from outside the cycle,
+    /// so its bound holds at every rank via the public bootstrap, not at one ranked level.
+    /// Rewriting it to `TRanked<Rank>` here made the inductive impl's method-generic bound
+    /// (`ImplTrait0: FeedRanked<Rank>`) disagree with the ranked trait definition's
+    /// (`ImplTrait0: Feed`), yielding E0276/E0277 whenever an `impl CyclicTrait` argument
+    /// was used. Skipping the whole node leaves the bound untouched for the post-ranking
+    /// desugar pass to lift into a public-bounded generic.
+    fn visit_type_impl_trait_mut(&mut self, _: &mut syn::TypeImplTrait) {}
 }
 
 fn remove_cyclic_bounds(
@@ -471,9 +482,18 @@ fn replace_self(sig: &mut Signature, base_self_ty: &Type) {
     replacer.visit_signature_mut(sig);
 }
 
-fn replace_self_and_desugar_impl_trait(sig: &mut Signature, base_self_ty: &Type) {
-    replace_self(sig, base_self_ty);
-
+/// Desugars every input-position `impl Trait` into a fresh method-level type parameter
+/// (`ImplTrait{N}`) carrying the `impl Trait`'s bounds **verbatim**. The bounds are kept
+/// exactly as written — in particular a bound naming a `#[decycle]` trait stays on the
+/// PUBLIC trait and is never rank-lowered: the argument is a value supplied from outside
+/// the cycle (it satisfies the public trait via the bootstrap `impl<T: TRanked<Init>> T for T`,
+/// or, for internal delegation, is threaded through unchanged at every rank), so a
+/// rank-indexed bound would be both wrong (the same value can't satisfy `TRanked<Rank>` at
+/// every rank simultaneously) and inconsistent with the ranked trait definition (which keeps
+/// the public bound too). `TraitReplacer` therefore skips `impl Trait` bounds
+/// (`visit_type_impl_trait_mut`), and the inductive-impl path desugars only AFTER the ranking
+/// passes have run — see the call site.
+fn desugar_impl_trait_inputs(sig: &mut Signature) {
     let mut param_counter = 0usize;
 
     // Replace input-position impl Trait with type parameters
@@ -504,6 +524,60 @@ fn replace_self_and_desugar_impl_trait(sig: &mut Signature, base_self_ty: &Type)
             }
         }
     }
+}
+
+fn replace_self_and_desugar_impl_trait(sig: &mut Signature, base_self_ty: &Type) {
+    replace_self(sig, base_self_ty);
+    desugar_impl_trait_inputs(sig);
+}
+
+/// Within input-position `impl Trait` bounds only, qualify a bare bound naming a `#[decycle]`
+/// trait with `super::` so it resolves to the PUBLIC trait (defined in the user module — the
+/// parent of `shadowing_module`) instead of the empty dummy trait that `shadowing_module`
+/// rebinds the bare name to (that dummy exists to force ordinary body references through the
+/// ranked versions). Used ONLY for the inductive impls, which are emitted inside
+/// `shadowing_module`. The ranked trait definition, leaf impls, and re-entry fn all live in
+/// `ranked_traits`, whose `use super::super::*` already binds the bare name to the public trait
+/// — so they carry the bound unqualified. Both spellings must resolve to the SAME trait, or the
+/// inductive impl's method-generic bound disagrees with the ranked trait definition's (E0276).
+///
+/// The bound is left on the PUBLIC trait (never rank-lowered): an `impl Trait` argument is a
+/// value from outside the cycle, so its bound must hold at the public boundary — where the
+/// public→ranked delegation only knows `T: Trait`, not the (irreversible) `T: TraitRanked<Init>`.
+fn qualify_apit_cyclic_bounds_super(
+    sig: &mut Signature,
+    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+) {
+    use syn::visit_mut::VisitMut;
+
+    struct Qualifier<'a> {
+        table: &'a HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+    }
+
+    impl VisitMut for Qualifier<'_> {
+        fn visit_type_impl_trait_mut(&mut self, it: &mut syn::TypeImplTrait) {
+            for bound in it.bounds.iter_mut() {
+                if let syn::TypeParamBound::Trait(tb) = bound {
+                    let path = &mut tb.path;
+                    if path.leading_colon.is_none()
+                        && path.segments.len() == 1
+                        && self.table.contains_key(&path.segments[0].ident)
+                    {
+                        let seg = path.segments[0].clone();
+                        *path = parse_quote!(super::#seg);
+                    }
+                }
+            }
+            // A cyclic bound only appears at top level of the `impl Trait`; no need to recurse
+            // into its generic arguments (an `impl Foo<Bar>` where `Bar` is cyclic would be a
+            // non-cyclic use of `Bar` as a type argument, which stays as written).
+        }
+    }
+
+    Qualifier {
+        table: replacing_table,
+    }
+    .visit_signature_mut(sig);
 }
 
 fn process_trait_item_for_ranked(item: &TraitItem) -> TraitItem {
@@ -3178,16 +3252,6 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
 
                         let mut modified_impl = impl_.clone();
 
-                        // Desugar `impl Trait` in method signatures to match the ranked
-                        // trait definition (which also desugars via process_trait_item_for_ranked).
-                        // This must happen BEFORE TraitReplacer so bounds inside `impl Trait`
-                        // get rewritten too.
-                        for item in &mut modified_impl.items {
-                            if let ImplItem::Fn(ImplItemFn { sig, .. }) = item {
-                                replace_self_and_desugar_impl_trait(sig, &parse_quote!(Self));
-                            }
-                        }
-
                         // Step 1: Rewrite the impl's trait path with rank=(Rank,)
                         TraitReplacer {
                             table: trait_replacer_table.clone(),
@@ -3199,6 +3263,26 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                             table: trait_replacer_table.clone(),
                             rank_type: parse_quote!(#{name!("Rank")}),
                         }.visit_item_impl_mut(&mut modified_impl);
+
+                        // Desugar input-position `impl Trait` into method generics AFTER the
+                        // ranking passes: TraitReplacer skips `impl Trait` bounds
+                        // (`visit_type_impl_trait_mut`), so an `impl CyclicTrait` argument keeps
+                        // its PUBLIC bound (`ImplTrait0: Feed`, matching the ranked trait def)
+                        // instead of being wrongly rank-lowered to `ImplTrait0: FeedRanked<Rank>`.
+                        // Must run BEFORE the re-entry registration below, which reads each
+                        // method's generics (incl. the desugared params) to build per-instantiation
+                        // marker keys — the leaf side keys the same set, so both must agree.
+                        // Self is already the impl's own type here, so only desugar (no replace_self).
+                        // Qualify any `impl CyclicTrait` bound with `super::` FIRST (while it is
+                        // still inside the `impl Trait` node): `shadowing_module` shadows the bare
+                        // trait name with an empty dummy, so the bound must reach the public trait
+                        // in the parent module — the same trait the ranked def resolves to.
+                        for item in &mut modified_impl.items {
+                            if let ImplItem::Fn(ImplItemFn { sig, .. }) = item {
+                                qualify_apit_cyclic_bounds_super(sig, &replacing_table);
+                                desugar_impl_trait_inputs(sig);
+                            }
+                        }
 
                         // Add Rank as a generic parameter
                         modified_impl.generics.params.push(parse_quote!(#{name!("Rank")}));

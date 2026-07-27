@@ -170,7 +170,7 @@ pub use decycle_impl::process_trait;
 
 /// Programmatic entry point for the `#[decycle]` transformation.
 ///
-/// A wrapper macro crate (e.g. syan's `#[recurse]`) constructs [`finalize::FinalizeArgs`]
+/// A wrapper macro crate constructs [`finalize::FinalizeArgs`]
 /// directly and calls [`finalize::finalize`], bypassing the token-carrier ping-pong entirely
 /// (and its `crate_version` assertion, which only guards the `Parse` carrier path). This
 /// surface is **semver-committed**: `FinalizeArgs`' fields and `finalize`'s signature are part
@@ -183,8 +183,8 @@ pub use decycle_impl::finalize;
 
 /// D1 bridge (impl-spec §C.4): convenience root re-export of
 /// [`decycle_impl::finalize::ranked_trait_name`] — the exact ident mangling `finalize` uses for
-/// a `#[decycle]` trait's synthesized ranked counterpart. A programmatic caller (e.g. syan's
-/// `#[recurse]`) needs this to spell a rank-PRESERVING wrapper impl BEFORE calling `finalize`,
+/// a `#[decycle]` trait's synthesized ranked counterpart. A programmatic caller needs this
+/// to spell a rank-PRESERVING wrapper impl BEFORE calling `finalize`,
 /// since such a wrapper must be emitted outside `finalize`'s own output (see
 /// [`finalize::AlsoRank`]'s docs on the rank-preserving wrapper constraint, and
 /// [`finalize::ranked_trait_path`] for the full path form). This surface is
@@ -218,21 +218,28 @@ pub trait Repeater<const RANDOM: u64, const IX: usize, PARAM: ?Sized> {
 /// content* of generated per-(trait, method, instantiation) marker ZSTs — robust against
 /// linker identical-code-folding and `-Zshare-generics` (string identity, not address
 /// identity) — paired with a layout fingerprint (`type_name` is non-injective: e.g. two
-/// closures declared in one fn share a `{{closure}}` name, so the fold over each key type's
-/// size/align keeps different-layout instantiations on distinct keys — an ABI-mismatched
-/// transmute-call is thereby unreachable). The map is **thread-local**: every registration a
-/// floor depends on is emitted on the same call stack (register-before-descend), hence the
-/// same thread — so a thread-local map preserves the coverage guarantee while making
-/// cross-thread interleaving physically unable to cross-contaminate keys, and there is no
-/// lock to poison and no contention. Registration is an idempotent insert: the same key
-/// always maps to the same fn, so overwrite is harmless.
+/// closures declared in one fn share a `{{closure}}` name, and the fold over each key type's
+/// size/align only keeps *different-layout* instantiations on distinct keys). The fingerprint
+/// does NOT separate two **same-layout** closures — different bodies, or even different
+/// signatures, fold identically and share one key — so key uniqueness is *not* what makes the
+/// transmute-call sound. Soundness rests on two other properties: (1) **register-before-descend
+/// at every rank** — each inductive frame re-registers its own re-entry fn immediately before
+/// descending, so the floor of any real descent reads the entry its own descent wrote last,
+/// i.e. its own instantiation's fn; and (2) **fail-closed lookup** — a miss panics (see
+/// `lookup`) rather than transmute-calling a colliding entry. The map is **thread-local**:
+/// every registration a floor depends on is emitted on the same call stack
+/// (register-before-descend), hence the same thread — so a thread-local map preserves the
+/// coverage guarantee while making cross-thread interleaving physically unable to
+/// cross-contaminate keys, and there is no lock to poison and no contention. Registration is an
+/// idempotent insert governed by that ordering: overwrite by an unrelated instantiation
+/// *between* descents is harmless because the next descent re-registers before its own floor.
 ///
 /// **Semver-committed bridge surface (D1, E3 replan §1.2).** `FP_SEED`, `fp_fold`,
 /// `fp_fold_word`, `register`, and `lookup` — together with the key construction
 /// `(type_name::<Mk<Target, targs…, margs…>>(), fp)`, where `Mk` is the per-(trait × method)
 /// marker [`decycle_impl::finalize::reentry_marker_name`] names and `fp` is
 /// [`decycle_impl::finalize::fingerprint_expr`]'s fold — are a stable library API: a
-/// programmatic `finalize` caller (syan's `#[recurse]`) hand-emits registrations that a
+/// programmatic `finalize` caller hand-emits registrations that a
 /// `finalize`-emitted floor must find. Any change to the key construction, the fold
 /// constants, or these signatures is a breaking change to such callers, `__` prefix
 /// notwithstanding.
@@ -277,7 +284,9 @@ pub mod __reentry {
              generic method's first descent at cycle width > recurse_level (including \
              self-recursion consuming ranks before the first generic cross-edge call), or an \
              impl whose cyclic bound targets a bare type parameter. Increase recurse_level; \
-             if two same-signature closures are involved, give them distinct named types.",
+             if two same-LAYOUT closures share this method's floor (even with different \
+             signatures or bodies — `type_name` collapses closures and the key folds only \
+             layout), give them distinct named types.",
         )
     }
 }

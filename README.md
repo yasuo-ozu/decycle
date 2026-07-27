@@ -188,34 +188,38 @@ mod cycle {
 # fn main() {}
 ```
 
-## Attribute Arguments
+## Two algorithms
 
-- **Module**: 
-  - `#[decycle::decycle(recurse_level = N, support_infinite_cycle = true|false, decycle = path)]`
-  - `recurse_level`: expansion depth (default 10, must be at least 1)
-  - `support_infinite_cycle`: enables/disable infinite cycle handling (default true)
-  - `decycle`: override the path used to refer to this crate
-- **Trait**:
-  - `#[decycle::decycle(marker = path, decycle = path)]`
-  - `marker`: marker type used for internal references (required when reported)
-  - `decycle`: override the path used to refer to this crate
-  - `allowed_paths = [path, ...]`: overrides the type-leak allowed-path set (advanced; rarely needed)
+`#[decycle]` on a module selects one of two independent cycle-breaking strategies:
 
-## Contributing
+|                                                 | `#[decycle]` (default)                          | `#[decycle(structural)]`                              |
+| ----------------------------------------------- | ----------------------------------------------- | ---------------------------------------------------- |
+| Approach                                        | ranked helper traits + runtime re-entry         | per-type `#[repr(transparent)]` terminators + casts  |
+| Runtime                                         | thread-local re-entry registry                  | none                                                 |
+| `type-leak` in generated code                   | yes                                             | no                                                   |
+| Growing-type-arg recursion (`Dup` stream, RPIT) | supported (RPIT: `support_infinite_cycle = false` only) | not supported                                |
+| Depth bound                                      | OS stack (or `recurse_level` when bounded)      | OS stack (always)                                    |
 
-Contributions are welcome. Please open an issue or PR.
+The `type-leak` row is about the *generated* code: `#[decycle(structural)]` emits none. The `decycle`
+proc-macro crate itself still compiles `type-leak` at build time (it backs the trait-level
+`#[decycle]` attribute); only a programmatic consumer of `decycle-impl` built with
+`default-features = false` sheds that build dependency entirely.
 
-## License
+Both consume the same module shape — `#[decycle]`-annotated traits and their cyclic
+impls — and are behaviourally interchangeable for ordinary method-recursion cycles.
+About nine test files run identical scenarios under **both** engines (via the
+`dual_mod!` / `on_both!` harness in `tests/common/mod.rs`) as an equivalence check.
 
-MIT
+### The ranked engine (default)
 
-## The mechanism
-
-`#[decycle]` rewrites the annotated module into a set of ranked helper traits.
-Each original trait gets a hidden "Ranked" version that carries an extra type
-parameter representing recursion depth. Implementations are duplicated with that
-rank parameter, and calls are delegated through the ranked trait for the current
-depth. This breaks the direct cycle at the type level.
+`#[decycle]` rewrites the annotated module into a set of ranked helper traits. Each
+original trait gets a hidden "Ranked" version that carries an extra type parameter
+representing recursion depth. Implementations are duplicated with that rank parameter, and
+calls are delegated through the ranked trait for the current depth. This breaks the direct
+cycle at the type level. It is the engine that handles **growing-type-argument** recursion —
+a return-position `impl Trait` (bounded mode), or a backtracking `Dup<…>`-style stream whose
+type would otherwise grow one wrapper per descent level — so prefer it unless you
+specifically want zero runtime machinery.
 
 Smallest example (two mutually recursive traits):
 
@@ -275,8 +279,8 @@ mod cycle {
         fn b(&self) -> usize { self.0 + 1 }
     }
 
-    // Floor: the compile-time chain bottoms out here (see "The mechanism"
-    // below for what actually happens here instead of `unimplemented!`).
+    // Floor: the compile-time chain bottoms out here (see the paragraph below for
+    // what actually happens here instead of `unimplemented!`).
     impl ARanked<()> for Left {
         fn a(&self) -> usize { unimplemented!("decycle: cycle limit reached") }
     }
@@ -318,7 +322,7 @@ When it is `false`, no runtime machinery is emitted (zero-cost) and decycle
 stops at the configured `recurse_level` with an `unimplemented!` panic once the
 limit is reached.
 
-### `impl Trait` in method arguments
+#### `impl Trait` in method arguments
 
 Input-position `impl Trait` (APIT) in a `#[decycle]` trait method is desugared to a
 method-level generic on the ranked traits — `fn m(&self, x: impl Bound)` becomes
@@ -332,11 +336,157 @@ a value supplied from outside the cycle, so its bound is kept on the **public** 
 `impl Trait` stays unsupported in unbounded mode (its erased fn-pointer type is not
 nameable — E0562) and produces a clean compile error.
 
-### Coinduction
+### The structural unroll (`#[decycle(structural)]`)
+
+A second, self-contained algorithm with **no runtime and no `type-leak` dependency** —
+everything is resolved at compile time.
+
+```rust
+# use decycle::decycle;
+#[decycle(structural)]
+mod ast {
+    #[decycle]
+    pub trait Eval {
+        fn eval(&self) -> i64;
+    }
+
+    pub enum Expr {
+        Lit(i64),
+        Node(Option<Box<Expr>>),
+    }
+
+    impl Eval for Expr
+    where
+        Expr: Eval, // the cyclic obligation
+    {
+        fn eval(&self) -> i64 {
+            match self {
+                Expr::Lit(n) => *n,
+                Expr::Node(c) => 1 + c.as_ref().map_or(0, |x| x.eval()),
+            }
+        }
+    }
+}
+
+fn main() {
+    use ast::Eval;
+    let e = ast::Expr::Node(Some(Box::new(
+        ast::Expr::Node(Some(Box::new(ast::Expr::Lit(3)))),
+    )));
+    assert_eq!(e.eval(), 5);
+}
+```
+
+**How it works.** For each cycle-member type `Xxx` it emits a `#[repr(transparent)]`
+terminator `__XxxTerm(pub Xxx)` (with the same visibility as `Xxx`). Each trait impl is
+placed on the terminator via a *trait-def-inside-body* pattern — a private local trait
+whose method holds the **original body verbatim**, implemented for the natural type so
+`self`, `Self` and constructors resolve unchanged. The natural type's impl then delegates
+to the terminator by a same-layout `transmute_copy`. The obligation cycle is broken by
+**stripping the cyclic `where`-bounds** from the terminator/natural impls (a *bare* cyclic
+bound is kept on the local body impl, where it resolves on-sight through the natural impl
+and still pins otherwise-uninferable generics). Cross-trait cycles
+(`Expr: Eval → Expr: Size → Expr: Eval`) are recognised via a `(type, trait)`-pair
+obligation graph.
+
+The expansion of the example above (simplified, real internal names):
+
+```rust,ignore
+mod ast {
+    #[inline]
+    unsafe fn __decycle_cast<A, B>(a: A) -> B {
+        let b = ::core::mem::transmute_copy::<A, B>(&a);
+        ::core::mem::forget(a);
+        b
+    }
+
+    pub trait Eval { fn eval(&self) -> i64; }
+    pub enum Expr { Lit(i64), Node(Option<Box<Expr>>) }
+
+    // one #[repr(transparent)] terminator per cycle-member type
+    #[repr(transparent)]
+    pub struct __ExprTerm(pub Expr);
+
+    // the body lives on the terminator, via a local trait impl'd for the *natural* type
+    impl Eval for __ExprTerm {
+        fn eval(&self) -> i64 {
+            trait __DecycleBody: Sized { fn __run(&self) -> i64; }
+            impl __DecycleBody for Expr
+            where
+                Expr: Eval, // bare cyclic bound kept here (resolves on-sight)
+            {
+                fn __run(&self) -> i64 {
+                    match self { // ← ORIGINAL body, verbatim (`self`/`Self` unchanged)
+                        Expr::Lit(n) => *n,
+                        Expr::Node(c) => 1 + c.as_ref().map_or(0, |x| x.eval()),
+                    }
+                }
+            }
+            unsafe {
+                __decycle_cast(<Expr as __DecycleBody>::__run(
+                    &*(self as *const Self as *const Expr),
+                ))
+            }
+        }
+    }
+
+    // the natural type delegates to its terminator (same layout → the cast is exact)
+    impl Eval for Expr {
+        fn eval(&self) -> i64 {
+            unsafe {
+                __decycle_cast(<__ExprTerm as Eval>::eval(
+                    &*(self as *const Self as *const __ExprTerm),
+                ))
+            }
+        }
+    }
+}
+```
+
+**Supported.** Self-, multi-type, multiroot and **cross-trait** cycles; every receiver
+shape (`&self`, `&mut self`, owned `self`, `self: Box<Self>`); method generics;
+argument-position `impl Trait`; destructured parameters; associated types/consts;
+multiple `#[decycle]` traits on one type; and methods taking an already-erased
+`&mut dyn Trait` argument. When a *wrapped* cyclic bound is stripped (e.g. `Box<Stmt>: Tr`)
+it also emits a compile-time forwarding assertion `for<T: Tr> Box<T>: Tr`.
+
+**Limitations** (use the default ranked engine instead):
+
+- **Growing-type-argument recursion** — a return-position `impl Trait`, or a backtracking
+  `Dup<…>`-style stream whose type grows one wrapper per descent level. This is exactly
+  what the ranked engine's fn-pointer re-entry exists for; the layout cast cannot express it.
+- `recurse_level` / `support_infinite_cycle` are rejected with `structural` — there is no
+  rank floor, so depth is bounded only by the OS call stack (unbounded by construction).
+- A *wrapped* cyclic bound requires its container to actually forward the trait (a blanket
+  `impl<T: Tr> Tr for Container<T>`); otherwise the emitted forwarding assertion fails to
+  compile. HRTB wrapped bounds (`for<'a> Wrap<&'a A>: Tr`) are not supported.
+
+### Comparison with `coinduction`
 
 Decycle is often compared with the [coinduction](https://crates.io/crates/coinduction)
-crate and its documentation on [docs.rs](https://docs.rs/coinduction), which is
-developed to solve the same problem. Coinduction’s
-expands all related dependencies into a flat set, which removes
-the dependency loop at the type level and lets mutually recursive bounds resolve
-in one pass.
+crate (and its [docs.rs](https://docs.rs/coinduction) documentation), which is developed
+to solve the same problem. Coinduction expands all related dependencies into a flat set,
+which removes the dependency loop at the type level and lets mutually recursive bounds
+resolve in one pass.
+
+## Attribute Arguments
+
+- **Module**: 
+  - `#[decycle::decycle(recurse_level = N, support_infinite_cycle = true|false, decycle = path)]`
+  - `structural`: use the structural unroll instead of the ranked engine (see [Two algorithms](#two-algorithms)); incompatible with `recurse_level` / `support_infinite_cycle`
+  - `recurse_level`: expansion depth (default 10, must be at least 1)
+  - `support_infinite_cycle`: enables/disable infinite cycle handling (default true)
+  - `decycle`: override the path used to refer to this crate
+- **Trait**:
+  - `#[decycle::decycle(marker = path, decycle = path)]`
+  - `marker`: marker type used for internal references (required when reported)
+  - `decycle`: override the path used to refer to this crate
+  - `allowed_paths = [path, ...]`: overrides the type-leak allowed-path set (advanced; rarely needed)
+
+## Contributing
+
+Contributions are welcome. Please open an issue or PR.
+
+## License
+
+MIT

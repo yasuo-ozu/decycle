@@ -30,8 +30,8 @@ features = ["full", "derive", "printing", "extra-traits", "visit", "visit-mut"]
 
 [features]
 # `process_trait` (the `#[decycle]`-on-a-trait attribute) interns paths via type-leak; the
-# programmatic `finalize` entry (the bridge a wrapper macro crate like syan's `#[recurse]`
-# uses) does not. Default keeps the attribute working; a `finalize`-only consumer sets
+# programmatic `finalize` entry (the bridge a wrapper macro crate uses) does not. Default
+# keeps the attribute working; a `finalize`-only consumer sets
 # `default-features = false`.
 default = ["type-leak"]
 type-leak = ["dep:type-leak"]

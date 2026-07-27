@@ -56,10 +56,12 @@ pub(crate) struct ImplBlock {
 pub(crate) struct Model {
     pub adts: BTreeMap<String, Adt>,
     pub impls: Vec<ImplBlock>,
+    /// Per-expansion nonce suffixed onto every generated identifier for hygiene.
+    pub nonce: u64,
 }
 
 impl Model {
-    pub fn collect(items: &[Item]) -> syn::Result<Self> {
+    pub fn collect(items: &[Item], nonce: u64) -> syn::Result<Self> {
         let mut adts = BTreeMap::new();
         let mut impls = Vec::new();
         for it in items {
@@ -101,7 +103,11 @@ impl Model {
                 _ => {}
             }
         }
-        Ok(Model { adts, impls })
+        Ok(Model {
+            adts,
+            impls,
+            nonce,
+        })
     }
 }
 

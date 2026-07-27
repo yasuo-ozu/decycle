@@ -8,7 +8,7 @@ use super::*;
 /// `self: Box<Self>` / `Pin<&mut Self>` / `Rc<Self>` — casts the whole receiver value from its declared
 /// type to that type with `Self` replaced by `target` (both are same-layout because `__MTerm` is a
 /// `#[repr(transparent)]` wrapper of the natural type).
-fn receiver_cast(r: &syn::Receiver, target: &Type) -> TokenStream {
+fn receiver_cast(r: &syn::Receiver, target: &Type, nonce: u64) -> TokenStream {
     // Emit the receiver's OWN `self` token (not a fresh one) so its hygiene matches the method's
     // `self` parameter even when the impl arrived through a `macro_rules!` wrapper.
     let self_tok = &r.self_token;
@@ -21,7 +21,8 @@ fn receiver_cast(r: &syn::Receiver, target: &Type) -> TokenStream {
     } else {
         let src = &r.ty; // e.g. `Self` or `Box<Self>` — `Self` = this impl's Self
         let dst = subst_self(&r.ty, target);
-        quote! { unsafe { __decycle_cast::<#src, #dst>(#self_tok) } }
+        let cast = cast_ident(nonce);
+        quote! { unsafe { #cast::<#src, #dst>(#self_tok) } }
     }
 }
 
@@ -126,8 +127,8 @@ pub(crate) fn codegen_scc(model: &Model, scc: &Scc) -> syn::Result<TokenStream> 
 /// `#[repr(transparent)] <vis> struct __MTerm<params>(<vis> M<params>);` — the per-member terminator, a
 /// same-layout wrapper of the natural type. Its visibility (and its field's) matches `M`, so wrapping a
 /// private cycle type doesn't expose it through a `pub` interface (no `private_interfaces`).
-pub(crate) fn make_term_item(member: &Adt) -> TokenStream {
-    let term = term_ident(&member.ident.to_string());
+pub(crate) fn make_term_item(member: &Adt, nonce: u64) -> TokenStream {
+    let term = term_ident(&member.ident.to_string(), nonce);
     let m_id = &member.ident;
     let vis = member.vis();
     let decl = bare_generics_decl(&member.generics);
@@ -155,10 +156,10 @@ fn make_impls(model: &Model, scc: &Scc, im: &ImplBlock) -> syn::Result<TokenStre
 
     // natural self type `M<self_args>` and its terminator `__MTerm<self_args>` (same layout).
     let (natural, term_ty): (Type, Type) = if self_args.is_empty() {
-        let term = term_ident(&m);
+        let term = term_ident(&m, model.nonce);
         (parse_quote!(#m_ident), parse_quote!(#term))
     } else {
-        let term = term_ident(&m);
+        let term = term_ident(&m, model.nonce);
         (
             parse_quote!(#m_ident< #(#self_args),* >),
             parse_quote!(#term< #(#self_args),* >),
@@ -173,7 +174,7 @@ fn make_impls(model: &Model, scc: &Scc, im: &ImplBlock) -> syn::Result<TokenStre
 
     let mut assertions = TokenStream::new();
     for sw in &stripped_wrapped {
-        assertions.extend(emit_forwarding_assertion(sw, scc, &reduced));
+        assertions.extend(emit_forwarding_assertion(sw, scc, &reduced, model.nonce));
     }
 
     // Pass 1: associated items (types/consts). They go on BOTH the natural and terminator impls, and
@@ -196,8 +197,8 @@ fn make_impls(model: &Model, scc: &Scc, im: &ImplBlock) -> syn::Result<TokenStre
     // Pass 2: methods.
     for it in &im.item.items {
         if let ImplItem::Fn(f) = it {
-            term_methods.extend(rec_method(f, &natural, &local, &assoc_items)?);
-            nat_methods.extend(nat_method(f, &term_ty, &trait_path)?);
+            term_methods.extend(rec_method(f, &natural, &local, &assoc_items, model.nonce)?);
+            nat_methods.extend(nat_method(f, &term_ty, &trait_path, model.nonce)?);
         }
     }
 
@@ -224,15 +225,22 @@ fn rec_method(
     natural: &Type,
     reduced: &syn::Generics,
     assoc_items: &[&ImplItem],
+    nonce: u64,
 ) -> syn::Result<TokenStream> {
     let attrs = &f.attrs;
     let vis = &f.vis;
-    let outer_sig = &f.sig;
+    // Rewrite destructured / `mut` / `ref` params to fresh idents so the dispatch can forward them;
+    // the original patterns are rebound at the top of the body.
+    let (norm_sig, rebinds) = normalize_sig(&f.sig, nonce);
+    let outer_sig = &norm_sig;
     let body = &f.block;
 
-    // `fn __run(<original sig>)` — same signature, renamed.
-    let mut run_sig = f.sig.clone();
-    run_sig.ident = format_ident!("__run");
+    let body_tr = body_ident(nonce);
+    let run = run_ident(nonce);
+
+    // `fn __run(<normalized sig>)` — same signature, renamed.
+    let mut run_sig = norm_sig.clone();
+    run_sig.ident = run.clone();
 
     let (impl_g, _, where_g) = reduced.split_for_impl();
     let trait_g = wrap_angle(&bare_generics_decl(reduced)); // `<Span, Token>` for the trait decl
@@ -247,27 +255,29 @@ fn rec_method(
     // cast result up.
     let mut call_args: Vec<TokenStream> = Vec::new();
     if let Some(r) = outer_sig.receiver() {
-        call_args.push(receiver_cast(r, natural));
+        call_args.push(receiver_cast(r, natural, nonce));
     }
-    call_args.extend(forward_args(outer_sig, natural)?);
+    call_args.extend(forward_args(outer_sig, natural, nonce)?);
     let turbofish = method_turbofish(outer_sig);
     let call = quote! {
-        < #natural as __DecycleBody #use_g >::__run #turbofish ( #(#call_args),* )
+        < #natural as #body_tr #use_g >::#run #turbofish ( #(#call_args),* )
     };
+    let cast = cast_ident(nonce);
     let dispatch = match &outer_sig.output {
         ReturnType::Default => quote! { #call; },
-        ReturnType::Type(..) => quote! { unsafe { __decycle_cast(#call) } },
+        ReturnType::Type(..) => quote! { unsafe { #cast(#call) } },
     };
 
+    let inline = inline_attr(attrs);
     Ok(quote! {
-        #(#attrs)* #vis #outer_sig {
-            trait __DecycleBody #trait_g : Sized {
+        #inline #(#attrs)* #vis #outer_sig {
+            trait #body_tr #trait_g : Sized {
                 #(#assoc_decls)*
                 #run_sig ;
             }
-            impl #impl_g __DecycleBody #use_g for #natural #where_g {
+            impl #impl_g #body_tr #use_g for #natural #where_g {
                 #(#assoc_defs)*
-                #run_sig #body
+                #run_sig { #(#rebinds)* #body }
             }
             #dispatch
         }
@@ -292,29 +302,46 @@ fn assoc_decl(item: &ImplItem) -> TokenStream {
     }
 }
 
+/// `#[inline]` for a generated dispatch shim, unless the user's own method already carries an
+/// `#[inline]` (the user attrs are cloned onto the shim, and a duplicate would trip
+/// `unused_attributes`). Both shims are tiny pass-throughs; inlining lets a downstream crate collapse
+/// the natural→terminator→`__run` chain to a direct call even without LTO (the user body lives in the
+/// un-attributed `__run`, so this never force-duplicates user code).
+fn inline_attr(attrs: &[Attribute]) -> TokenStream {
+    if attrs.iter().any(|a| a.path().is_ident("inline")) {
+        quote!()
+    } else {
+        quote!(#[inline])
+    }
+}
+
 /// Delegating method on the natural type: cast the receiver (if any) into `Rec`-space, call the Rec
 /// impl's trait method, and cast the result back.
 fn nat_method(
     f: &syn::ImplItemFn,
     closed_rec: &Type,
     trait_path: &syn::Path,
+    nonce: u64,
 ) -> syn::Result<TokenStream> {
     let attrs = &f.attrs;
     let vis = &f.vis;
-    let sig = &f.sig;
+    let (norm_sig, _) = normalize_sig(&f.sig, nonce);
+    let sig = &norm_sig;
     let name = &sig.ident;
     let mut call_args: Vec<TokenStream> = Vec::new();
     if let Some(r) = sig.receiver() {
-        call_args.push(receiver_cast(r, closed_rec));
+        call_args.push(receiver_cast(r, closed_rec, nonce));
     }
-    call_args.extend(forward_args(sig, closed_rec)?);
+    call_args.extend(forward_args(sig, closed_rec, nonce)?);
     // forward the method's own type/const generics (lifetimes inferred) so non-inferable params resolve
     let turbofish = method_turbofish(sig);
     let call = quote! { < #closed_rec as #trait_path >::#name #turbofish ( #(#call_args),* ) };
+    let cast = cast_ident(nonce);
+    let inline = inline_attr(attrs);
     match &sig.output {
-        ReturnType::Default => Ok(quote! { #(#attrs)* #vis #sig { #call; } }),
+        ReturnType::Default => Ok(quote! { #inline #(#attrs)* #vis #sig { #call; } }),
         ReturnType::Type(..) => Ok(quote! {
-            #(#attrs)* #vis #sig { unsafe { __decycle_cast(#call) } }
+            #inline #(#attrs)* #vis #sig { unsafe { #cast(#call) } }
         }),
     }
 }
@@ -322,8 +349,9 @@ fn nat_method(
 /// Forward the non-receiver parameters (receiver handled separately). An argument whose type mentions
 /// `Self` (e.g. `other: &Self` in `PartialEq::eq`) is cast into `target`-space, exactly like the
 /// receiver; others pass through by ident.
-fn forward_args(sig: &syn::Signature, target: &Type) -> syn::Result<Vec<TokenStream>> {
+fn forward_args(sig: &syn::Signature, target: &Type, nonce: u64) -> syn::Result<Vec<TokenStream>> {
     let mut out = Vec::new();
+    let cast = cast_ident(nonce);
     for a in &sig.inputs {
         if let syn::FnArg::Typed(pt) = a {
             let id = match &*pt.pat {
@@ -338,13 +366,39 @@ fn forward_args(sig: &syn::Signature, target: &Type) -> syn::Result<Vec<TokenStr
             let ty = &pt.ty;
             if mentions_self(ty) {
                 let dst = subst_self(ty, target);
-                out.push(quote! { unsafe { __decycle_cast::<#ty, #dst>(#id) } });
+                out.push(quote! { unsafe { #cast::<#ty, #dst>(#id) } });
             } else {
                 out.push(quote!(#id));
             }
         }
     }
     Ok(out)
+}
+
+/// Rewrite every non-trivial parameter pattern to a fresh ident so the dispatch can forward each
+/// param by name AND the fresh signature is legal in the bodiless `__run` trait declaration. Returns
+/// the rewritten signature plus the `let <original-pattern> = <fresh-ident>;` rebinds to prepend to
+/// the body (which still uses the original bindings). Only a bare `ident: T` (no `mut`, no `ref`, no
+/// subpattern) is left alone — a `mut x` / `ref x` / destructured param must be rewritten too, else it
+/// lands verbatim in the bodiless trait method decl and trips `E0642` (patterns in a fn without a
+/// body) / the deny-by-default `patterns_in_fns_without_body` lint (for `mut`).
+fn normalize_sig(sig: &syn::Signature, nonce: u64) -> (syn::Signature, Vec<TokenStream>) {
+    let mut renamed = sig.clone();
+    let mut rebinds = Vec::new();
+    for (i, input) in renamed.inputs.iter_mut().enumerate() {
+        if let syn::FnArg::Typed(pt) = input {
+            let is_plain_ident = matches!(&*pt.pat,
+                syn::Pat::Ident(pi)
+                    if pi.subpat.is_none() && pi.by_ref.is_none() && pi.mutability.is_none());
+            if !is_plain_ident {
+                let fresh = arg_ident(i, nonce);
+                let orig = (*pt.pat).clone();
+                rebinds.push(quote! { let #orig = #fresh; });
+                pt.pat = Box::new(parse_quote!(#fresh));
+            }
+        }
+    }
+    (renamed, rebinds)
 }
 
 /// Whether `ty` mentions the `Self` type anywhere.
@@ -390,40 +444,62 @@ fn reduce_generics(
         syn::punctuated::Punctuated::new();
 
     for pred in generics.where_clause.iter().flat_map(|w| &w.predicates) {
-        let mut is_cyclic = false;
-        let mut is_wrapped = false;
-        if let WherePredicate::Type(pt) = pred {
-            let refs = local_refs(&pt.bounded_ty, &adt_names);
-            // A cyclic edge: some trait bound `TrB` on the pred where a referenced type `B` makes
-            // `(B, TrB)` a member of THIS SCC (possibly a different trait — that's what breaks a
-            // cross-trait cycle).
-            let trait_bound = pt.bounds.iter().find_map(|b| match b {
-                syn::TypeParamBound::Trait(tb) => {
-                    let btr = tb.path.segments.last()?.ident.to_string();
-                    refs.iter()
-                        .any(|r| scc.contains(r, &btr))
-                        .then(|| tb.path.clone())
-                }
-                _ => None,
-            });
-            if let Some(trait_path) = trait_bound {
-                is_cyclic = true;
-                if is_wrapped_member(&pt.bounded_ty, &member_set) {
-                    is_wrapped = true;
-                    wrapped.push(StrippedWrapped {
-                        container: pt.bounded_ty.clone(),
-                        trait_path,
-                    });
-                }
+        let WherePredicate::Type(pt) = pred else {
+            // lifetime / eq predicates are never cyclic — keep verbatim in both.
+            reduced_preds.push(pred.clone());
+            local_preds.push(pred.clone());
+            continue;
+        };
+        let refs = local_refs(&pt.bounded_ty, &adt_names);
+        // Split THIS predicate's bounds: a *cyclic* bound is a trait `TrB` where a referenced type
+        // `B` makes `(B, TrB)` a member of THIS SCC (possibly a different trait — that is what breaks
+        // a cross-trait cycle). Only cyclic bounds break the obligation cycle; any co-bound on the
+        // same predicate (`Clone` in `Expr: Eval + Clone`) must SURVIVE onto the reduced impls, else
+        // valid input fails to compile.
+        let mut cyclic_paths: Vec<syn::Path> = Vec::new();
+        let mut noncyclic: syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]> =
+            syn::punctuated::Punctuated::new();
+        for b in &pt.bounds {
+            let is_cyclic_bound = matches!(b,
+                syn::TypeParamBound::Trait(tb) if tb.path.segments.last().is_some_and(|s|
+                    refs.iter().any(|r| scc.contains(r, &s.ident.to_string()))));
+            match b {
+                syn::TypeParamBound::Trait(tb) if is_cyclic_bound => cyclic_paths.push(tb.path.clone()),
+                _ => noncyclic.push(b.clone()),
             }
         }
-        match (is_cyclic, is_wrapped) {
-            (false, _) => {
-                reduced_preds.push(pred.clone());
-                local_preds.push(pred.clone());
+        if cyclic_paths.is_empty() {
+            // no cyclic bound: keep the whole predicate in both.
+            reduced_preds.push(pred.clone());
+            local_preds.push(pred.clone());
+            continue;
+        }
+        // The surviving (non-cyclic) bounds rebuilt as their own predicate, if any remain.
+        let survivor = (!noncyclic.is_empty()).then(|| {
+            let mut keep = pt.clone();
+            keep.bounds = noncyclic.clone();
+            WherePredicate::Type(keep)
+        });
+        if is_wrapped_member(&pt.bounded_ty, &member_set) {
+            // wrapped cyclic bound(s): dropped from both impls; each gets a forwarding assertion. The
+            // co-bounds survive onto both.
+            for trait_path in cyclic_paths {
+                wrapped.push(StrippedWrapped {
+                    container: pt.bounded_ty.clone(),
+                    trait_path,
+                });
             }
-            (true, false) => local_preds.push(pred.clone()), // bare cyclic: kept for the local impl
-            (true, true) => {}                               // wrapped cyclic: dropped everywhere
+            if let Some(s) = &survivor {
+                reduced_preds.push(s.clone());
+                local_preds.push(s.clone());
+            }
+        } else {
+            // bare cyclic bound: dropped from `reduced` (breaks the cycle) but the FULL predicate is
+            // kept in `local` so the bare bound still pins generics on-sight through the natural impl.
+            if let Some(s) = survivor {
+                reduced_preds.push(s);
+            }
+            local_preds.push(pred.clone());
         }
     }
 
@@ -448,7 +524,7 @@ fn is_wrapped_member(ty: &Type, members: &HashSet<String>) -> bool {
     match ty {
         Type::Path(tp) if tp.qself.is_none() => {
             let head = tp.path.segments.last().map(|s| s.ident.to_string());
-            !head.map_or(false, |h| members.contains(&h))
+            !head.is_some_and(|h| members.contains(&h))
         }
         _ => true, // tuple / array / reference / … are always containers
     }
@@ -456,13 +532,14 @@ fn is_wrapped_member(ty: &Type, members: &HashSet<String>) -> bool {
 
 /// Replace every member-headed path in `ty` with the ident `__DecycleX` (dropping its args), so
 /// `Box<Stmt<T>>` becomes `Box<__DecycleX>` — the generic container for the forwarding assertion.
-fn generalize_members(ty: &Type, members: &HashSet<String>) -> Type {
-    let repl: Type = parse_quote!(__DecycleX);
+fn generalize_members(ty: &Type, members: &HashSet<String>, nonce: u64) -> Type {
+    let x = memberx_ident(nonce);
+    let repl: Type = parse_quote!(#x);
     fn go(ty: &Type, members: &HashSet<String>, repl: &Type) -> Type {
         match ty {
             Type::Path(tp) if tp.qself.is_none() => {
                 let head = tp.path.segments.last().map(|s| s.ident.to_string());
-                if head.map_or(false, |h| members.contains(&h)) {
+                if head.is_some_and(|h| members.contains(&h)) {
                     return repl.clone();
                 }
                 let mut tp = tp.clone();
@@ -524,9 +601,14 @@ fn generalize_members(ty: &Type, members: &HashSet<String>) -> Type {
 /// container bound whose container does not forward the trait — a real soundness signal. Skipped when
 /// the trait or generalized container still mentions an impl generic (would be out of the const's
 /// scope) — the assertion stays a pure crate-private item, so no `private_interfaces` ever arises.
-fn emit_forwarding_assertion(sw: &StrippedWrapped, scc: &Scc, reduced: &syn::Generics) -> TokenStream {
+fn emit_forwarding_assertion(
+    sw: &StrippedWrapped,
+    scc: &Scc,
+    reduced: &syn::Generics,
+    nonce: u64,
+) -> TokenStream {
     let member_set: HashSet<String> = scc.types().into_iter().collect();
-    let generalized = generalize_members(&sw.container, &member_set);
+    let generalized = generalize_members(&sw.container, &member_set, nonce);
     let trait_path = &sw.trait_path;
 
     let param_idents: HashSet<String> = reduced
@@ -542,13 +624,17 @@ fn emit_forwarding_assertion(sw: &StrippedWrapped, scc: &Scc, reduced: &syn::Gen
         return quote!();
     }
 
+    let needs = format_ident!("__decycle_needs_{:016x}", nonce);
+    let assert = format_ident!("__decycle_assert_{:016x}", nonce);
+    let u = format_ident!("__DecycleU_{:016x}", nonce);
+    let x = memberx_ident(nonce);
     quote! {
         const _: () = {
             #[allow(dead_code)]
-            fn __decycle_needs<__DecycleU: #trait_path>() {}
+            fn #needs<#u: #trait_path>() {}
             #[allow(dead_code)]
-            fn __decycle_assert<__DecycleX: #trait_path>() {
-                __decycle_needs::<#generalized>()
+            fn #assert<#x: #trait_path>() {
+                #needs::<#generalized>()
             }
         };
     }

@@ -34,7 +34,7 @@ mod bareparam {
     pub struct Wrap<T>(pub T);
     pub struct Leaf;
 
-    // The bare-param wrapper under test (mirrors syan's container shim
+    // The bare-param wrapper under test (mirrors a wrapper macro's container shim
     // `impl<T: __ParseDyn> __ParseDyn for Vec<T>`): a CONCRETE in-module `Wrap`, generic over
     // any `T: Cb` (resp. `T: Ca`). Its own `Self: Ca`/`Self: Cb` obligation is registered by NO
     // frame pre-C4.

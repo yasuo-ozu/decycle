@@ -1,4 +1,7 @@
-error: decycle: cannot build unbounded re-entry (`support_infinite_cycle = true`) for method `ca`: it returns `impl Trait`, whose erased fn-pointer type is not nameable. Return a concrete or boxed type (e.g. `Box<dyn Trait>`), or set `support_infinite_cycle = false` for this cycle.
+error: decycle: return-position `impl Trait` in method `ca` of #[decycle] trait `Ca` is not supported by the ranked re-entry engine
+
+         = help: return a concrete or boxed type (e.g. `Box<dyn Trait>`), or set `support_infinite_cycle = false`
+
   --> tests/ui/reentry_impl_trait_return.rs:11:32
    |
 11 |         fn ca(&self, n: usize) -> impl Iterator<Item = u8>;

@@ -764,8 +764,9 @@ fn sig_has_impl_trait_input(sig: &Signature) -> bool {
 
 /// D4: true iff the method's RETURN type mentions `impl Trait` anywhere. Such a method's
 /// erased fn-pointer alias `fn(...) -> impl Trait` is not nameable (E0562), so unbounded
-/// re-entry cannot be built for it.
-fn sig_has_impl_trait_output(sig: &Signature) -> bool {
+/// re-entry cannot be built for it — and the ranked ADT rewrite can't name it in bounded mode
+/// either. `process_module` uses this to reject RPITIT early with an actionable error.
+pub(crate) fn sig_has_impl_trait_output(sig: &Signature) -> bool {
     struct Find(bool);
     impl<'ast> syn::visit::Visit<'ast> for Find {
         fn visit_type_impl_trait(&mut self, _: &'ast TypeImplTrait) {
@@ -1086,7 +1087,7 @@ fn any_type_has_projection<'a>(tys: impl Iterator<Item = &'a Type>) -> bool {
 /// naming the re-entry fn still requires the target `Sized` at every ordinary registration
 /// site, but a syntactically unsized target is exactly the case that isn't).
 ///
-/// D1 bridge (semver-committed): a programmatic caller (syan) MUST build every hand-emitted
+/// D1 bridge (semver-committed): a programmatic caller MUST build every hand-emitted
 /// registration's fp through THIS fn with the same argument recipe the floor uses —
 /// `(decycle, target, is_syntactically_unsized(target), trait_generics, targs,
 /// Some(&method_sig.generics))` — so registration and floor keys agree by construction.
@@ -1896,7 +1897,7 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize, _decycle: &Path) -> T
             .collect();
         // C3: `normalize_reentry_sig` only bare-`Self`-substitutes the signature (params +
         // output type) — a `Self::Assoc` PROJECTION surviving in the copied method
-        // where-clause (e.g. syan's span-tying surface `A: Spanned<Span = Self::SpanParam>`)
+        // where-clause (e.g. a span-tying surface `A: Spanned<Span = Self::SpanParam>`)
         // is left as a literal `Self`, which is E0411 in the FREE `#re` fn below (it has no
         // `Self`, only `#s_ident`). Project it through the real trait here, exactly as
         // `norm.params`/`norm.output_ty` already are: `Self::SpanParam` ⟿
@@ -2127,7 +2128,7 @@ fn rule1_registration_ok(
 /// to let a caller outside `shadowing_module` emit a well-formed registration.
 ///
 /// D1 bridge (semver-committed): the third emission site — a programmatic `finalize` caller
-/// (syan's `#[recurse]` E3 path) splicing registrations alongside `finalize`'s output (the C4
+/// (a wrapper macro's E3 path) splicing registrations alongside `finalize`'s output (the C4
 /// scope; pass `rt_path = quote!(#{shadowing_module_name()}::#{ranked_traits_module_name()})`).
 // The parameter list is the semver-committed bridge signature; bundling it into a struct
 // would be a breaking change, so the arity is intentional.
@@ -2529,7 +2530,7 @@ pub fn ranked_trait_path(trait_ident: &Ident) -> Path {
 /// synthesized rank parameter — the index of the first non-lifetime generic param, or
 /// `trait_.generics.params.len()` if the trait declares none (mirrors the `rank_loc`
 /// computation `finalize` itself uses when building `replacing_table`/`trait_replacer_table`,
-/// above). All three of syan's erased traits (`__ParseDyn`/`__UnparseDyn`/`__SpanDyn`, impl-spec
+/// above). All three of a wrapper macro's erased traits (`__ParseDyn`/`__UnparseDyn`/`__SpanDyn`, impl-spec
 /// §A) declare no generics of their own, so this is always `0` for them: the ranked trait is
 /// `XxxRanked<Rank>` (a single type param), exactly the shape the rank-preserving wrapper sketch
 /// (`impl<R, Slot: XxxRanked<R>> XxxRanked<R> for Group<Slot,O,C>`) assumes without further
@@ -2560,8 +2561,8 @@ pub fn reentry_fn_name(trait_ident: &Ident, method_ident: &Ident) -> Ident {
 }
 
 /// D1 bridge: the erased fn-pointer type alias ident (`__Fp_<Trait>_<method><suffix>`) — the
-/// only transmute target a floor may name. Exposed for completeness/diagnostics; syan's
-/// emissions never need to transmute (only `finalize`'s own floors do).
+/// only transmute target a floor may name. Exposed for completeness/diagnostics; a wrapper
+/// macro's emissions never need to transmute (only `finalize`'s own floors do).
 pub fn reentry_alias_name(trait_ident: &Ident, method_ident: &Ident) -> Ident {
     name!("__Fp_{}_{}", trait_ident, method_ident)
 }
@@ -2769,7 +2770,7 @@ pub fn floor_rank() -> Type {
 /// D1 bridge: one rank step — `rank_succ(&R) = (R,)`. This is the exact encoding the
 /// inductive rewrite uses: the impl's TRAIT-path rank is spelled `(Rank,)` against the
 /// body/where-clause rank `Rank` (TraitReplacer steps 1 and 2 in `finalize`). A caller
-/// emitting its own RANK-PRESERVING impls (syan's per-occurrence group impls) does NOT use
+/// emitting its own RANK-PRESERVING impls (a wrapper macro's per-occurrence group impls) does NOT use
 /// this — both sides of a rank-preserving impl carry the same rank variable; it exists so a
 /// caller can compose/spell concrete ranks (`Ranked<((),)>`) identically to `finalize`.
 pub fn rank_succ(rank: &Type) -> Type {
@@ -3528,12 +3529,12 @@ mod tests {
         assert!(hay.contains(&fin), "Final initial rank is not spelled `((),)`:\n{}", out);
     }
 
-    /// D1 gate: a hand-emitted, syan-style registration byte-agrees with (1) `finalize`'s own
+    /// D1 gate: a hand-emitted registration byte-agrees with (1) `finalize`'s own
     /// rule-1 registration prologue and (3) the floor's `lookup` key, for the same
     /// (trait, method, target). All three are built through the one shared pair
     /// `fingerprint_expr` + `emit_registration`/`reentry_*_name`, so agreement is by
     /// construction; this locks it at the token level. (2) additionally pins the C4/sibling-
-    /// scope spelling — the exact form syan's `register_all_members` prelude emits.
+    /// scope spelling — the exact form a wrapper macro's registration prelude emits.
     #[test]
     fn d1_hand_registration_byte_agrees_with_floor_lookup() {
         let (args, ca_trait, _) = d1_cycle_args(true); // unbounded: floors + registrations
@@ -3563,7 +3564,7 @@ mod tests {
             "hand-built registration does not byte-agree with rule 1's prologue:\n{}", out
         );
 
-        // (2) the sibling-scope (C4 / syan) spelling — identical statement modulo the
+        // (2) the sibling-scope (C4 / wrapper-macro) spelling — identical statement modulo the
         // `shadowing_module::` prefix; the KEY (marker type_name + fp) is the same type either
         // way. Pin the exact emitted shape:
         let sm = super::shadowing_module_name();
@@ -3679,7 +3680,7 @@ mod tests {
 
     /// D1 bridge (impl-spec §C.4): [`super::ranked_trait_name`]/[`super::ranked_trait_path`]
     /// must predict the EXACT name/path `finalize` itself mints for a trait's ranked
-    /// counterpart — a caller (syan) needs to spell a rank-preserving wrapper impl BEFORE
+    /// counterpart — a caller needs to spell a rank-preserving wrapper impl BEFORE
     /// calling `finalize`, so there is no chance to read the name back out of `finalize`'s own
     /// output first. Same proven two-trait cycle as `finalize_output_is_carrier_free` (never
     /// aborts/warns), reused here purely to inspect the generated ranked-trait declarations
@@ -3736,7 +3737,7 @@ mod tests {
         };
         let out = finalize(args).to_string();
 
-        // Rule check: neither of syan's three erased traits (`__ParseDyn`/`__UnparseDyn`/
+        // Rule check: neither of the three erased traits (`__ParseDyn`/`__UnparseDyn`/
         // `__SpanDyn`, impl-spec §A) declares any generics of its own, so `rank_loc` is always
         // `0` — the same shape as this test's `Ca`/`Cb`.
         for trait_ in [&ca_trait, &cb_trait] {

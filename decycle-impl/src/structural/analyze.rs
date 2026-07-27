@@ -126,7 +126,7 @@ impl Graph {
     fn reaches(&self, from: &Pair, to: &Pair) -> bool {
         if from == to {
             // reflexive only through a real path (self-edge)
-            return self.adj.get(from).map_or(false, |s| s.contains(to));
+            return self.adj.get(from).is_some_and(|s| s.contains(to));
         }
         let mut stack = vec![from.clone()];
         let mut seen = HashSet::new();
@@ -152,7 +152,7 @@ impl Graph {
             return true;
         }
         let n = &comp[0];
-        self.adj.get(n).map_or(false, |s| s.contains(n))
+        self.adj.get(n).is_some_and(|s| s.contains(n))
     }
 }
 

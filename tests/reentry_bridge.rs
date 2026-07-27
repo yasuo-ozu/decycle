@@ -6,11 +6,13 @@
 // This test hand-simulates the reentry registry, whose values ARE function addresses stored as
 // `usize` (exactly what the macro emits: `Re::<..> as usize`). The `fn as usize` casts are the
 // mechanism under test, not an accident.
+// `unknown_lints` keeps this compiling on toolchains whose clippy predates `function_casts_as_integer`.
+#![allow(unknown_lints)]
 #![allow(function_casts_as_integer)]
 
 use decycle::__reentry::{fp_fold, fp_fold_word, lookup, register, FP_SEED};
 
-/// A syan-style marker ZST — the same shape `emit_reentry_items` mints
+/// A marker ZST — the same shape `emit_reentry_items` mints
 /// (`PhantomData<(*const Target, …)>`). The key is `type_name::<Mk<..>>()` STRING content +
 /// the layout fingerprint, so a hand declaration works exactly like a generated one.
 struct HandMk<S: ?Sized>(core::marker::PhantomData<*const S>);

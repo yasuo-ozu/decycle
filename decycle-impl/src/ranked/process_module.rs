@@ -294,6 +294,27 @@ pub fn process_module(
             "cannot detect traits nor `use` statement annotated with #[decycle]"
         )
     }
+    // Return-position `impl Trait` (RPITIT) in a #[decycle] trait method is an ACTUAL limitation of
+    // the ranked re-entry engine: full-height re-entry needs a nameable fn-pointer return, but
+    // `fn(..) -> impl Trait` is not nameable (E0562). Reject it up-front (in the unbounded path where
+    // re-entry is built) with an actionable message rather than leaking a raw solver error from deep
+    // in the generated code. (Bounded mode `support_infinite_cycle = false` never builds re-entry, so
+    // RPITIT there is a plain rustc property — a diverging floor body infers `()` — and is left alone.)
+    if support_infinite_cycle {
+        for t in &traits {
+            for item in &t.items {
+                if let TraitItem::Fn(tf) = item {
+                    if crate::finalize::sig_has_impl_trait_output(&tf.sig) {
+                        abort!(
+                            &tf.sig.output,
+                            "decycle: return-position `impl Trait` in method `{}` of #[decycle] trait `{}` is not supported by the ranked re-entry engine", tf.sig.ident, t.ident;
+                            help = "return a concrete or boxed type (e.g. `Box<dyn Trait>`), or set `support_infinite_cycle = false`"
+                        );
+                    }
+                }
+            }
+        }
+    }
     let all_traits: HashSet<Ident> = working_list
         .iter()
         .filter_map(|path| path.segments.last().map(|seg| seg.ident.clone()))

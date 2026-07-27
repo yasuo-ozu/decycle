@@ -1,12 +1,12 @@
 //! The `&mut dyn Trait` erasure case: a cross-trait cycle threading an ALREADY-erased stream
-//! (`&mut (dyn Stream + '_)`, syan's `&mut dyn ParseStream` shape). Because the stream parameter is
+//! (`&mut (dyn Stream + '_)`, the same shape as an erased `&mut dyn ParseStream`). Because the stream parameter is
 //! concrete/non-generic, re-entry crosses one fixed `&mut dyn` boundary with no `Dup<…>` stream-type
 //! tower growth. Run under BOTH algorithms.
 #![allow(dead_code)]
 
 mod common;
 
-/// A tiny stand-in for syan's `dyn ParseStream`: an object-safe trait erasing the concrete stream.
+/// A tiny stand-in for a `dyn ParseStream`-style trait: an object-safe trait erasing the concrete stream.
 pub trait Stream {
     fn advance(&mut self) -> Option<u8>;
 }

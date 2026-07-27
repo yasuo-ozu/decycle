@@ -21,7 +21,7 @@ decycle-impl = { path = "decycle-impl", version = "0.4.0", default-features = fa
 [features]
 # `process_trait` (the `#[decycle]`-on-a-trait attribute) needs type-leak; the programmatic
 # `finalize` bridge (see `finalize` module docs) does not. Default-on for drop-in compatibility;
-# a `finalize`-only consumer (e.g. syan's `#[recurse]`) sets `default-features = false` to shed
+# a `finalize`-only consumer sets `default-features = false` to shed
 # the type-leak dependency (and its MSRV floor — see D2 in the decycle bridge spec).
 default = ["type-leak"]
 type-leak = ["decycle-impl/type-leak"]

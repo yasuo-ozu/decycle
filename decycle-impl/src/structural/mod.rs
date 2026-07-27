@@ -50,6 +50,10 @@ fn expand(mut module: ItemMod, decycle: &Path) -> syn::Result<TokenStream> {
         .map(|s| s.ident.clone())
         .ok_or_else(|| syn::Error::new(decycle.span(), "empty decycle path"))?;
 
+    // Per-expansion hygiene nonce, derived from the (pre-mutation) module tokens. Every generated
+    // identifier carries it so nothing the engine emits can collide with a user identifier.
+    let nonce = make_nonce(&module.to_token_stream());
+
     let brace_items = match &mut module.content {
         Some((_, items)) => items,
         None => {
@@ -71,7 +75,7 @@ fn expand(mut module: ItemMod, decycle: &Path) -> syn::Result<TokenStream> {
     }
 
     let items = brace_items.clone();
-    let model = Model::collect(&items)?;
+    let model = Model::collect(&items, nonce)?;
     let sccs = model.cyclic_sccs(&decycle_traits);
 
     let mut replaced_impls: HashSet<(String, String)> = HashSet::new();
@@ -85,14 +89,18 @@ fn expand(mut module: ItemMod, decycle: &Path) -> syn::Result<TokenStream> {
 
     let mut out = TokenStream::new();
 
-    // The one layout-cast helper.
+    // The one layout-cast helper. `a` is placed in `ManuallyDrop` and never moved again, so the
+    // bitwise `transmute_copy` result is the only owner: moving `a` into a `forget` *after* the copy
+    // (the previous shape) retagged any `Box`/`&mut` inside it and invalidated the copy's tags —
+    // Stacked-Borrows UB for every by-value `Self` shape containing a `Box`. Reading through a shared
+    // `&ManuallyDrop<A>` performs no such retag, so the returned value's provenance stays valid.
+    let cast = cast_ident(nonce);
     out.extend(quote! {
         #[inline]
         #[allow(dead_code)]
-        unsafe fn __decycle_cast<__A, __B>(a: __A) -> __B {
-            let b = ::core::mem::transmute_copy::<__A, __B>(&a);
-            ::core::mem::forget(a);
-            b
+        unsafe fn #cast<__A, __B>(a: __A) -> __B {
+            let a = ::core::mem::ManuallyDrop::new(a);
+            ::core::mem::transmute_copy::<::core::mem::ManuallyDrop<__A>, __B>(&a)
         }
     });
 
@@ -121,7 +129,7 @@ fn expand(mut module: ItemMod, decycle: &Path) -> syn::Result<TokenStream> {
             .adts
             .get(m)
             .ok_or_else(|| syn::Error::new(Span::call_site(), format!("unknown ADT {m}")))?;
-        out.extend(make_term_item(adt));
+        out.extend(make_term_item(adt, model.nonce));
     }
 
     // Generated impls, per cyclic SCC.

@@ -46,8 +46,8 @@ jobs:
       # (and in the three `rust-version` fields) must move with it.
       #
       # Build both feature configurations: the default (type-leak, backed by safegraph) and
-      # the `default-features = false` finalize-only bridge that downstream wrappers (e.g.
-      # syan's `#[recurse]`) depend on — the latter is the whole reason the floor is this low.
+      # the `default-features = false` finalize-only bridge that downstream wrappers depend
+      # on — the latter is the whole reason the floor is this low.
       - name: cargo build (default features — decycle + macro + impl)
         run: cargo build -p decycle -p decycle-macro -p decycle-impl
       - name: cargo build (decycle-impl, no default features)

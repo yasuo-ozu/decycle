@@ -1,8 +1,7 @@
 # Changelog
 
 Notable changes, following [Keep a Changelog](https://keepachangelog.com/) and
-[Semantic Versioning](https://semver.org/). Full defect analysis and design notes
-for 0.4.0 live in `docs/unbounded-reentry-plan.md` (repository only).
+[Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
@@ -10,8 +9,10 @@ for 0.4.0 live in `docs/unbounded-reentry-plan.md` (repository only).
 
 - A second, self-contained algorithm for breaking method-recursion cycles, selected with the new
   `structural` flag: `#[decycle(structural)] mod … { … }`. It has **no runtime** (no registry, no
-  re-entry fn pointers, no `type_name` keys) and **no `type-leak` dependency** — everything is
-  resolved at compile time.
+  re-entry fn pointers, no `type_name` keys) and its **generated code uses no `type-leak`** —
+  everything is resolved at compile time. (The proc-macro crate still links `type-leak` at build time
+  for the trait-level `#[decycle]` attribute; only a `decycle-impl` consumer with
+  `default-features = false` sheds that build dependency.)
 - Mechanism: per cycle-member type it emits a `#[repr(transparent)]` terminator `__XxxTerm(pub Xxx)`
   (matching `Xxx`'s visibility) and puts each trait impl on the terminator via a *trait-def-inside-body*
   pattern (a private local trait whose method holds the original body verbatim, implemented for the
@@ -45,6 +46,17 @@ for 0.4.0 live in `docs/unbounded-reentry-plan.md` (repository only).
   (`impl Feed<u8>`). Non-cyclic APIT bounds (`impl Fn(..)`, HRTB, multiple params) are unchanged;
   return-position `impl Trait` remains a clean compile error in unbounded mode.
 
+### Changed — return-position `impl Trait` (RPITIT) rejected earlier and more clearly
+
+- A `#[decycle]` trait method with a return-position `impl Trait`, under the default
+  `support_infinite_cycle = true`, is now rejected **up-front during module processing** with an
+  actionable error that names the method and trait, instead of an `abort!` fired deep in re-entry
+  codegen (which could leave a raw solver error alongside it). RPITIT is a genuine limitation of the
+  ranked re-entry engine: full-height re-entry needs a nameable `fn(..) -> T` fn-pointer alias, and
+  `fn(..) -> impl Trait` is `E0562`. Return a concrete or boxed type (e.g. `Box<dyn Trait>`), or set
+  `support_infinite_cycle = false`. **Bounded mode is unchanged** — it builds no re-entry, so RPITIT
+  there stays a plain rustc property (a diverging rank floor infers the hidden type as `()`).
+
 ## [0.4.0]
 
 ### Advisory
@@ -71,7 +83,11 @@ crashes (SIGSEGV). Workaround on old versions: `support_infinite_cycle = false`.
 - Residual unregisterable floors **fail closed** with an actionable, isolated panic
   (never memory unsafety): a generic method's first descent past the floor, bare
   type-param cyclic bounds (`impl<T: Cb> Ca for Wrap<T>`), and heterogeneous
-  side-bound cycles.
+  side-bound cycles. This backstop — not registry-key uniqueness — is also what keeps
+  *closure-keyed* floors sound: two same-layout closures share a key (the fingerprint
+  folds only layout), so a floor whose exact instantiation didn't register on the current
+  descent hits this fail-closed panic rather than transmute-calling a colliding re-entry fn.
+  (If it fires for that reason, give the closures distinct named types.)
 - `recurse_level = 0` is a clean compile error. The previously-disabled 6-trait
   dense-cycle test now passes in both modes. `support_infinite_cycle = false`
   is unchanged (zero-cost, `unimplemented!` at the limit).

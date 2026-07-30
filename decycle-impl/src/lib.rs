@@ -1,9 +1,5 @@
-// `HashMap`/`VisitMut` are used solely by the `GenericRenamer` cluster below, which only
-// the type-leak-gated `process_trait` path calls — gate the imports to keep the
-// `default-features = false` (finalize-only) build warning-free.
-#[cfg(feature = "type-leak")]
+// `HashMap`/`VisitMut` are used by the `GenericRenamer` cluster below, reached via `process_trait`.
 use std::collections::HashMap;
-#[cfg(feature = "type-leak")]
 use syn::visit_mut::VisitMut;
 use syn::*;
 
@@ -14,25 +10,29 @@ mod ranked;
 pub use ranked::finalize;
 pub(crate) use ranked::helper;
 pub use ranked::process_module::process_module;
-#[cfg(feature = "type-leak")]
 pub use ranked::process_trait::process_trait;
 
 // ===== Structural unroll: per-member `#[repr(transparent)]` terminators (`#[decycle(structural)]`) =====
 mod structural;
 pub use structural::process_module_structural;
 
+// Rendering `syn::Generics` to token form, shared by both engines.
+mod generics_fmt;
+
+/// Emitted by both engines when a `#[decycle]` module contains no trait (nor `#[decycle] use`)
+/// annotated with `#[decycle]` — nothing marks a cycle participant, so there is nothing to break.
+pub(crate) const NO_DECYCLE_TRAITS_MSG: &str =
+    "cannot detect traits nor `use` statement annotated with #[decycle]";
+
 pub use proc_macro_error;
-#[cfg(feature = "type-leak")]
 pub use type_leak;
 
-#[cfg(feature = "type-leak")]
 #[derive(Clone)]
 struct GenericRenamer {
     pub(crate) lifetime_renames: HashMap<String, Lifetime>,
     pub(crate) ident_renames: HashMap<String, Ident>,
 }
 
-#[cfg(feature = "type-leak")]
 impl VisitMut for GenericRenamer {
     fn visit_lifetime_mut(&mut self, lt: &mut Lifetime) {
         if let Some(new) = self.lifetime_renames.get(&lt.ident.to_string()) {
@@ -71,7 +71,6 @@ impl VisitMut for GenericRenamer {
     }
 }
 
-#[cfg(feature = "type-leak")]
 pub(crate) fn randomize_impl_generics(
     generics: &mut Generics,
     random_suffix: u64,
@@ -135,6 +134,60 @@ fn ident_to_path(ident: &Ident) -> Path {
         })
         .collect(),
     }
+}
+
+/// Attributes on a trait-method impl that must be replicated onto EVERY generated copy of that
+/// method (the delegating shim, each ranked/inductive copy, the floor, the re-entry fn, the
+/// structural `__run`), not applied just once. These are idempotent, layer-sensitive diagnostics /
+/// codegen hints: `#[track_caller]` must be on every frame for `Location::caller()` to reach the real
+/// call site; a `#[allow/warn/deny/forbid(...)]` on the method must cover the copy that actually
+/// carries the user's body; `#[inline]`/`#[cold]`/`#[must_use]` are hints. Deliberately EXCLUDES
+/// `cfg`/`cfg_attr` (needs separate handling), `derive`, `doc`, and arbitrary attribute macros —
+/// replicating those would double-run them or duplicate items.
+pub(crate) fn propagated_method_attrs(attrs: &[Attribute]) -> Vec<Attribute> {
+    attrs
+        .iter()
+        .filter(|a| {
+            let p = a.path();
+            p.is_ident("track_caller")
+                || p.is_ident("inline")
+                || p.is_ident("cold")
+                || p.is_ident("allow")
+                || p.is_ident("warn")
+                || p.is_ident("deny")
+                || p.is_ident("forbid")
+                || p.is_ident("must_use")
+        })
+        .cloned()
+        .collect()
+}
+
+/// The `#[cfg(...)]` / `#[cfg_attr(...)]` attributes on an item. decycle can't *evaluate* these (a
+/// proc-macro doesn't know the target/features), so instead it REPLICATES them onto every item it
+/// generates from a cfg-gated source item — the generated machinery then strips together with the
+/// source under rustc's post-expansion cfg pass, instead of referencing an item rustc removed.
+pub(crate) fn extract_cfg_attrs(attrs: &[Attribute]) -> Vec<Attribute> {
+    attrs
+        .iter()
+        .filter(|a| a.path().is_ident("cfg") || a.path().is_ident("cfg_attr"))
+        .cloned()
+        .collect()
+}
+
+/// Symbol-defining attributes: `#[no_mangle]`, `#[export_name]`, `#[link_section]`. They produce a
+/// FIXED externally-visible symbol, so — unlike diagnostic attrs — they must land on EXACTLY ONE
+/// emitted copy of a method: the callable delegating impl on the ORIGINAL type implementing the
+/// ORIGINAL trait. Replicating them onto the internal ranked/terminator copies would yield duplicate
+/// symbols; dropping them from the callable copy (the previous behavior) silently ignored the user's
+/// intent. So each engine keeps them on the delegating/natural copy and strips them elsewhere.
+pub(crate) fn is_symbol_attr(a: &Attribute) -> bool {
+    let p = a.path();
+    p.is_ident("no_mangle") || p.is_ident("export_name") || p.is_ident("link_section")
+}
+
+/// The symbol-defining attributes among `attrs` (see [`is_symbol_attr`]).
+pub(crate) fn symbol_attrs(attrs: &[Attribute]) -> Vec<Attribute> {
+    attrs.iter().filter(|a| is_symbol_attr(a)).cloned().collect()
 }
 
 fn get_random() -> u64 {

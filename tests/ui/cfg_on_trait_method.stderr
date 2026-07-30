@@ -1,0 +1,40 @@
+error: decycle: `#[cfg]`/`#[cfg_attr]` on trait method `ev` inside a #[decycle] cycle is not supported
+
+         = help: gate the whole `impl` or type with the `#[cfg]` instead of the individual method
+
+  --> tests/ui/cfg_on_trait_method.rs:19:12
+   |
+19 |         fn ev(&self) -> i64 {
+   |            ^^
+
+error[E0275]: overflow evaluating the requirement `L: Ev`
+  --> tests/ui/cfg_on_trait_method.rs:16:9
+   |
+16 |         R: Ev,
+   |         ^^^^^
+   |
+note: required for `R` to implement `Ev`
+  --> tests/ui/cfg_on_trait_method.rs:23:10
+   |
+23 |     impl Ev for R
+   |          ^^     ^
+24 |     where
+25 |         L: Ev,
+   |            -- unsatisfied trait bound introduced here
+   = help: see issue #48214
+
+error[E0275]: overflow evaluating the requirement `R: Ev`
+  --> tests/ui/cfg_on_trait_method.rs:25:9
+   |
+25 |         L: Ev,
+   |         ^^^^^
+   |
+note: required for `L` to implement `Ev`
+  --> tests/ui/cfg_on_trait_method.rs:14:10
+   |
+14 |     impl Ev for L
+   |          ^^     ^
+15 |     where
+16 |         R: Ev,
+   |            -- unsatisfied trait bound introduced here
+   = help: see issue #48214

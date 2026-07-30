@@ -43,7 +43,15 @@ pub(crate) fn arg_ident(i: usize, nonce: u64) -> Ident {
     format_ident!("__decycle_arg{}_{:016x}", i, nonce)
 }
 
-/// The generic placeholder type used in a forwarding assertion: `__DecycleX_<nonce>`.
-pub(crate) fn memberx_ident(nonce: u64) -> Ident {
-    format_ident!("__DecycleX_{:016x}", nonce)
+/// The generic placeholder type used in a forwarding assertion. It stands for "any element type that
+/// implements the trait" and lives entirely inside a `const _ {}` block (so it needs no hygiene
+/// nonce), where a readable name (`__DecycleElem`) makes the failing-bound error legible:
+/// `the trait bound Box<__DecycleElem>: Tr is not satisfied`.
+pub(crate) fn memberx_ident() -> Ident {
+    format_ident!("__DecycleElem")
+}
+
+/// The compile-time size-guard helper type used by the layout cast: `__DecycleSizeGuard_<nonce>`.
+pub(crate) fn sizeguard_ident(nonce: u64) -> Ident {
+    format_ident!("__DecycleSizeGuard_{:016x}", nonce)
 }

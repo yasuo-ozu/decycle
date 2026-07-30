@@ -2,6 +2,8 @@
 //! `Self::` ctor), `&dyn`-trait returns, trait lifetime generics (`&'a self`), const generics on the
 //! self type, and boxed-future (async) returns. Every module runs under BOTH algorithms.
 #![allow(dead_code)]
+// `unsafe_trait_loops` declares a synthetic `unsafe trait` with no real invariant to document.
+#![allow(clippy::missing_safety_doc)]
 mod common;
 
 // ---- generic traits: `-> Self`, `&Self` arg, destructured param, `Self::` ctor ----
@@ -56,6 +58,7 @@ fn test_generic_loop() {
         let b: Boxed<u32> = Boxed::lift(2);
         assert_eq!(a.pair(&b, (2, 3)), 5);
         assert_eq!(b.clone().scale(4), 4);
+        assert_eq!(b.describe(), "boxed");
     });
 }
 
@@ -281,5 +284,126 @@ fn test_async_like_loop() {
         let b = WorkerB { value: 3 };
         assert_eq!(block_on(a.run(4)), 6);
         assert_eq!(block_on(b.run(5)), 8);
+    });
+}
+
+// ---- MULTIPLE participating traits with a cross-TRAIT cyclic edge on a single type ----
+// (Migrated from the former single-ADT `multi_trait_one_type_cross_edge.rs`: `Eval` reaches `Size`
+// and back on the same type. Two independent such types here so the module is not single-ADT; the
+// structural side exercises the `(type, trait)`-pair obligation graph.)
+dual_mod! {
+    cross_trait_loops {
+        #[decycle]
+        pub trait Eval {
+            fn eval(&self, n: usize) -> usize;
+        }
+        #[decycle]
+        pub trait Size {
+            fn size(&self, n: usize) -> usize;
+        }
+        pub struct Expr;
+        pub struct Stmt;
+        impl Eval for Expr where Expr: Size {
+            fn eval(&self, n: usize) -> usize {
+                if n == 0 { 0 } else { self.size(n - 1) + 1 } // cross-trait hop Eval -> Size
+            }
+        }
+        impl Size for Expr where Expr: Eval {
+            fn size(&self, n: usize) -> usize {
+                if n == 0 { 0 } else { self.eval(n - 1) + 1 } // cross-trait hop back Size -> Eval
+            }
+        }
+        impl Eval for Stmt where Stmt: Size {
+            fn eval(&self, n: usize) -> usize {
+                if n == 0 { 0 } else { self.size(n - 1) + 1 }
+            }
+        }
+        impl Size for Stmt where Stmt: Eval {
+            fn size(&self, n: usize) -> usize {
+                if n == 0 { 0 } else { self.eval(n - 1) + 1 }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_cross_trait_cycle_on_one_type() {
+    on_both!(cross_trait_loops, {
+        // Alternates Eval/Size on every hop, well past any fixed depth.
+        assert_eq!(Expr.eval(2000), 2000);
+        assert_eq!(Expr.size(2001), 2001);
+        assert_eq!(Stmt.eval(2000), 2000);
+    });
+}
+
+// ---- self-cycle spelled `where Self: Tr` (both engines resolve `Self` to the ADT) ----
+dual_mod! {
+    self_bound_loops {
+        #[decycle]
+        pub trait Sb {
+            fn sb(&self, d: usize) -> usize;
+        }
+        pub enum T {
+            Leaf(usize),
+            Rec(Box<T>),
+        }
+        impl Sb for T
+        where
+            Self: Sb, // the cyclic bound written with `Self`, not `T`
+        {
+            fn sb(&self, d: usize) -> usize {
+                match self {
+                    T::Leaf(n) => *n,
+                    T::Rec(b) => 1 + b.sb(d),
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_self_bound_cycle() {
+    on_both!(self_bound_loops, {
+        let t = T::Rec(Box::new(T::Rec(Box::new(T::Leaf(5)))));
+        assert_eq!(t.sb(0), 7); // 1 + 1 + 5
+    });
+}
+
+// ---- `unsafe trait`: both engines emit `unsafe impl` for the generated impls (ranked keeps it on
+// the delegating Final impl / drops it on the safe ranked-helper impls; structural mirrors it onto
+// the terminator + natural impls). The trait is unsafe to IMPLEMENT; its methods stay safe to CALL. ----
+dual_mod! {
+    unsafe_trait_loops {
+        #[decycle]
+        pub unsafe trait Danger {
+            fn danger(&self, n: usize) -> usize;
+        }
+        pub struct A;
+        pub struct B;
+        unsafe impl Danger for A
+        where
+            B: Danger,
+        {
+            fn danger(&self, n: usize) -> usize {
+                if n == 0 { 0 } else { B.danger(n - 1) + 1 }
+            }
+        }
+        unsafe impl Danger for B
+        where
+            A: Danger,
+        {
+            fn danger(&self, n: usize) -> usize {
+                if n == 0 { 0 } else { A.danger(n - 1) + 1 }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_unsafe_trait_cycle() {
+    on_both!(unsafe_trait_loops, {
+        // `danger` is a safe method of an unsafe trait — calling it needs no `unsafe` block.
+        assert_eq!(A.danger(2000), 2000);
+        assert_eq!(B.danger(1500), 1500);
     });
 }

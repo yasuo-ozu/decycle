@@ -1,0 +1,24 @@
+error[E0658]: non-inline modules in proc macro input are unstable
+ --> tests/ui/ranked_bodyless_module.rs:6:1
+  |
+6 | mod m;
+  | ^^^^^^
+  |
+  = note: see issue #54727 <https://github.com/rust-lang/rust/issues/54727> for more information
+
+error[E0583]: file not found for module `m`
+ --> tests/ui/ranked_bodyless_module.rs:6:1
+  |
+6 | mod m;
+  | ^^^^^^
+  |
+  = help: to create the module `m`, create file "$DIR/tests/ui/m.rs" or "$DIR/tests/ui/m/mod.rs"
+  = note: if there is a `mod m` elsewhere in the crate already, import it with `use crate::...` instead
+
+error: #[decycle] requires an inline module with at least one item
+ --> tests/ui/ranked_bodyless_module.rs:5:1
+  |
+5 | #[decycle]
+  | ^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `decycle` (in Nightly builds, run with -Z macro-backtrace for more info)

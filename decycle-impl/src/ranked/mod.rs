@@ -9,5 +9,4 @@
 pub mod finalize;
 pub(crate) mod helper;
 pub mod process_module;
-#[cfg(feature = "type-leak")]
 pub mod process_trait;

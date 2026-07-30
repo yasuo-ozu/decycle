@@ -10,29 +10,7 @@ pub(crate) struct Adt {
     pub item: Item,
 }
 
-#[allow(dead_code)]
 impl Adt {
-    /// The type-parameter idents of this ADT, in declaration order (lifetimes/consts skipped for the
-    /// purposes of building `Rec`/`Term` instantiations — the mock scope is type params).
-    pub fn ty_param_idents(&self) -> Vec<Ident> {
-        self.generics
-            .params
-            .iter()
-            .filter_map(|p| match p {
-                GenericParam::Type(t) => Some(t.ident.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    pub fn fields(&self) -> Vec<&syn::Field> {
-        match &self.item {
-            Item::Struct(s) => s.fields.iter().collect(),
-            Item::Enum(e) => e.variants.iter().flat_map(|v| v.fields.iter()).collect(),
-            _ => vec![],
-        }
-    }
-
     /// The natural type's visibility — the generated `__MTerm` copies it so a private cycle type is
     /// wrapped by a private terminator (no `pub`-over-private `private_interfaces` mismatch).
     pub fn vis(&self) -> &syn::Visibility {
@@ -40,6 +18,16 @@ impl Adt {
             Item::Struct(s) => &s.vis,
             Item::Enum(e) => &e.vis,
             _ => &syn::Visibility::Inherited,
+        }
+    }
+
+    /// The type's own attributes (so its `#[cfg]`s can be replicated onto the generated terminator
+    /// and impls — see [`crate::extract_cfg_attrs`]).
+    pub fn attrs(&self) -> &[syn::Attribute] {
+        match &self.item {
+            Item::Struct(s) => &s.attrs,
+            Item::Enum(e) => &e.attrs,
+            _ => &[],
         }
     }
 }

@@ -67,16 +67,22 @@ fn expand(mut module: ItemMod, decycle: &Path) -> syn::Result<TokenStream> {
     // Only impls of traits annotated `#[decycle]` in this module participate — collect their idents
     // and strip the `#[decycle]` attrs from the trait/use items.
     let decycle_traits = collect_decycle_traits(brace_items, &decycle_crate);
+    let items = brace_items.clone();
+
+    // No `#[decycle]`-annotated trait/use → no cyclic participants. Re-emit the module unchanged (its
+    // inner `#[decycle]` attrs were already stripped in place): the impls are valid Rust on their own,
+    // so a `structural` annotation on a module with nothing to unroll is a silent no-op, not an error.
+    // (The ranked engine instead REQUIRES an annotated cycle and rejects this — `NO_DECYCLE_TRAITS_MSG`.)
     if decycle_traits.is_empty() {
-        return Err(syn::Error::new(
-            Span::call_site(),
-            "cannot detect traits nor `use` statement annotated with #[decycle]",
-        ));
+        return Ok(module.to_token_stream());
     }
 
-    let items = brace_items.clone();
     let model = Model::collect(&items, nonce)?;
     let sccs = model.cyclic_sccs(&decycle_traits);
+    // Annotated traits present but they form no cycle — the same silent no-op pass-through.
+    if sccs.is_empty() {
+        return Ok(module.to_token_stream());
+    }
 
     let mut replaced_impls: HashSet<(String, String)> = HashSet::new();
     let mut cycle_adts: HashSet<String> = HashSet::new();
@@ -94,11 +100,26 @@ fn expand(mut module: ItemMod, decycle: &Path) -> syn::Result<TokenStream> {
     // (the previous shape) retagged any `Box`/`&mut` inside it and invalidated the copy's tags —
     // Stacked-Borrows UB for every by-value `Self` shape containing a `Box`. Reading through a shared
     // `&ManuallyDrop<A>` performs no such retag, so the returned value's provenance stays valid.
+    // Defense-in-depth: `transmute_copy` reads `size_of::<__B>()` bytes from a `&__A` without any
+    // compile-time size check, so a (hypothetical future) codegen bug producing a size mismatch would
+    // be silent UB. `#Guard::<A,B>::OK` is a post-monomorphization `assert!` (MSRV-1.71-safe — inline
+    // `const{}` is 1.79) that turns any such mismatch into a compile error at zero runtime cost.
     let cast = cast_ident(nonce);
+    let guard = sizeguard_ident(nonce);
     out.extend(quote! {
+        #[allow(dead_code)]
+        struct #guard<__A, __B>(::core::marker::PhantomData<(fn() -> __A, fn() -> __B)>);
+        #[allow(dead_code)]
+        impl<__A, __B> #guard<__A, __B> {
+            const OK: () = ::core::assert!(
+                ::core::mem::size_of::<__A>() == ::core::mem::size_of::<__B>(),
+                "decycle internal error: layout cast between differently-sized types",
+            );
+        }
         #[inline]
         #[allow(dead_code)]
         unsafe fn #cast<__A, __B>(a: __A) -> __B {
+            let () = #guard::<__A, __B>::OK;
             let a = ::core::mem::ManuallyDrop::new(a);
             ::core::mem::transmute_copy::<::core::mem::ManuallyDrop<__A>, __B>(&a)
         }

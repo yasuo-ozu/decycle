@@ -4,6 +4,10 @@ use syn::punctuated::Punctuated;
 use syn::*;
 use template_quote::quote;
 
+/// Rejection for a `#[decycle]` trait named with `Fn(...)`-sugar (`where B: Cb(usize) -> usize`):
+/// the ranked-trait rewrite must splice a `Rank` argument, which parenthesized args can't carry.
+const PARENTHESIZED_ARGS_MSG: &str = "unsupported parenthesized generic arguments on a #[decycle] trait";
+
 /// Strips a leading, argument-less `self` segment (`self::Trait` -> `Trait`,
 /// `self::Trait::method` -> `Trait::method`) so a `self::`-qualified reference to a
 /// #[decycle] trait is recognized the same way the bare name is. A leading `self` is only
@@ -49,7 +53,7 @@ pub fn path_insert_type_arg(path: &mut Path, index: usize, ty: Type) {
         // matching `PathArgumentsScheme::insert`'s identical rejection for an impl's own
         // (syntactically distinct, but equally unsupported) parenthesized trait reference.
         PathArguments::Parenthesized(pa) => {
-            abort!(pa, "unsupported parenthesized generic arguments on a #[decycle] trait")
+            abort!(pa, PARENTHESIZED_ARGS_MSG)
         }
     }
 }
@@ -127,7 +131,7 @@ impl PathArgumentsScheme for PathArguments {
             // (`impl FnLike(A) -> B for X`), which isn't a supported form of a decycle
             // trait bound — a clean compile error instead of an internal panic.
             PathArguments::Parenthesized(pa) => {
-                abort!(pa, "unsupported parenthesized generic arguments on a #[decycle] trait")
+                abort!(pa, PARENTHESIZED_ARGS_MSG)
             }
         }
     }

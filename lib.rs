@@ -163,9 +163,6 @@ pub use decycle_macro::decycle;
 /// should also be valid targets for `#[decycle]`. The wrapper macro can call into this
 /// function to apply decycle's transformation while keeping its own macro API.
 ///
-/// Requires the (default-on) `type-leak` feature; a `finalize`-only consumer that builds with
-/// `default-features = false` does not get this re-export (see the `type-leak` feature doc).
-#[cfg(feature = "type-leak")]
 pub use decycle_impl::process_trait;
 
 /// Programmatic entry point for the `#[decycle]` transformation.
@@ -293,6 +290,5 @@ pub mod __reentry {
 
 #[doc(hidden)]
 pub use decycle_impl::proc_macro_error;
-#[cfg(feature = "type-leak")]
 #[doc(hidden)]
 pub use decycle_impl::type_leak;

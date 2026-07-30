@@ -1,0 +1,44 @@
+error: decycle: return-position `impl Trait` in method `ca` of #[decycle] trait `Ca` is not supported
+
+         = help: declare an associated type on the trait and return it instead (e.g. `type Output; fn m(&self) -> Self::Output`)
+
+  --> tests/ui/ranked_impl_trait_return_bounded.rs:11:32
+   |
+11 |         fn ca(&self, n: usize) -> impl std::fmt::Debug;
+   |                                ^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0275]: overflow evaluating the requirement `A: Ca`
+  --> tests/ui/ranked_impl_trait_return_bounded.rs:23:35
+   |
+23 |         fn ca(&self, n: usize) -> impl std::fmt::Debug {
+   |                                   ^^^^^^^^^^^^^^^^^^^^
+   |
+note: required for `B` to implement `Cb`
+  --> tests/ui/ranked_impl_trait_return_bounded.rs:27:10
+   |
+27 |     impl Cb for B
+   |          ^^     ^
+28 |     where
+29 |         A: Ca,
+   |            -- unsatisfied trait bound introduced here
+note: required by a bound in `<A as Ca>`
+  --> tests/ui/ranked_impl_trait_return_bounded.rs:21:12
+   |
+21 |         B: Cb,
+   |            ^^ required by this bound in `<A as Ca>`
+
+error[E0275]: overflow evaluating the requirement `B: Cb`
+  --> tests/ui/ranked_impl_trait_return_bounded.rs:29:9
+   |
+29 |         A: Ca,
+   |         ^^^^^
+   |
+note: required for `A` to implement `Ca`
+  --> tests/ui/ranked_impl_trait_return_bounded.rs:19:10
+   |
+19 |     impl Ca for A
+   |          ^^     ^
+20 |     where
+21 |         B: Cb,
+   |            -- unsatisfied trait bound introduced here
+   = help: see issue #48214

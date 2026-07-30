@@ -2,6 +2,7 @@
 //! (body via the trait-def-inside-body pattern), and the natural type's delegating impl.
 
 use super::*;
+use crate::generics_fmt::{params_decl, params_use, wrap_angle, DeclBounds};
 
 /// An expression that reinterprets the receiver `self` into `target`-space (a same-layout type).
 /// `&self`/`&mut self` use a pointer cast; any other receiver — owned `self`, or a custom type such as
@@ -27,7 +28,7 @@ fn receiver_cast(r: &syn::Receiver, target: &Type, nonce: u64) -> TokenStream {
 }
 
 /// Replace every `Self` type occurrence in `ty` with `replacement`.
-fn subst_self(ty: &Type, replacement: &Type) -> Type {
+pub(crate) fn subst_self(ty: &Type, replacement: &Type) -> Type {
     match ty {
         Type::Path(tp) if tp.qself.is_none() && tp.path.is_ident("Self") => replacement.clone(),
         Type::Path(tp) => {
@@ -131,11 +132,15 @@ pub(crate) fn make_term_item(member: &Adt, nonce: u64) -> TokenStream {
     let term = term_ident(&member.ident.to_string(), nonce);
     let m_id = &member.ident;
     let vis = member.vis();
-    let decl = bare_generics_decl(&member.generics);
-    let uses = bare_generics_use(&member.generics);
+    let decl = params_decl(&member.generics, DeclBounds::Bare);
+    let uses = params_use(&member.generics);
     let decl_angle = wrap_angle(&decl);
     let use_angle = wrap_angle(&uses);
+    // Replicate the type's `#[cfg]`s so a cfg-gated cyclic type's terminator strips with it (else the
+    // terminator would wrap a type rustc removed → E0412).
+    let cfgs = crate::extract_cfg_attrs(member.attrs());
     quote! {
+        #(#cfgs)*
         #[repr(transparent)]
         #[allow(dead_code)]
         #vis struct #term #decl_angle ( #vis #m_id #use_angle );
@@ -169,12 +174,18 @@ fn make_impls(model: &Model, scc: &Scc, im: &ImplBlock) -> syn::Result<TokenStre
     // `reduced` (all cyclic preds dropped) drives the terminator + natural impls; `local` (only wrapped
     // cyclic preds dropped) drives each method's local `__DecycleBody` impl so bare cyclic bounds still
     // pin generics for the body. `stripped_wrapped` → forwarding assertions.
-    let (reduced, local, stripped_wrapped) = reduce_generics(&im.item.generics, scc, model);
+    let (reduced, local, stripped_wrapped) =
+        reduce_generics(&im.item.generics, &im.item.self_ty, scc, model);
     let (impl_g, _, where_g) = reduced.split_for_impl();
+
+    // An `unsafe trait` requires `unsafe impl`: the user wrote `unsafe impl` (else E0200 on their own
+    // source), so mirror that keyword onto BOTH generated impls of the trait. The local
+    // `__DecycleBody` trait is safe, so its impl is unaffected.
+    let unsafety = &im.item.unsafety;
 
     let mut assertions = TokenStream::new();
     for sw in &stripped_wrapped {
-        assertions.extend(emit_forwarding_assertion(sw, scc, &reduced, model.nonce));
+        assertions.extend(emit_forwarding_assertion(sw, scc, &reduced));
     }
 
     // Pass 1: associated items (types/consts). They go on BOTH the natural and terminator impls, and
@@ -202,12 +213,20 @@ fn make_impls(model: &Model, scc: &Scc, im: &ImplBlock) -> syn::Result<TokenStre
         }
     }
 
+    // Replicate the `#[cfg]`s of BOTH the source impl and its self type onto every generated impl:
+    // if either is cfg-gated out, the generated machinery (which references the natural type) must
+    // strip with it rather than reference a removed item.
+    let mut cfgs = crate::extract_cfg_attrs(&im.item.attrs);
+    cfgs.extend(crate::extract_cfg_attrs(adt.attrs()));
+
     Ok(quote! {
         #assertions
-        impl #impl_g #trait_path for #term_ty #where_g {
+        #(#cfgs)*
+        #unsafety impl #impl_g #trait_path for #term_ty #where_g {
             #term_methods
         }
-        impl #impl_g #trait_path for #natural #where_g {
+        #(#cfgs)*
+        #unsafety impl #impl_g #trait_path for #natural #where_g {
             #nat_methods
         }
     })
@@ -229,11 +248,39 @@ fn rec_method(
 ) -> syn::Result<TokenStream> {
     let attrs = &f.attrs;
     let vis = &f.vis;
+    // `async fn` returns an OPAQUE future (`impl Future`). The dispatch would `transmute_copy` the
+    // terminator's future into the natural type's future — two distinct anonymous types — which is
+    // unsound (the layout cast reinterprets an un-polled future). The size guard catches it only when
+    // the sizes differ; a same-size coincidence would be silent UB. Reject it up-front, like the
+    // ranked engine rejects return-position `impl Trait`.
+    if let Some(a) = &f.sig.asyncness {
+        return Err(syn::Error::new_spanned(
+            a,
+            "#[decycle(structural)]: `async fn` is not supported — the returned future is an opaque \
+             type the layout cast cannot reinterpret. Return a boxed future \
+             (`-> Pin<Box<dyn Future<Output = ..>>>`) instead.",
+        ));
+    }
+    // Return-position `impl Trait` (RPITIT) is likewise an opaque return type the layout cast cannot
+    // reinterpret. Reject it up-front (the ranked engine rejects it too); an associated type is the
+    // portable escape hatch since it names the return type.
+    if crate::finalize::sig_has_impl_trait_output(&f.sig) {
+        return Err(syn::Error::new_spanned(
+            &f.sig.output,
+            "#[decycle(structural)]: return-position `impl Trait` is not supported — an opaque return \
+             type the layout cast cannot reinterpret. Declare an associated type and return it instead \
+             (e.g. `type Output; fn m(&self) -> Self::Output`), or return a concrete/boxed type.",
+        ));
+    }
     // Rewrite destructured / `mut` / `ref` params to fresh idents so the dispatch can forward them;
     // the original patterns are rebound at the top of the body.
     let (norm_sig, rebinds) = normalize_sig(&f.sig, nonce);
     let outer_sig = &norm_sig;
-    let body = &f.block;
+    // Splice the user body's STATEMENTS (not the whole `{ .. }` block): re-wrapping the block as
+    // `{ #body }` would double-brace a single-expression body (`{ { 1 } }`), tripping `unused_braces`
+    // under `#![deny(warnings)]` / `clippy -D warnings`. (The ranked engine splices statements for the
+    // same reason.) The tail expression stays the tail, so the return value is unchanged.
+    let body_stmts = &f.block.stmts;
 
     let body_tr = body_ident(nonce);
     let run = run_ident(nonce);
@@ -243,8 +290,8 @@ fn rec_method(
     run_sig.ident = run.clone();
 
     let (impl_g, _, where_g) = reduced.split_for_impl();
-    let trait_g = wrap_angle(&bare_generics_decl(reduced)); // `<Span, Token>` for the trait decl
-    let use_g = wrap_angle(&bare_generics_use(reduced)); // `<Span, Token>` at the impl/call
+    let trait_g = wrap_angle(&params_decl(reduced, DeclBounds::Bare)); // `<Span, Token>` for the trait decl
+    let use_g = wrap_angle(&params_use(reduced)); // `<Span, Token>` at the impl/call
 
     // associated-item decls (for the local trait) and defs (for the local impl), so a `Self::Assoc`
     // in the body resolves against the natural type.
@@ -269,15 +316,23 @@ fn rec_method(
     };
 
     let inline = inline_attr(attrs);
+    // Replicate `#[track_caller]` / lint / hint attrs onto the body-bearing `__run` too — otherwise
+    // `Location::caller()` in the body stops at the shim, and a method-level `#[allow(..)]` wouldn't
+    // cover the copy holding the user's statements.
+    let prop = crate::propagated_method_attrs(attrs);
+    // This is the TERMINATOR (`__MTerm`) copy — an internal delegate, not the callable entry — so it
+    // must NOT carry symbol attrs (`#[no_mangle]` etc.); those stay on the natural impl (`nat_method`)
+    // so the requested symbol is produced exactly once.
+    let outer_attrs: Vec<&Attribute> = attrs.iter().filter(|a| !crate::is_symbol_attr(a)).collect();
     Ok(quote! {
-        #inline #(#attrs)* #vis #outer_sig {
+        #inline #(#outer_attrs)* #vis #outer_sig {
             trait #body_tr #trait_g : Sized {
                 #(#assoc_decls)*
                 #run_sig ;
             }
             impl #impl_g #body_tr #use_g for #natural #where_g {
                 #(#assoc_defs)*
-                #run_sig { #(#rebinds)* #body }
+                #(#prop)* #run_sig { #(#rebinds)* #(#body_stmts)* }
             }
             #dispatch
         }
@@ -429,6 +484,7 @@ pub(crate) struct StrippedWrapped {
 ///    `Deref`-reached wrapped bound needn't be provable).
 fn reduce_generics(
     generics: &syn::Generics,
+    self_ty: &Type,
     scc: &Scc,
     model: &Model,
 ) -> (syn::Generics, syn::Generics, Vec<StrippedWrapped>) {
@@ -450,6 +506,16 @@ fn reduce_generics(
             local_preds.push(pred.clone());
             continue;
         };
+        // Resolve `Self` in the bounded type to the impl's self type, so `where Self: Tr` (and
+        // `where Box<Self>: Tr`) is detected, classified, and re-emitted exactly like `where A: Tr`:
+        // the SCC graph and the forwarding assertion key on the concrete ADT, which `Self` alone
+        // never matches. A bound with no `Self` is unchanged.
+        let pt_owned = {
+            let mut p = pt.clone();
+            p.bounded_ty = subst_self(&p.bounded_ty, self_ty);
+            p
+        };
+        let pt = &pt_owned;
         let refs = local_refs(&pt.bounded_ty, &adt_names);
         // Split THIS predicate's bounds: a *cyclic* bound is a trait `TrB` where a referenced type
         // `B` makes `(B, TrB)` a member of THIS SCC (possibly a different trait — that is what breaks
@@ -469,9 +535,9 @@ fn reduce_generics(
             }
         }
         if cyclic_paths.is_empty() {
-            // no cyclic bound: keep the whole predicate in both.
-            reduced_preds.push(pred.clone());
-            local_preds.push(pred.clone());
+            // no cyclic bound: keep the whole (Self-resolved) predicate in both.
+            reduced_preds.push(WherePredicate::Type(pt.clone()));
+            local_preds.push(WherePredicate::Type(pt.clone()));
             continue;
         }
         // The surviving (non-cyclic) bounds rebuilt as their own predicate, if any remain.
@@ -494,12 +560,13 @@ fn reduce_generics(
                 local_preds.push(s.clone());
             }
         } else {
-            // bare cyclic bound: dropped from `reduced` (breaks the cycle) but the FULL predicate is
-            // kept in `local` so the bare bound still pins generics on-sight through the natural impl.
+            // bare cyclic bound: dropped from `reduced` (breaks the cycle) but the FULL (Self-resolved)
+            // predicate is kept in `local` so the bare bound still pins generics on-sight through the
+            // natural impl.
             if let Some(s) = survivor {
                 reduced_preds.push(s);
             }
-            local_preds.push(pred.clone());
+            local_preds.push(WherePredicate::Type(pt.clone()));
         }
     }
 
@@ -532,8 +599,8 @@ fn is_wrapped_member(ty: &Type, members: &HashSet<String>) -> bool {
 
 /// Replace every member-headed path in `ty` with the ident `__DecycleX` (dropping its args), so
 /// `Box<Stmt<T>>` becomes `Box<__DecycleX>` — the generic container for the forwarding assertion.
-fn generalize_members(ty: &Type, members: &HashSet<String>, nonce: u64) -> Type {
-    let x = memberx_ident(nonce);
+fn generalize_members(ty: &Type, members: &HashSet<String>) -> Type {
+    let x = memberx_ident();
     let repl: Type = parse_quote!(#x);
     fn go(ty: &Type, members: &HashSet<String>, repl: &Type) -> Type {
         match ty {
@@ -596,19 +663,20 @@ fn generalize_members(ty: &Type, members: &HashSet<String>, nonce: u64) -> Type 
 }
 
 /// The forwarding assertion for a stripped wrapped predicate `Container<Member>: Trait`: a private
-/// `const _` block that type-checks `for<__DecycleX: Trait> Container<__DecycleX>: Trait`
-/// (encoded via two helper fns, since HRTBs can't carry trait bounds). If it fails, the user stripped a
-/// container bound whose container does not forward the trait — a real soundness signal. Skipped when
-/// the trait or generalized container still mentions an impl generic (would be out of the const's
-/// scope) — the assertion stays a pure crate-private item, so no `private_interfaces` ever arises.
-fn emit_forwarding_assertion(
-    sw: &StrippedWrapped,
-    scc: &Scc,
-    reduced: &syn::Generics,
-    nonce: u64,
-) -> TokenStream {
+/// `const _` block that type-checks `for<__DecycleElem: Trait> Container<__DecycleElem>: Trait`
+/// (encoded via two helper fns, since HRTBs can't carry trait bounds). If it fails, the user stripped
+/// a container bound whose container does not forward the trait — a real soundness signal. Skipped
+/// when the trait or generalized container still mentions an impl generic (would be out of the
+/// const's scope) — the assertion stays a pure crate-private item, so no `private_interfaces` arises.
+///
+/// All items here are LOCAL to the `const _ {}` block, so they carry no hygiene nonce — a nonce would
+/// only clutter the failing-bound diagnostic. The requirement fn is named as a sentence so rustc's
+/// `... required by a bound in <name>` note reads as guidance, and the placeholder is `__DecycleElem`
+/// so the message reads `the trait bound Box<__DecycleElem>: Tr is not satisfied`. The primary span
+/// lands on the user's own `Container<Member>` bound (its tokens are cloned verbatim).
+fn emit_forwarding_assertion(sw: &StrippedWrapped, scc: &Scc, reduced: &syn::Generics) -> TokenStream {
     let member_set: HashSet<String> = scc.types().into_iter().collect();
-    let generalized = generalize_members(&sw.container, &member_set, nonce);
+    let generalized = generalize_members(&sw.container, &member_set);
     let trait_path = &sw.trait_path;
 
     let param_idents: HashSet<String> = reduced
@@ -624,15 +692,18 @@ fn emit_forwarding_assertion(
         return quote!();
     }
 
-    let needs = format_ident!("__decycle_needs_{:016x}", nonce);
-    let assert = format_ident!("__decycle_assert_{:016x}", nonce);
-    let u = format_ident!("__DecycleU_{:016x}", nonce);
-    let x = memberx_ident(nonce);
+    // Named so the failing bound reads as an explanation:
+    //   error[E0277]: the trait bound `Box<__DecycleElem>: Tr` is not satisfied
+    //   note: required by a bound in `stripped_wrapped_bound_needs_its_container_to_forward_the_trait`
+    let needs = format_ident!("stripped_wrapped_bound_needs_its_container_to_forward_the_trait");
+    let assert = format_ident!("__decycle_check_wrapped_bound_forwards");
+    let u = memberx_ident();
+    let x = memberx_ident();
     quote! {
         const _: () = {
-            #[allow(dead_code)]
+            #[allow(dead_code, non_snake_case)]
             fn #needs<#u: #trait_path>() {}
-            #[allow(dead_code)]
+            #[allow(dead_code, non_snake_case)]
             fn #assert<#x: #trait_path>() {
                 #needs::<#generalized>()
             }
@@ -669,52 +740,5 @@ fn path_mentions(path: &syn::Path, idents: &HashSet<String>) -> bool {
     found
 }
 
-// ---- generics rendering helpers ----
-
-/// Param declarations without bounds: `'a, Span, const N: usize`.
-pub(crate) fn bare_generics_decl(g: &syn::Generics) -> TokenStream {
-    let parts = g.params.iter().map(|p| match p {
-        GenericParam::Lifetime(l) => {
-            let lt = &l.lifetime;
-            quote!(#lt)
-        }
-        GenericParam::Type(t) => {
-            let id = &t.ident;
-            quote!(#id)
-        }
-        GenericParam::Const(c) => {
-            let id = &c.ident;
-            let ty = &c.ty;
-            quote!(const #id: #ty)
-        }
-    });
-    quote!( #(#parts),* )
-}
-
-/// Param uses: `'a, Span, N`.
-pub(crate) fn bare_generics_use(g: &syn::Generics) -> TokenStream {
-    let parts = g.params.iter().map(|p| match p {
-        GenericParam::Lifetime(l) => {
-            let lt = &l.lifetime;
-            quote!(#lt)
-        }
-        GenericParam::Type(t) => {
-            let id = &t.ident;
-            quote!(#id)
-        }
-        GenericParam::Const(c) => {
-            let id = &c.ident;
-            quote!(#id)
-        }
-    });
-    quote!( #(#parts),* )
-}
-
-/// Wrap a comma-list in angle brackets, or empty if the list is empty.
-pub(crate) fn wrap_angle(inner: &TokenStream) -> TokenStream {
-    if inner.is_empty() {
-        quote!()
-    } else {
-        quote!( < #inner > )
-    }
-}
+// Generics rendering (`params_decl`/`params_use`/`wrap_angle`) lives in `crate::generics_fmt`,
+// shared with the ranked engine.

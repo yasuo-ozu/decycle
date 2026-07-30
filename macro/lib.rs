@@ -94,6 +94,18 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
     let decycle_path = args.decycle.unwrap_or_else(|| parse_quote!(::decycle));
 
     if let Ok(module) = parse::<ItemMod>(input.clone()) {
+        // Fail closed up front, for BOTH engines, on an empty `#[decycle]` module: a bodyless
+        // `mod m;` or an empty `mod m {}` has nothing to expand.
+        if module
+            .content
+            .as_ref()
+            .map_or(true, |(_, items)| items.is_empty())
+        {
+            abort!(
+                Span::call_site(),
+                "#[decycle] requires an inline module with at least one item"
+            )
+        }
         let ret = if args.structural {
             // The structural unroll has no rank floor, so the depth/infinite knobs don't apply.
             if args.recurse_level.is_some() || args.support_infinite_cycle.is_some() {

@@ -9,7 +9,7 @@ proc-macro = true
 path = "lib.rs"
 
 [dependencies]
-decycle-impl = { path = "../../decycle-impl", version = "0.4.0", default-features = false }
+decycle-impl = { path = "../../decycle-impl", version = "0.4.0" }
 template-quote = "0.4.0"
 proc-macro2 = "1.0"
 

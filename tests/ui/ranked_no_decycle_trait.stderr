@@ -1,0 +1,7 @@
+error: cannot detect traits nor `use` statement annotated with #[decycle]
+ --> tests/ui/ranked_no_decycle_trait.rs:5:1
+  |
+5 | #[decycle]
+  | ^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `decycle` (in Nightly builds, run with -Z macro-backtrace for more info)

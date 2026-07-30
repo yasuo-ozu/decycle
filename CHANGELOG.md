@@ -10,9 +10,9 @@ Notable changes, following [Keep a Changelog](https://keepachangelog.com/) and
 - A second, self-contained algorithm for breaking method-recursion cycles, selected with the new
   `structural` flag: `#[decycle(structural)] mod … { … }`. It has **no runtime** (no registry, no
   re-entry fn pointers, no `type_name` keys) and its **generated code uses no `type-leak`** —
-  everything is resolved at compile time. (The proc-macro crate still links `type-leak` at build time
-  for the trait-level `#[decycle]` attribute; only a `decycle-impl` consumer with
-  `default-features = false` sheds that build dependency.)
+  everything is resolved at compile time. (The proc-macro crate always links `type-leak` — a
+  non-optional dependency backing the trait-level `#[decycle]` attribute — so it is a build
+  dependency regardless of which engine you use.)
 - Mechanism: per cycle-member type it emits a `#[repr(transparent)]` terminator `__XxxTerm(pub Xxx)`
   (matching `Xxx`'s visibility) and puts each trait impl on the terminator via a *trait-def-inside-body*
   pattern (a private local trait whose method holds the original body verbatim, implemented for the

@@ -19,6 +19,19 @@
 // copy. File-level rather than item-level because the generated copy isn't the
 // annotated item.
 #![allow(unused_mut)]
+// `crate_path_generic_bounds` (migrated from single-ADT bug4.rs) writes `crate::`-rooted trait
+// bounds that decycle re-quotes verbatim inside a generated `macro_rules!`, tripping this lint on
+// GENERATED tokens (not on an item an inner `#[allow]` could attach to). `non_camel_case_types`
+// covers its `__A` impl generic.
+// `dead_code`: several migrated shape-regressions (crate_path_generic_bounds,
+// supertrait_and_iter_method) are compile-only — their structs exist solely as impl targets.
+#![allow(clippy::crate_in_macro_def, non_camel_case_types, dead_code)]
+
+/// A crate-ROOT trait referenced via `crate::CrateRootBound` from inside a `#[decycle]` module —
+/// used by `crate_path_generic_bounds` below to pin that such a path survives the macro carrier.
+pub trait CrateRootBound<A> {
+    type S;
+}
 
 /// L-C1: `#[decycle] use super::T as R;` used to silently DELETE impls of the renamed
 /// trait (nothing inside the consuming module ever matched the trait by its ORIGINAL
@@ -608,6 +621,147 @@ mod gat_delegation {
         fn gat_delegation_keeps_own_params() {
             assert_eq!(A.wrap(5u32), Some(5u32));
             assert_eq!(A.step(3), 3);
+        }
+    }
+}
+
+/// (Migrated from single-ADT bug2.rs) A `#[decycle]` trait whose associated type is named
+/// identically to the trait, with a lifetime-parameterized method, implemented for a const-generic +
+/// multi-lifetime struct — all must survive decycle processing.
+mod assoc_name_and_generics {
+    #[decycle::decycle]
+    pub trait NameClash<'a> {
+        type NameClash;
+        type T;
+        fn f<'b>(&'a self, _: &'b [u8]) -> usize {
+            0
+        }
+    }
+    impl NameClash<'static> for () {
+        type NameClash = ();
+        type T = ();
+    }
+    #[decycle::decycle]
+    pub mod inner {
+        #[decycle]
+        use super::NameClash;
+        #[derive(Default)]
+        pub struct A<'a, 'b, const N: usize, T>(pub ::core::marker::PhantomData<(&'a T, &'b [(); N])>);
+        #[derive(Default)]
+        pub struct B<'a, T>(pub ::core::marker::PhantomData<&'a T>);
+        impl<'a, 'b, const N: usize, T> NameClash<'a> for A<'a, 'b, N, T> {
+            type NameClash = T;
+            type T = T;
+            fn f<'c>(&'a self, _: &'c [u8]) -> usize {
+                0
+            }
+        }
+        impl<'a, T> NameClash<'a> for B<'a, T> {
+            type NameClash = T;
+            type T = T;
+            fn f<'c>(&'a self, _: &'c [u8]) -> usize {
+                0
+            }
+        }
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            #[test]
+            fn assoc_name_lifetimes_const_generics() {
+                let s: A<'static, 'static, 123, ()> = Default::default();
+                assert_eq!(s.f(&[]), 0);
+            }
+        }
+    }
+}
+
+/// (Migrated from single-ADT bug3.rs) A UFCS trait-method call with an INFERRED Self type
+/// (`<_ as Trait>::method(self, ..)`) must be rewritten correctly by decycle.
+mod ufcs_self_call {
+    #[decycle::decycle]
+    pub trait Recurse {
+        fn go(&self, n: usize) -> usize;
+    }
+    #[decycle::decycle]
+    pub mod inner {
+        #[decycle]
+        use super::Recurse;
+        pub struct A;
+        pub struct B;
+        impl Recurse for A {
+            fn go(&self, n: usize) -> usize {
+                if n == 0 {
+                    0
+                } else {
+                    <_ as Recurse>::go(self, n - 1) + 1
+                }
+            }
+        }
+        impl Recurse for B {
+            fn go(&self, n: usize) -> usize {
+                if n == 0 {
+                    0
+                } else {
+                    <_ as Recurse>::go(self, n - 1) + 1
+                }
+            }
+        }
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            #[test]
+            fn ufcs_inferred_self_recursion() {
+                assert_eq!(A.go(5), 5);
+                assert_eq!(B.go(3), 3);
+            }
+        }
+    }
+}
+
+/// (Migrated from single-ADT bug4.rs) A `crate::`-rooted trait bound on a method generic and an
+/// `impl Trait` argument with an associated-type equality — both re-quoted through decycle's macro
+/// carrier, where a naive `$crate` would resolve against the wrong crate. Compile-only.
+mod crate_path_generic_bounds {
+    #[decycle::decycle]
+    pub trait Sink<A> {
+        fn sink<S: crate::CrateRootBound<A, S = S>>(sink: &mut S);
+        fn f(sink: impl crate::CrateRootBound<A, S = A>);
+    }
+    #[decycle::decycle]
+    pub mod inner {
+        #[decycle]
+        use super::Sink;
+        pub struct A {}
+        pub struct B {}
+        impl<__A> Sink<__A> for A {
+            fn sink<S: crate::CrateRootBound<__A, S = S>>(_: &mut S) {}
+            fn f(_: impl crate::CrateRootBound<__A, S = __A>) {}
+        }
+        impl<__A> Sink<__A> for B {
+            fn sink<S: crate::CrateRootBound<__A, S = S>>(_: &mut S) {}
+            fn f(_: impl crate::CrateRootBound<__A, S = __A>) {}
+        }
+    }
+}
+
+/// (Migrated from single-ADT bug5.rs) A `#[decycle]` trait with a `Sized` supertrait and a generic
+/// method bounded by `Iterator<Item = _>`. Compile-only.
+mod supertrait_and_iter_method {
+    #[decycle::decycle]
+    pub trait Consume<Item>: ::core::marker::Sized {
+        fn consume<I: ::core::iter::Iterator<Item = Item>>(stream: I);
+    }
+    #[decycle::decycle]
+    pub mod inner {
+        #[decycle]
+        use super::Consume;
+        pub struct A;
+        pub struct B;
+        impl<Item> Consume<Item> for A {
+            fn consume<I: ::core::iter::Iterator<Item = Item>>(_: I) {}
+        }
+        impl<Item> Consume<Item> for B {
+            fn consume<I: ::core::iter::Iterator<Item = Item>>(_: I) {}
         }
     }
 }

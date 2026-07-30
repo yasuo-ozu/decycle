@@ -69,7 +69,10 @@ impl Model {
             let src: Pair = (im.self_ident.to_string(), im.trait_key.clone());
             for pred in im.item.generics.where_clause.iter().flat_map(|w| &w.predicates) {
                 if let WherePredicate::Type(pt) = pred {
-                    let refs = local_refs(&pt.bounded_ty, adt_names);
+                    // Resolve `Self` to the impl's self type so `where Self: Tr` forms a real cycle
+                    // edge — `Self` never matches a local ADT ident on its own.
+                    let bounded = subst_self(&pt.bounded_ty, &im.item.self_ty);
+                    let refs = local_refs(&bounded, adt_names);
                     for bound in &pt.bounds {
                         let syn::TypeParamBound::Trait(tb) = bound else {
                             continue;

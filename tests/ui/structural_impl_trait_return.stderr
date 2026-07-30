@@ -1,0 +1,33 @@
+error: #[decycle(structural)]: return-position `impl Trait` is not supported — an opaque return type the layout cast cannot reinterpret. Declare an associated type and return it instead (e.g. `type Output; fn m(&self) -> Self::Output`), or return a concrete/boxed type.
+  --> tests/ui/structural_impl_trait_return.rs:17:22
+   |
+17 |         fn ev(&self) -> impl std::fmt::Debug {
+   |                      ^^^^^^^^^^^^^^^^^^^^^^^
+
+error: cannot find attribute `decycle` in this scope
+ --> tests/ui/structural_impl_trait_return.rs:8:7
+  |
+8 |     #[decycle]
+  |       ^^^^^^^
+  |
+  = note: `decycle` is in scope, but it is a crate, not an attribute
+help: consider importing one of these attribute macros
+  |
+8 +     use crate::decycle;
+  |
+8 +     use decycle::decycle;
+  |
+8 +     use decycle_macro::decycle;
+  |
+
+error[E0275]: overflow evaluating the requirement `A: Ev`
+  --> tests/ui/structural_impl_trait_return.rs:17:25
+   |
+17 |         fn ev(&self) -> impl std::fmt::Debug {
+   |                         ^^^^^^^^^^^^^^^^^^^^
+   |
+note: required by a bound in `<A as Ev>`
+  --> tests/ui/structural_impl_trait_return.rs:15:12
+   |
+15 |         A: Ev,
+   |            ^^ required by this bound in `<A as Ev>`

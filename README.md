@@ -182,7 +182,8 @@ verified by a compiled spike (✓ = works, ✗ = rejected / fails to compile):
 | Unsupported shape → **compile-time rejection** (caught by `cargo build`) | most shapes | **every** shape |
 | Unsupported shape → **fail-closed runtime panic** (isolated floor panic) | a residual set: generic method past width, bare-param bound, heterogeneous side-bound, projection cross-edge | **never** |
 | **`no_std`** | ✗ in unbounded mode (thread-local registry) | **✓** |
-| Arg mentioning `Self` (**`impl Fn(&Self)`** / `dyn` / fn-ptr) | **✓** | ✗ — name the concrete type |
+| Arg mentioning `Self`: **`impl Fn(&Self)`** (APIT) | **✓** | ✗ (unnameable cast target — use `fn`/`dyn`) |
+| Arg mentioning `Self`: **`fn(&Self)`** / **`&dyn Fn(&Self)`** | ✗ | **✓** |
 | Non-`#[decycle]` **supertrait** on the trait | **✓** | ✗ |
 | Same-named foreign trait / finite `Wrap<u8>→Wrap<u16>` chain | **✓** (per-instantiation keys) | ✗ (name-keyed) |
 | **`#[track_caller]`** | bounded ✓ / unbounded ✗ | **✓** |
@@ -240,8 +241,9 @@ An `unsafe trait` is supported by both engines (the generated impls are emitted 
 
 - no growing-type-argument recursion (above); HRTB wrapped bounds (`for<'a> Wrap<&'a A>: Tr`) aren't
   supported either;
-- an argument-position `impl Trait` / `dyn` / fn-pointer whose type mentions `Self`
-  (`fn m(&self, f: impl Fn(&Self))`) isn't cast — name the concrete type;
+- an argument-position `impl Trait` whose bound mentions `Self` (`fn m(&self, f: impl Fn(&Self))`)
+  isn't castable — its target `impl Fn(&__Term)` is unnameable; use a `fn(&Self)` or `&dyn Fn(&Self)`
+  arg instead (both of which structural *does* cast, and which ranked can't);
 - a non-`#[decycle]` supertrait on the decycled trait isn't supported;
 - cycle membership is keyed by trait/type *name* over local ADTs only, so a same-named foreign trait
   or a finite `Wrap<u8> → Wrap<u16>` chain is misclassified — the ranked engine gets these right.

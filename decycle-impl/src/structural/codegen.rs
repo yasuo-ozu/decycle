@@ -27,20 +27,16 @@ fn receiver_cast(r: &syn::Receiver, target: &Type, nonce: u64) -> TokenStream {
     }
 }
 
-/// Replace every `Self` type occurrence in `ty` with `replacement`.
+/// Replace every `Self` type occurrence in `ty` with `replacement`. Descends into fn-pointer
+/// (`fn(&Self)`), trait-object (`dyn Fn(&Self)`) and `impl Trait` (`impl Fn(&Self)`) types too — a
+/// `Self` buried in a higher-order argument must be cast into `replacement`-space like any other.
 pub(crate) fn subst_self(ty: &Type, replacement: &Type) -> Type {
     match ty {
         Type::Path(tp) if tp.qself.is_none() && tp.path.is_ident("Self") => replacement.clone(),
         Type::Path(tp) => {
             let mut tp = tp.clone();
             for seg in tp.path.segments.iter_mut() {
-                if let PathArguments::AngleBracketed(ab) = &mut seg.arguments {
-                    for a in ab.args.iter_mut() {
-                        if let GenericArgument::Type(t) = a {
-                            *t = subst_self(t, replacement);
-                        }
-                    }
-                }
+                subst_self_in_args(&mut seg.arguments, replacement);
             }
             Type::Path(tp)
         }
@@ -79,7 +75,63 @@ pub(crate) fn subst_self(ty: &Type, replacement: &Type) -> Type {
             g.elem = Box::new(subst_self(&g.elem, replacement));
             Type::Group(g)
         }
+        Type::BareFn(bf) => {
+            let mut bf = bf.clone();
+            for input in bf.inputs.iter_mut() {
+                input.ty = subst_self(&input.ty, replacement);
+            }
+            if let syn::ReturnType::Type(_, t) = &mut bf.output {
+                *t = Box::new(subst_self(t, replacement));
+            }
+            Type::BareFn(bf)
+        }
+        Type::TraitObject(to) => {
+            let mut to = to.clone();
+            subst_self_in_bounds(&mut to.bounds, replacement);
+            Type::TraitObject(to)
+        }
+        Type::ImplTrait(it) => {
+            let mut it = it.clone();
+            subst_self_in_bounds(&mut it.bounds, replacement);
+            Type::ImplTrait(it)
+        }
         other => other.clone(),
+    }
+}
+
+/// Substitute `Self` inside a path segment's arguments — both `<..>` and `Fn(..)`-sugar forms.
+fn subst_self_in_args(args: &mut PathArguments, replacement: &Type) {
+    match args {
+        PathArguments::AngleBracketed(ab) => {
+            for a in ab.args.iter_mut() {
+                if let GenericArgument::Type(t) = a {
+                    *t = subst_self(t, replacement);
+                }
+            }
+        }
+        PathArguments::Parenthesized(p) => {
+            for t in p.inputs.iter_mut() {
+                *t = subst_self(t, replacement);
+            }
+            if let syn::ReturnType::Type(_, t) = &mut p.output {
+                *t = Box::new(subst_self(t, replacement));
+            }
+        }
+        PathArguments::None => {}
+    }
+}
+
+/// Substitute `Self` inside the trait bounds of a `dyn`/`impl Trait` type.
+fn subst_self_in_bounds(
+    bounds: &mut syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
+    replacement: &Type,
+) {
+    for b in bounds.iter_mut() {
+        if let syn::TypeParamBound::Trait(tb) = b {
+            for seg in tb.path.segments.iter_mut() {
+                subst_self_in_args(&mut seg.arguments, replacement);
+            }
+        }
     }
 }
 
@@ -232,6 +284,23 @@ fn make_impls(model: &Model, scc: &Scc, im: &ImplBlock) -> syn::Result<TokenStre
     })
 }
 
+/// True if `ty` contains an `impl Trait` node whose bounds mention `Self` (`impl Fn(&Self)`,
+/// `&impl Fn(&Self)`). Such an argument can't be cast into terminator-space — its target type
+/// `impl Fn(&__Term)` is unnameable (E0562) — unlike `fn(&Self)` / `dyn Fn(&Self)`, which are.
+fn has_self_mentioning_impl_trait(ty: &Type) -> bool {
+    match ty {
+        Type::ImplTrait(_) => mentions_self(ty),
+        Type::Reference(r) => has_self_mentioning_impl_trait(&r.elem),
+        Type::Ptr(p) => has_self_mentioning_impl_trait(&p.elem),
+        Type::Array(a) => has_self_mentioning_impl_trait(&a.elem),
+        Type::Slice(s) => has_self_mentioning_impl_trait(&s.elem),
+        Type::Paren(p) => has_self_mentioning_impl_trait(&p.elem),
+        Type::Group(g) => has_self_mentioning_impl_trait(&g.elem),
+        Type::Tuple(t) => t.elems.iter().any(has_self_mentioning_impl_trait),
+        _ => false,
+    }
+}
+
 /// Body-holding method on the terminator `__MTerm`. Uses the **trait-def-inside-body** pattern: a
 /// local trait `__DecycleBody` whose `__run` holds the ORIGINAL block, implemented for the
 /// *natural* type. Inside that impl `Self` **is** the natural type, so the body is dropped in
@@ -271,6 +340,22 @@ fn rec_method(
              type the layout cast cannot reinterpret. Declare an associated type and return it instead \
              (e.g. `type Output; fn m(&self) -> Self::Output`), or return a concrete/boxed type.",
         ));
+    }
+    // An argument-position `impl Trait` whose bound mentions `Self` (`impl Fn(&Self)`) is unnameable
+    // as a cast target (`impl Fn(&__Term)` — E0562), unlike a `fn(&Self)` / `dyn Fn(&Self)` arg, which
+    // ARE cast (they're concrete, same-layout as `&Self` → `&__Term`). Reject it up-front, pointing at
+    // those concrete forms.
+    for input in &f.sig.inputs {
+        if let syn::FnArg::Typed(pt) = input {
+            if has_self_mentioning_impl_trait(&pt.ty) {
+                return Err(syn::Error::new_spanned(
+                    &pt.ty,
+                    "#[decycle(structural)]: an argument-position `impl Trait` that mentions `Self` \
+                     (e.g. `impl Fn(&Self)`) is not supported — its cast target is unnameable. Use a \
+                     concrete form the layout cast can reinterpret: `fn(&Self)` or `&dyn Fn(&Self)`.",
+                ));
+            }
+        }
     }
     // Rewrite destructured / `mut` / `ref` params to fresh idents so the dispatch can forward them;
     // the original patterns are rebound at the top of the body.

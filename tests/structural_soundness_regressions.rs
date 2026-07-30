@@ -208,3 +208,47 @@ fn receiver_shapes_generics_apit_and_assoc_items() {
     assert_eq!(mk().mapped(|x| x * 10), 60); // method generic
     assert_eq!(mk().via(|x| x + 100), 106); // argument impl Trait
 }
+
+// ---- #7: args whose type mentions `Self` inside a fn-pointer / `dyn Fn` — structural casts them into
+// terminator-space (`subst_self` descending into `BareFn`/`TraitObject`; the cast is a same-layout
+// pointer transmute). `impl Fn(&Self)` is NOT castable (unnameable target) and is rejected — see
+// `tests/ui/structural_impl_fn_self_arg.rs`. ----
+#[decycle(structural)]
+mod self_args {
+    #[decycle]
+    pub trait Vis {
+        fn apply(&self, f: fn(&Self) -> i64) -> i64;
+        fn apply_dyn(&self, f: &dyn Fn(&Self) -> i64) -> i64;
+    }
+    pub struct A(pub i64);
+    pub struct B(pub i64);
+    impl Vis for A
+    where
+        B: Vis,
+    {
+        fn apply(&self, f: fn(&Self) -> i64) -> i64 {
+            f(self)
+        }
+        fn apply_dyn(&self, f: &dyn Fn(&Self) -> i64) -> i64 {
+            f(self)
+        }
+    }
+    impl Vis for B
+    where
+        A: Vis,
+    {
+        fn apply(&self, f: fn(&Self) -> i64) -> i64 {
+            f(self)
+        }
+        fn apply_dyn(&self, f: &dyn Fn(&Self) -> i64) -> i64 {
+            f(self)
+        }
+    }
+}
+
+#[test]
+fn self_mentioning_fn_and_dyn_args() {
+    use self_args::Vis;
+    assert_eq!(self_args::A(3).apply(|x| x.0 * 2), 6);
+    assert_eq!(self_args::B(5).apply_dyn(&|x| x.0 + 1), 6);
+}

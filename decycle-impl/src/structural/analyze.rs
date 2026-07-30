@@ -171,7 +171,9 @@ pub(crate) fn local_refs(ty: &Type, adt_names: &HashSet<String>) -> Vec<String> 
     out
 }
 
-/// Visit every path-segment ident within `ty`, descending references/containers/tuples/generic args.
+/// Visit every path-segment ident within `ty`, descending references/containers/tuples/generic args,
+/// and also into fn-pointer, `dyn` and `impl Trait` types (so a `Self` inside `fn(&Self)` /
+/// `dyn Fn(&Self)` / `impl Fn(&Self)` is seen).
 pub(crate) fn walk_type(ty: &Type, f: &mut impl FnMut(&Ident)) {
     match ty {
         Type::Path(tp) => {
@@ -180,13 +182,7 @@ pub(crate) fn walk_type(ty: &Type, f: &mut impl FnMut(&Ident)) {
             }
             if let Some(seg) = tp.path.segments.last() {
                 f(&seg.ident);
-                if let PathArguments::AngleBracketed(ab) = &seg.arguments {
-                    for a in &ab.args {
-                        if let GenericArgument::Type(t) = a {
-                            walk_type(t, f);
-                        }
-                    }
-                }
+                walk_args(&seg.arguments, f);
             }
         }
         Type::Reference(r) => walk_type(&r.elem, f),
@@ -196,6 +192,51 @@ pub(crate) fn walk_type(ty: &Type, f: &mut impl FnMut(&Ident)) {
         Type::Tuple(t) => t.elems.iter().for_each(|e| walk_type(e, f)),
         Type::Paren(p) => walk_type(&p.elem, f),
         Type::Group(g) => walk_type(&g.elem, f),
+        Type::BareFn(bf) => {
+            for input in &bf.inputs {
+                walk_type(&input.ty, f);
+            }
+            if let syn::ReturnType::Type(_, t) = &bf.output {
+                walk_type(t, f);
+            }
+        }
+        Type::TraitObject(to) => walk_bounds(&to.bounds, f),
+        Type::ImplTrait(it) => walk_bounds(&it.bounds, f),
         _ => {}
+    }
+}
+
+/// Visit types inside a path segment's arguments — both `<..>` and `Fn(..)`-sugar forms.
+fn walk_args(args: &PathArguments, f: &mut impl FnMut(&Ident)) {
+    match args {
+        PathArguments::AngleBracketed(ab) => {
+            for a in &ab.args {
+                if let GenericArgument::Type(t) = a {
+                    walk_type(t, f);
+                }
+            }
+        }
+        PathArguments::Parenthesized(p) => {
+            p.inputs.iter().for_each(|t| walk_type(t, f));
+            if let syn::ReturnType::Type(_, t) = &p.output {
+                walk_type(t, f);
+            }
+        }
+        PathArguments::None => {}
+    }
+}
+
+/// Visit types inside the trait bounds of a `dyn`/`impl Trait` type.
+fn walk_bounds(
+    bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
+    f: &mut impl FnMut(&Ident),
+) {
+    for b in bounds {
+        if let syn::TypeParamBound::Trait(tb) = b {
+            if let Some(seg) = tb.path.segments.last() {
+                f(&seg.ident);
+                walk_args(&seg.arguments, f);
+            }
+        }
     }
 }

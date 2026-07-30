@@ -407,3 +407,4 @@ fn test_unsafe_trait_cycle() {
         assert_eq!(B.danger(1500), 1500);
     });
 }
+

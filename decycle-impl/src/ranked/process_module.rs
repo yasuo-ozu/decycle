@@ -258,6 +258,12 @@ fn validate_impl_where_bounds(
     }
 }
 
+/// Apply the ranked `#[decycle]` transformation to `module`, programmatically.
+///
+/// `decycle` is the path to the decycle crate (its leading segment names the crate, used to
+/// recognise `#[<crate>::decycle]` on inner items). `recurse_level` sets the compile-time expansion
+/// depth; `support_infinite_cycle` toggles the runtime re-entry registry (unbounded depth) versus a
+/// fixed-depth floor. For macro authors wrapping `#[decycle]`; most users should use the attribute.
 pub fn process_module(
     mut module: ItemMod,
     decycle: &Path,

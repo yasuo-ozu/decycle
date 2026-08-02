@@ -408,3 +408,42 @@ fn test_unsafe_trait_cycle() {
     });
 }
 
+// ---- a cycle that crosses DISTINCT instantiations of the same generic type (`Wrap<u8> ↔ Wrap<u16>`).
+// Both engines must key these apart rather than conflate them by the head name `Wrap` — ranked via
+// per-instantiation registry keys, structural because codegen emits one terminator impl per impl
+// (each carrying its own `self_args`), even though the SCC graph is name-keyed. Genuinely needs
+// decycle: the mutual obligation overflows (`E0275`) in plain Rust. ----
+dual_mod! {
+    cross_instantiation_loops {
+        #[decycle]
+        pub trait Step {
+            fn step(&self, n: usize) -> i64;
+        }
+        pub struct Wrap<T>(pub T);
+        impl Step for Wrap<u8>
+        where
+            Wrap<u16>: Step,
+        {
+            fn step(&self, n: usize) -> i64 {
+                if n == 0 { 0 } else { Wrap(0u16).step(n - 1) + 1 }
+            }
+        }
+        impl Step for Wrap<u16>
+        where
+            Wrap<u8>: Step,
+        {
+            fn step(&self, n: usize) -> i64 {
+                if n == 0 { 0 } else { Wrap(0u8).step(n - 1) + 1 }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_cross_instantiation_cycle() {
+    on_both!(cross_instantiation_loops, {
+        assert_eq!(Wrap(1u8).step(2000), 2000);
+        assert_eq!(Wrap(1u16).step(1500), 1500);
+    });
+}
+

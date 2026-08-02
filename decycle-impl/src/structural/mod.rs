@@ -30,9 +30,11 @@ pub(crate) use codegen::*;
 pub(crate) use collect::*;
 pub(crate) use rho::*;
 
-/// Entry point for `#[decycle(structural)]` on a module. `decycle` is the runtime path argument (its
-/// leading segment names the decycle crate, used to recognise `#[<crate>::decycle]` on inner items).
-pub fn process_module_structural(module: ItemMod, decycle: &Path) -> TokenStream {
+/// Apply the structural `#[decycle(structural)]` transformation to `module`, programmatically —
+/// the no-runtime unroll. `decycle` is the path to the decycle crate (its leading segment names the
+/// crate, used to recognise `#[<crate>::decycle]` on inner items). For macro authors wrapping
+/// `#[decycle(structural)]`; most users should use the attribute.
+pub fn process_module(module: ItemMod, decycle: &Path) -> TokenStream {
     match expand(module.clone(), decycle) {
         Ok(ts) => ts,
         Err(e) => {

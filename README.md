@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/yasuo-ozu/decycle/main/assets/logo.svg" width="140" alt="decycle logo: a broken cycle escaping on a tangent">
+  <img src="https://raw.githubusercontent.com/yasuo-ozu/decycle/main/decycle.png" width="140" alt="decycle logo: a broken cycle escaping on a tangent">
 </p>
 
 # Decycle
@@ -166,92 +166,25 @@ mod cycle {
 ## Two algorithms
 
 `#[decycle]` on a module selects one of two independent cycle-breaking strategies: the default
-**ranked** engine (hidden "Ranked" helper traits + a thread-local runtime re-entry registry) or the
-**structural** unroll — `#[decycle(structural)]` — using per-type `#[repr(transparent)]` terminators
-and layout casts with no runtime. They break the same cycles and are interchangeable for ordinary
-method recursion (about nine test files run identical scenarios under both, via
-`tests/common/mod.rs`), but differ sharply in cost and in what they can't do. Every cell below is
-verified by a compiled spike (✓ = works, ✗ = rejected / fails to compile):
+**ranked** engine  or the **structural** unroll — `#[decycle(structural)]`.
 
 | | `#[decycle]` (ranked) | `#[decycle(structural)]` |
 | --- | --- | --- |
 | Deep-recursion **runtime cost** | not zero-cost (vtable hop) | **zero-cost** |
-| **Unbounded depth** | needs `support_infinite_cycle` option | always |
-| **Growing-type-arg** recursion (`Dup<…>` tower) | **✓** (fn-pointer re-entry) | ✗ (layout cast can't) |
-| Return-position **`impl Trait`** | ✗ (declare an associated type) | ✗ (declare an associated type) |
-| Unsupported shape → **compile-time rejection** (caught by `cargo build`) | most shapes | **every** shape |
-| Unsupported shape → **fail-closed runtime panic** (isolated floor panic) | a residual set: generic method past width, bare-param bound, heterogeneous side-bound, projection cross-edge | **never** |
-| **`no_std`** | ✗ in unbounded mode (thread-local registry) | **✓** |
-| Arg mentioning `Self`: **`impl Fn(&Self)`** (APIT) | **✓** | ✗ (unnameable cast target — use `fn`/`dyn`) |
+| **Unbounded depth** | only when `support_infinite_cycle = true` | always |
+| **Growing-type-arg** recursion | **✓** (fn-pointer re-entry) | ✗ (layout cast can't) |
+| **`no_std`** | only when `support_infinite_cycle = false` | **✓** |
+| Arg mentioning `Self`: **`impl Fn(&Self)`** (APIT) | **✓** | ✗ (use generics) |
 | Arg mentioning `Self`: **`fn(&Self)`** / **`&dyn Fn(&Self)`** | ✗ | **✓** |
 | Non-`#[decycle]` **supertrait** on the trait | **✓** | ✗ |
-| Same-named foreign trait / finite `Wrap<u8>→Wrap<u16>` chain | **✓** (per-instantiation keys) | ✗ (name-keyed) |
-| **`#[track_caller]`** | bounded ✓ / unbounded ✗ | **✓** |
-| **`#[cfg]`** on a *required* trait method | ✗ (rejected up-front) | ✓ when the cfg is true |
-| **`async fn`** | ✗ | ✗ |
-| **`unsafe` trait** | **✓** (emits `unsafe impl`) | **✓** (emits `unsafe impl`) |
-| Wrapped bound `Box<Stmt>: Tr` w/o a blanket `impl<T: Tr> Tr for Box<T>` | ✗ (clear up-front diagnostic) | ✗ (clear up-front diagnostic) |
-| Third-party trait *in* the cycle, impl'd for **your** local types | ✓ if it's `#[decycle]`-annotated at its definition | **✓** (any foreign trait) |
-| Cross-module cycle; foreign trait impl'd for a *foreign* type | ✗ | ✗ |
-| Nested `#[decycle]` modules; glob-`use` | ✗ (rejected) | silently ignored |
+| Third-party trait *in* the cycle | only when `#[decycle]`-annotated at its definition | **✓**  |
 
-**In short:**
 
-Every unsupported shape surfaces as one of two failure modes: a **compile-time rejection** (caught by
-`cargo build`) or a **fail-closed runtime panic** (an isolated floor panic when the path executes).
+## How the algorithms work?
 
-- **Prefer `#[decycle(structural)]`** for ordinary method-recursion cycles — it is genuinely
-  zero-cost, recurses unboundedly (OS stack only), and every shape it can't handle is a
-  **compile-time rejection**, never a runtime surprise.
-- **Use the ranked engine** only for **growing-type-argument recursion** (a `Dup<…>` stream whose
-  type grows one wrapper per descent level) — the structural layout cast can't express it. Its
-  default *unbounded* mode is **not** zero-cost (per-frame thread-local inserts + a fn-pointer
-  indirection that blocks inlining), and a residual set of unsupported shapes is a **fail-closed
-  runtime panic** (an isolated panic at the recursion floor) rather than a compile-time rejection.
+<details>
 
-**Both engines** need the whole cycle in one *inline* `#[decycle]` module over traits **you** annotate
-(ranked rejects a module with no annotated cycle; structural treats it as a silent no-op), and reject
-a few shapes:
-
-- no return-position `impl Trait` / `async fn` — declare an associated type, or return a boxed type
-  (`Pin<Box<dyn Future<…>>>` for async);
-- no cross-module cycle, and no foreign trait impl'd for a *foreign* type (the orphan rule blocks the
-  generated impls). A third-party trait *is* allowed **in** the cycle when you `#[decycle] use` it and
-  implement it for your **own** types — structural takes any such trait; ranked additionally needs it
-  `#[decycle]`-annotated at its definition;
-- an empty `#[decycle]` module is rejected; a nested `#[decycle]` module and a glob-`use` are rejected
-  by ranked and silently ignored by structural;
-- a *wrapped* cyclic bound (`Box<Stmt>: Tr`) needs its container to forward the trait — a blanket
-  `impl<T: Tr> Tr for Box<T>`;
-- prefer `crate::`-rooted paths over `super::` in method bodies.
-
-An `unsafe trait` is supported by both engines (the generated impls are emitted as `unsafe impl`).
-
-**Ranked-only:**
-
-- `#[track_caller]` (unbounded) and `#[cfg]` on a *required* trait method — rejected;
-- a `#[decycle]` trait can't be a supertrait of another; trait aliases and `Fn(..)`-sugar bounds are
-  unsupported;
-- unbounded mode is **std-only** and always links `type-leak`;
-- its safety net is a fail-closed floor panic — a generic method first reached at cycle width >
-  `recurse_level`, a bare-type-param cyclic bound (`impl<T: Cb> Ca for Wrap<T>`), a heterogeneous
-  side-bound cycle, or a projection-typed cross-edge.
-
-**Structural-only:**
-
-- no growing-type-argument recursion (above); HRTB wrapped bounds (`for<'a> Wrap<&'a A>: Tr`) aren't
-  supported either;
-- an argument-position `impl Trait` whose bound mentions `Self` (`fn m(&self, f: impl Fn(&Self))`)
-  isn't castable — its target `impl Fn(&__Term)` is unnameable; use a `fn(&Self)` or `&dyn Fn(&Self)`
-  arg instead (both of which structural *does* cast, and which ranked can't);
-- a non-`#[decycle]` supertrait on the decycled trait isn't supported;
-- cycle membership is keyed by trait/type *name* over local ADTs only, so a same-named foreign trait
-  or a finite `Wrap<u8> → Wrap<u16>` chain is misclassified — the ranked engine gets these right.
-
-> The `type-leak` distinction is about the *generated* code (`structural` emits none); the `decycle`
-> proc-macro crate always links `type-leak` at build time regardless of engine.
-
-### The ranked engine (default)
+<summary>Ranked traits</summary>
 
 `#[decycle]` rewrites the annotated module into a set of ranked helper traits. Each
 original trait gets a hidden "Ranked" version that carries an extra type parameter
@@ -362,21 +295,11 @@ When it is `false`, no runtime machinery is emitted (zero-cost) and decycle
 stops at the configured `recurse_level` with an `unimplemented!` panic once the
 limit is reached.
 
-#### `impl Trait` in method arguments
+</details>
 
-Input-position `impl Trait` (APIT) in a `#[decycle]` trait method is desugared to a
-method-level generic on the ranked traits — `fn m(&self, x: impl Bound)` becomes
-`fn m<T: Bound>(&self, x: T)` — so it participates in ranking and re-entry like any
-generic method (each instantiation gets its own registry key). Multiple APIT
-parameters and HRTB bounds (`impl for<'a> Fn(&'a T)`) are supported, in both bounded
-and unbounded modes. The bound may itself name a *cyclic* `#[decycle]` trait
-(`fn sink(&self, other: impl Feed, ..)` where `Feed` is decycled): such an argument is
-a value supplied from outside the cycle, so its bound is kept on the **public** trait
-(never rank-lowered) and remains provable at the public boundary. Return-position
-`impl Trait` is unsupported in **both** modes (its erased fn-pointer type is not nameable —
-E0562) and produces a clean compile error pointing you at an associated type.
 
-### The structural unroll (`#[decycle(structural)]`)
+<details>
+<summary> The structural unroll (`#[decycle(structural)]`) </summary>
 
 A second, self-contained algorithm with **no runtime and no `type-leak` dependency** —
 everything is resolved at compile time.
@@ -497,6 +420,8 @@ type grows one wrapper per descent level — the layout cast can't express it; t
 engine's fn-pointer re-entry is for). Return-position `impl Trait` and `async fn` are rejected
 up-front in both engines (declare an associated type, or return a boxed type). See
 [Two algorithms](#two-algorithms) for the full per-engine breakdown of what each side can't do.
+
+</details>
 
 ### Comparison with `coinduction`
 

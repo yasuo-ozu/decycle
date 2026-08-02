@@ -792,10 +792,9 @@ fn sig_has_impl_trait_input(sig: &Signature) -> bool {
     )
 }
 
-/// D4: true iff the method's RETURN type mentions `impl Trait` anywhere. Such a method's
-/// erased fn-pointer alias `fn(...) -> impl Trait` is not nameable (E0562), so unbounded
-/// re-entry cannot be built for it — and the ranked ADT rewrite can't name it in bounded mode
-/// either. `process_module` uses this to reject RPITIT early with an actionable error.
+/// True iff the method's return type mentions `impl Trait` anywhere. Such a method has no nameable
+/// erased fn-pointer type (`fn(...) -> impl Trait` is E0562), so it can't be threaded through
+/// re-entry — used to reject return-position `impl Trait` up-front with a clear error.
 pub(crate) fn sig_has_impl_trait_output(sig: &Signature) -> bool {
     struct Find(bool);
     impl<'ast> syn::visit::Visit<'ast> for Find {
@@ -813,10 +812,10 @@ pub(crate) fn sig_has_impl_trait_output(sig: &Signature) -> bool {
     }
 }
 
-/// D1 bridge (semver-committed): a method whose floor key depends on an instantiation rule 2
-/// cannot know. A programmatic caller's erased trait must keep its method NON-generic
-/// (`method_is_generic == false`) for every floor to register (E3 replan §2a).
-pub fn method_is_generic(sig: &Signature) -> bool {
+/// True iff the method has its own type/const generics or an argument-position `impl Trait`.
+/// A programmatic caller's erased trait must keep its methods non-generic for every floor to
+/// register. Semver-committed.
+fn method_is_generic(sig: &Signature) -> bool {
     sig.generics
         .params
         .iter()
@@ -990,14 +989,11 @@ fn const_param_ty_foldable(ty: &Type) -> bool {
         if FOLDABLE.iter().any(|p| path.is_ident(p)))
 }
 
-/// D1 bridge (semver-committed): true iff `ty` is syntactically unsized — a trait object, a
-/// slice, or the bare `str` path —
-/// so `size_of::<ty>()`/`align_of::<ty>()` would not compile (F-M1). One shared predicate used
-/// by every `fingerprint_expr` call site (the target fold is skipped for such a type): such
-/// targets are never anonymous, so omitting them from the fingerprint loses no discriminating
-/// power, and every emission site agreeing on the same predicate keeps registration and floor
-/// keys consistent.
-pub fn is_syntactically_unsized(ty: &Type) -> bool {
+/// True iff `ty` is syntactically unsized — a trait object, a slice, or the bare `str` path — so
+/// `size_of`/`align_of` on it would not compile. [`fingerprint_expr`] skips folding the target's
+/// layout for such a type (they're never anonymous, so nothing is lost); pass the same value at
+/// every call site so registration and floor keys agree. Semver-committed.
+fn is_syntactically_unsized(ty: &Type) -> bool {
     match ty {
         Type::TraitObject(_) => true,
         Type::Slice(_) => true,
@@ -1068,21 +1064,16 @@ fn any_type_has_projection<'a>(tys: impl Iterator<Item = &'a Type>) -> bool {
     c.0
 }
 
-/// The layout-fingerprint expression for one marker instantiation: a deterministic fold
-/// over size/align of the target (`Self` / the rule-2 bound target) and every TYPE generic
-/// argument, plus the value of every foldable const argument — `type_name` is non-injective
-/// (two closures in one fn share a `{{closure}}` name), so the fingerprint keeps
-/// different-layout instantiations on distinct registry keys. Registration sites and the
-/// floor MUST fold the identical list in the identical order, which is why both emission
-/// sites call this one helper. Params declared `?Sized` are skipped (`size_of` would not
-/// compile); the target is folded unless `target_is_unsized` (F-M1 — e.g. `impl Ca for str`;
-/// naming the re-entry fn still requires the target `Sized` at every ordinary registration
-/// site, but a syntactically unsized target is exactly the case that isn't).
+/// Build the layout-fingerprint expression for one registry key: a deterministic fold over the
+/// size/align of the target and every type generic argument, plus each foldable const argument.
+/// `type_name` alone isn't unique (two closures in one fn share a name), so this fingerprint keeps
+/// different-layout instantiations on distinct keys. Type params declared `?Sized` are skipped, and
+/// the target's layout is folded unless `target_is_unsized`.
 ///
-/// D1 bridge (semver-committed): a programmatic caller MUST build every hand-emitted
-/// registration's fp through THIS fn with the same argument recipe the floor uses —
-/// `(decycle, target, is_syntactically_unsized(target), trait_generics, targs,
-/// Some(&method_sig.generics))` — so registration and floor keys agree by construction.
+/// A programmatic caller must build every hand-emitted registration's fingerprint with THIS fn and
+/// the same arguments the floor uses — `(decycle, target, is_syntactically_unsized(target),
+/// trait_generics, targs, Some(&method_sig.generics))` — so registration and floor keys agree.
+/// Semver-committed.
 pub fn fingerprint_expr(
     decycle: &Path,
     target: &TokenStream,
@@ -2111,21 +2102,15 @@ fn rule1_registration_ok(
         )
 }
 
-/// One `register::<Mk<...>>(fp, Re::<...> as usize);` statement.
+/// Emit one re-entry registration statement (`register::<Mk<...>>(fp, Re::<...> as usize);`).
 ///
-/// C4: `rt_path` is the path prefix to `ranked_traits` as seen from the EMISSION site — bare
-/// `ranked_traits` for rules 1 & 2 (emitted from inside `shadowing_module`), and
-/// `shadowing_module::ranked_traits` for C4's registrations (emitted from the Final delegating
-/// impls, siblings of `shadowing_module`). Parameterizing this prefix is the only change needed
-/// to let a caller outside `shadowing_module` emit a well-formed registration.
-///
-/// D1 bridge (semver-committed): the third emission site — a programmatic `finalize` caller
-/// (a wrapper macro's E3 path) splicing registrations alongside `finalize`'s output (the C4
-/// scope; pass `rt_path = quote!(#{shadowing_module_name()}::#{ranked_traits_module_name()})`).
-// The parameter list is the semver-committed bridge signature; bundling it into a struct
-// would be a breaking change, so the arity is intentional.
+/// `rt_path` is the path prefix to the generated `ranked_traits` module as seen from wherever the
+/// statement is emitted. A programmatic caller splicing registrations alongside [`finalize`]'s
+/// output passes the full path to that module. Semver-committed.
+// The parameter list is the committed bridge signature; bundling it into a struct would be a
+// breaking change, so the arity is intentional.
 #[allow(clippy::too_many_arguments)]
-pub fn emit_registration(
+fn emit_registration(
     decycle: &Path,
     rt_path: &TokenStream,
     trait_ident: &Ident,
@@ -2359,73 +2344,55 @@ impl template_quote::ToTokens for TraitRename {
     }
 }
 
-/// D1 bridge (impl-spec §C.4 / plan risk 2-3): the exact ident mangling `finalize` uses for a
-/// `#[decycle]` trait's synthesized ranked counterpart — `<trait_ident>Ranked<suffix>`, where
-/// `<suffix>` is decycle's naming salt (`name`, above — a pure function of a fixed crate
-/// identity, so in practice a process/build-independent constant). Calling this with the same
-/// `trait_ident` — the literal `ItemTrait.ident` passed in `FinalizeArgs.traits` (BEFORE any
-/// `renames`; a programmatic, no-rename caller need not think about renames at all) — always
-/// yields the identical `Ident` that `finalize` itself mints for that trait's ranked
-/// declaration (`pub trait #{name!("{}Ranked", ident)}`, nested in `shadowing_module::
-/// ranked_traits`). This lets a caller spell the ranked trait's name BEFORE calling `finalize`,
-/// which is exactly what's needed for a rank-PRESERVING wrapper impl (see the NOTE below) —
-/// such a wrapper must be emitted by the caller, outside `finalize`'s own output, so it needs
-/// the name in hand ahead of time.
+/// The ident decycle mints for a `#[decycle]` trait's generated "ranked" counterpart
+/// (`<Trait>Ranked<suffix>`). Pass the trait's own `ItemTrait.ident` (as in `FinalizeArgs.traits`,
+/// before any renames) to get the exact name [`finalize`] uses — useful for emitting an extra impl
+/// of that ranked trait alongside decycle's output. Semver-committed.
 ///
 /// ```ignore
-/// let trait_ident: syn::Ident = syn::parse_quote!(__ParseDyn);
-/// let ranked = decycle_impl::finalize::ranked_trait_name(&trait_ident);
-/// // ranked spells the same ident `finalize` uses for `trait __ParseDynRanked<..> { .. }`
+/// let ranked = decycle_impl::finalize::ranked_trait_name(&syn::parse_quote!(MyTrait));
+/// // `ranked` is the ident of `trait MyTraitRanked<..> { .. }`
 /// ```
-pub fn ranked_trait_name(trait_ident: &Ident) -> Ident {
+#[cfg(test)]
+fn ranked_trait_name(trait_ident: &Ident) -> Ident {
     name!("{}Ranked", trait_ident)
 }
 
-/// D1 bridge: the `mod` name `finalize` nests every SCC's ranked-trait machinery under
-/// (`#[doc(hidden)] mod #{name!("shadowing_module")}`, above).
-pub fn shadowing_module_name() -> Ident {
+/// The name of the private module decycle nests every cycle's ranked-trait machinery under.
+#[cfg(test)]
+fn shadowing_module_name() -> Ident {
     name!("shadowing_module")
 }
 
-/// D1 bridge: the `pub mod` name, nested inside [`shadowing_module_name`], holding every
-/// ranked trait declaration (`pub mod #{name!("ranked_traits")}`, above).
-pub fn ranked_traits_module_name() -> Ident {
+/// The name of the module (inside [`shadowing_module_name`]) that holds the ranked trait
+/// declarations.
+#[cfg(test)]
+fn ranked_traits_module_name() -> Ident {
     name!("ranked_traits")
 }
 
-/// D1 bridge: the full path to a trait's ranked counterpart, AS SEEN FROM the scope
-/// `finalize` itself emits its OWN output into — i.e. a sibling of `shadowing_module` (the
-/// same scope the `Final` delegating impls live in; see `build_bareparam_registrations`'s
-/// `shadowing_module::ranked_traits::` prefix for the existing internal use of this same
-/// scope). This is exactly the scope a rank-preserving `Group` wrapper (see the NOTE below)
-/// must be emitted into, alongside `finalize`'s output:
+/// The full path to a trait's ranked counterpart, as seen from the scope [`finalize`] emits its own
+/// output into — the scope where a caller emitting an extra impl of the ranked trait must spell it.
+/// Semver-committed.
 ///
 /// ```ignore
-/// let trait_ident: syn::Ident = syn::parse_quote!(__ParseDyn);
-/// let path = decycle_impl::finalize::ranked_trait_path(&trait_ident);
-/// // path == shadowing_module<N>::ranked_traits<N>::__ParseDynRanked<N>
-/// let wrapper = quote::quote! {
-///     impl<R, Slot: #path<R>> #path<R> for Group<Slot, O, C> { /* forward each item */ }
-/// };
+/// let path = decycle_impl::finalize::ranked_trait_path(&syn::parse_quote!(MyTrait));
+/// // path == <shadowing-module>::<ranked-traits>::MyTraitRanked
 /// ```
-pub fn ranked_trait_path(trait_ident: &Ident) -> Path {
+#[cfg(test)]
+fn ranked_trait_path(trait_ident: &Ident) -> Path {
     let shadowing = shadowing_module_name();
     let ranked_mod = ranked_traits_module_name();
     let ranked = ranked_trait_name(trait_ident);
     parse_quote!(#shadowing::#ranked_mod::#ranked)
 }
 
-/// D1 bridge: where, in a `#[decycle]` trait's OWN generics, `finalize` inserts the
-/// synthesized rank parameter — the index of the first non-lifetime generic param, or
-/// `trait_.generics.params.len()` if the trait declares none (mirrors the `rank_loc`
-/// computation `finalize` itself uses when building `replacing_table`/`trait_replacer_table`,
-/// above). All three of a wrapper macro's erased traits (`__ParseDyn`/`__UnparseDyn`/`__SpanDyn`, impl-spec
-/// §A) declare no generics of their own, so this is always `0` for them: the ranked trait is
-/// `XxxRanked<Rank>` (a single type param), exactly the shape the rank-preserving wrapper sketch
-/// (`impl<R, Slot: XxxRanked<R>> XxxRanked<R> for Group<Slot,O,C>`) assumes without further
-/// adjustment. Exposed so a caller whose trait DOES carry its own generics doesn't have to
-/// reverse-engineer decycle's insertion rule.
-pub fn ranked_trait_rank_loc(trait_: &ItemTrait) -> usize {
+/// Where decycle inserts the synthesized rank parameter in a `#[decycle]` trait's own generics: the
+/// index of the first non-lifetime generic, or the end if the trait declares none (so a trait with
+/// no generics gets `XxxRanked<Rank>`). Exposed so a caller whose trait carries its own generics
+/// need not reverse-engineer the insertion rule. Semver-committed.
+#[cfg(test)]
+fn ranked_trait_rank_loc(trait_: &ItemTrait) -> usize {
     trait_
         .generics
         .params
@@ -2434,43 +2401,36 @@ pub fn ranked_trait_rank_loc(trait_: &ItemTrait) -> usize {
         .unwrap_or(trait_.generics.params.len())
 }
 
-/// D1 bridge: the marker ZST ident `emit_reentry_items` mints per (trait × method) —
-/// `__Mk_<Trait>_<method><suffix>`. The floor keys `__reentry::lookup` on
-/// `type_name::<Mk<Target, targs…, margs…>>()`; a hand-emitted registration must name the
-/// SAME marker. [`emit_registration`] calls this itself, so a caller only needs it to spell a
-/// floor-shaped `lookup` (diagnostics, tests) or to assert agreement.
-pub fn reentry_marker_name(trait_ident: &Ident, method_ident: &Ident) -> Ident {
+/// The marker-type ident decycle mints per (trait, method) — `__Mk_<Trait>_<method><suffix>` — used
+/// as the registry key. [`emit_registration`] names it for you; exposed for diagnostics/tests.
+fn reentry_marker_name(trait_ident: &Ident, method_ident: &Ident) -> Ident {
     name!("__Mk_{}_{}", trait_ident, method_ident)
 }
 
-/// D1 bridge: the full-height re-entry fn ident (`__Re_<Trait>_<method><suffix>`) whose
-/// address a registration stores. [`emit_registration`] names it itself.
-pub fn reentry_fn_name(trait_ident: &Ident, method_ident: &Ident) -> Ident {
+/// The re-entry fn ident (`__Re_<Trait>_<method><suffix>`) whose address a registration stores.
+/// [`emit_registration`] names it for you.
+fn reentry_fn_name(trait_ident: &Ident, method_ident: &Ident) -> Ident {
     name!("__Re_{}_{}", trait_ident, method_ident)
 }
 
-/// D1 bridge: the erased fn-pointer type alias ident (`__Fp_<Trait>_<method><suffix>`) — the
-/// only transmute target a floor may name. Exposed for completeness/diagnostics; a wrapper
-/// macro's emissions never need to transmute (only `finalize`'s own floors do).
-pub fn reentry_alias_name(trait_ident: &Ident, method_ident: &Ident) -> Ident {
+/// The erased fn-pointer type-alias ident (`__Fp_<Trait>_<method><suffix>`). Exposed for
+/// completeness; only decycle's own floors ever transmute through it.
+#[cfg(test)]
+fn reentry_alias_name(trait_ident: &Ident, method_ident: &Ident) -> Ident {
     name!("__Fp_{}_{}", trait_ident, method_ident)
 }
 
-/// One caller-supplied ranking augmentation for an indirect / projection cross-edge (C2).
+/// A caller-supplied ranking rule for an indirect / projection cross-edge that decycle's plain scan
+/// can't rank on its own.
 ///
-/// `normalize` rewrites a projection obligation target (`<G as EmptyGroup>::Fill<Substruct>`) to
-/// its concrete equal (`Group<Substruct,O,C>`) BEFORE any ranking stage runs, so
-/// `cyclic_where_bounds`, `unify_type_pattern`, `TraitReplacer`, and the leaf/inductive/Final
-/// loops all treat it as an ordinary `Type::Path{qself:None}` member bound. `foreign_impls` are
-/// the concrete, member-shaped in-module impls of that now-concrete type
-/// (`impl __UnparseDyn for Group<Substruct,O,C>`), injected into the ranked set so a full ranked
-/// chain is emitted for them and the reachability walk (`reachable_side_bounds_ok`) can match
-/// them.
+/// `normalize` rewrites a projection obligation target (e.g. `<G as EmptyGroup>::Fill<S>`) to its
+/// concrete form (e.g. `Group<S, O, C>`) before ranking runs, so it's treated like an ordinary
+/// member bound. `foreign_impls` are the concrete in-module impls of that now-concrete type,
+/// injected into the ranked set so a full ranked chain is emitted for them.
 ///
-/// NOTE: `foreign_impls` MUST NOT contain a rank-PRESERVING transparent wrapper
-/// (`impl<R,Slot: XRanked<R>> XRanked<R> for Group<Slot>`) — such a wrapper must be emitted by
-/// the caller directly and never enrolled here (use [`ranked_trait_name`] / [`ranked_trait_path`]
-/// to spell it); see the crate docs on the rank-preserving wrapper constraint.
+/// NOTE: `foreign_impls` must NOT contain a rank-preserving transparent wrapper
+/// (`impl<R, Slot: XRanked<R>> XRanked<R> for Group<Slot>`) — emit that yourself, never enroll it
+/// here.
 pub struct AlsoRank {
     pub normalize: Vec<(Type, Type)>,
     pub foreign_impls: Vec<ItemImpl>,
@@ -2521,23 +2481,28 @@ impl template_quote::ToTokens for AlsoRank {
     }
 }
 
+/// The fully-described input to [`finalize`] — a `#[decycle]` module's traits and impls plus the
+/// expansion settings. Build this to run the ranked transformation programmatically instead of
+/// through the `#[decycle]` attribute. Semver-committed.
 pub struct FinalizeArgs {
+    /// Paths of the `#[decycle]`-annotated traits participating in the cycle.
     pub working_list: Vec<Path>,
+    /// The `#[decycle]` trait definitions in the module.
     pub traits: Vec<ItemTrait>,
+    /// The module's trait impls (the cyclic ones get rewritten).
     pub contents: Vec<ItemImpl>,
+    /// Compile-time expansion depth (at least 1).
     pub recurse_level: usize,
+    /// `true` emits the runtime re-entry registry for unbounded depth; `false` stops at a
+    /// fixed-depth floor.
     pub support_infinite_cycle: bool,
-    /// `(original_ident, local_alias)` pairs from this module's own
-    /// `#[decycle] use path::T as R;` statements (see `TraitRename`).
+    /// `(original_ident, local_alias)` pairs from this module's own `#[decycle] use path::T as R;`.
     pub renames: Vec<(Ident, Ident)>,
-    /// C2: caller-supplied indirect/projection ranking rules. Empty ⇒ no change from today
-    /// (byte-identical for every SCC that doesn't opt in).
+    /// Caller-supplied ranking rules for indirect / projection cross-edges (see [`AlsoRank`]).
+    /// Empty leaves ranking unchanged.
     pub also_rank: Vec<AlsoRank>,
-    /// D1: explicit decycle-crate path for the PROGRAMMATIC entry (a wrapper macro crate
-    /// constructing `FinalizeArgs` directly, bypassing the token-carrier ping-pong). `Some(p)`
-    /// overrides the working-list recovery below; `None` ⇒ today's behaviour (recover from
-    /// `working_list`). The carrier `Parse`/`ToTokens` path always leaves this `None` — only a
-    /// direct, programmatic caller sets it.
+    /// Explicit path to the decycle crate. `None` recovers it from `working_list` (what the
+    /// `#[decycle]` attribute does); `Some(p)` overrides it — set this from a programmatic caller.
     pub decycle_path: Option<Path>,
 }
 
@@ -2649,30 +2614,23 @@ impl template_quote::ToTokens for FinalizeArgs {
     }
 }
 
-/// D1 bridge (E3 replan §1.2): the rank tuple at the FLOOR — the rank `finalize` spells on
-/// every leaf impl (`impl … XxxRanked<(), …> for T`; the `parse_quote![()]` insertion in the
-/// leaf loop below). Literally the unit type `()`.
-pub fn floor_rank() -> Type {
+/// The rank at the floor — the unit type `()`, spelled on every leaf impl (`impl … XxxRanked<()>
+/// for T`). The base of decycle's rank encoding. Semver-committed.
+fn floor_rank() -> Type {
     parse_quote!(())
 }
 
-/// D1 bridge: one rank step — `rank_succ(&R) = (R,)`. This is the exact encoding the
-/// inductive rewrite uses: the impl's TRAIT-path rank is spelled `(Rank,)` against the
-/// body/where-clause rank `Rank` (TraitReplacer steps 1 and 2 in `finalize`). A caller
-/// emitting its own RANK-PRESERVING impls (a wrapper macro's per-occurrence group impls) does NOT use
-/// this — both sides of a rank-preserving impl carry the same rank variable; it exists so a
-/// caller can compose/spell concrete ranks (`Ranked<((),)>`) identically to `finalize`.
-pub fn rank_succ(rank: &Type) -> Type {
+/// One rank step: `rank_succ(&R) = (R,)`. Compose it to spell concrete ranks the same way decycle
+/// does. Semver-committed.
+fn rank_succ(rank: &Type) -> Type {
     parse_quote!((#rank,))
 }
 
-/// D1 bridge: the rank the Final delegating impls enter the ranked family at for a given
-/// `recurse_level` — `rank_succ` applied `recurse_level` times to `floor_rank()`:
-/// `initial_rank(0) = ()`, `initial_rank(1) = ((),)`, `initial_rank(2) = (((),),)`, …
-/// This IS the `Type` `finalize` itself splices into `Self: …Ranked<initial, …>` on every
-/// Final impl (the former private `get_initial_rank` — single source of truth, see the
-/// call site in `finalize`).
-pub fn initial_rank(recurse_level: usize) -> Type {
+/// The rank the Final delegating impls enter at for a given `recurse_level` — [`rank_succ`] applied
+/// `recurse_level` times to [`floor_rank`]: `initial_rank(0) = ()`, `initial_rank(1) = ((),)`,
+/// `initial_rank(2) = (((),),)`, … This is exactly what decycle splices into `Self: …Ranked<..>` on
+/// each Final impl. Semver-committed.
+fn initial_rank(recurse_level: usize) -> Type {
     let mut rank = floor_rank();
     for _ in 0..recurse_level {
         rank = rank_succ(&rank);
@@ -2895,6 +2853,13 @@ fn check_no_decycle_supertraits(
     }
 }
 
+/// Run the ranked `#[decycle]` expansion and return the rewritten module tokens.
+///
+/// The lowest-level programmatic entry point: build a [`FinalizeArgs`] describing the module's
+/// `#[decycle]` traits and their impls — optionally with an [`AlsoRank`] hook for cross-edge
+/// obligations the plain scan can't rank on its own — and call this to get the expanded output.
+/// The `#[decycle]` attribute ultimately routes here; call it directly only when building macro
+/// tooling on top of decycle. Stable and semver-committed.
 pub fn finalize(args: FinalizeArgs) -> TokenStream {
     // Apply this module's own use-site renames (`#[decycle] use path::T as R;`) BEFORE
     // indexing traits by ident: the `ItemTrait` arriving through the macro ping-pong
@@ -3380,8 +3345,8 @@ mod tests {
         s.chars().filter(|c| !c.is_whitespace()).collect()
     }
 
-    /// The proven Ca/Cb two-trait cycle (same fixture as the two existing D1/D3 tests),
-    /// parameterized on `support_infinite_cycle`.
+    /// A proven Ca/Cb two-trait cycle fixture for the programmatic-`finalize` tests, parameterized
+    /// on `support_infinite_cycle`.
     fn d1_cycle_args(support_infinite_cycle: bool) -> (FinalizeArgs, ItemTrait, ItemTrait) {
         let ca_trait: ItemTrait = parse_quote! {
             pub trait Ca { fn ca(&self, n: usize) -> usize; }
@@ -3416,9 +3381,9 @@ mod tests {
         (args, ca_trait, cb_trait)
     }
 
-    /// D1 encoding lock (E3 replan §1.2): `floor_rank`/`rank_succ`/`initial_rank` are the rank
-    /// tuple encoding, both as values and as the spelling inside `finalize`'s own output —
-    /// leaf at `Ranked<()>`, Final entry at `Ranked<((),)>` for `recurse_level = 1`.
+    /// Locks the rank encoding: `floor_rank`/`rank_succ`/`initial_rank` must produce the tuples
+    /// decycle spells in its own output — leaf at `Ranked<()>`, Final entry at `Ranked<((),)>` for
+    /// `recurse_level = 1`.
     #[test]
     fn rank_encoding_lock() {
         let floor = super::floor_rank();
@@ -3447,12 +3412,10 @@ mod tests {
         assert!(hay.contains(&fin), "Final initial rank is not spelled `((),)`:\n{}", out);
     }
 
-    /// D1 gate: a hand-emitted registration byte-agrees with (1) `finalize`'s own
-    /// rule-1 registration prologue and (3) the floor's `lookup` key, for the same
-    /// (trait, method, target). All three are built through the one shared pair
-    /// `fingerprint_expr` + `emit_registration`/`reentry_*_name`, so agreement is by
-    /// construction; this locks it at the token level. (2) additionally pins the C4/sibling-
-    /// scope spelling — the exact form a wrapper macro's registration prelude emits.
+    /// A hand-emitted registration (via `fingerprint_expr` + `emit_registration`/`reentry_*_name`)
+    /// must byte-agree with `finalize`'s own registration prologue and the floor's `lookup` key for
+    /// the same (trait, method, target). Agreement is by construction; this locks it at the token
+    /// level, including the sibling-scope spelling a wrapper macro's registration prelude emits.
     #[test]
     fn d1_hand_registration_byte_agrees_with_floor_lookup() {
         let (args, ca_trait, _) = d1_cycle_args(true); // unbounded: floors + registrations
@@ -3512,12 +3475,10 @@ mod tests {
         );
     }
 
-    /// D3: `finalize`'s own output — reachable only via the programmatic `FinalizeArgs`
-    /// bridge (D1), never through `Parse`/carrier tokens — must never leak the carrier
-    /// machinery that lives in `process_module.rs`/`FinalizeArgs::to_tokens`: no
-    /// `#[macro_export]`, no re-emitted `__finalize` carrier call, no `crate_identity` literal.
-    /// This is already true (the carrier is emitted entirely by the *caller*, not by
-    /// `finalize` itself); this test locks it as a regression guard.
+    /// `finalize`'s own output — reachable via the programmatic `FinalizeArgs` entry — must never
+    /// leak the token-carrier machinery: no `#[macro_export]`, no re-emitted `__finalize` carrier
+    /// call, no `crate_identity` literal (the carrier is emitted by the *caller*, not by
+    /// `finalize`). This test locks that as a regression guard.
     #[test]
     fn finalize_output_is_carrier_free() {
         // The `mutual_default` cycle of `tests/unbounded_reentry.rs`, built directly (no
@@ -3596,13 +3557,11 @@ mod tests {
         );
     }
 
-    /// D1 bridge (impl-spec §C.4): [`super::ranked_trait_name`]/[`super::ranked_trait_path`]
-    /// must predict the EXACT name/path `finalize` itself mints for a trait's ranked
-    /// counterpart — a caller needs to spell a rank-preserving wrapper impl BEFORE
-    /// calling `finalize`, so there is no chance to read the name back out of `finalize`'s own
-    /// output first. Same proven two-trait cycle as `finalize_output_is_carrier_free` (never
-    /// aborts/warns), reused here purely to inspect the generated ranked-trait declarations
-    /// and module names.
+    /// [`super::ranked_trait_name`]/[`super::ranked_trait_path`] must predict the exact name/path
+    /// `finalize` itself mints for a trait's ranked counterpart — a caller spells a rank-preserving
+    /// wrapper impl before calling `finalize`, so it can't read the name back out of the output
+    /// first. Reuses the same two-trait cycle as `finalize_output_is_carrier_free`, here purely to
+    /// inspect the generated ranked-trait declarations and module names.
     #[test]
     fn ranked_trait_bridge_matches_finalize_output() {
         let ca_trait: ItemTrait = parse_quote! {

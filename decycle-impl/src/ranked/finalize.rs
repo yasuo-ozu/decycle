@@ -1533,6 +1533,16 @@ fn apply_targs_subst(targs: &[GenericArgument], subst: &HashMap<Ident, Type>) ->
         .collect()
 }
 
+/// Hard ceiling on the number of DISTINCT obligations `reachable_side_bounds_ok` may visit.
+/// A REGULAR cyclic-bound system (every cycle edge re-states the same instantiation up to the
+/// impl's own generic params) closes after at most one obligation per (impl, bound) shape —
+/// the entire test suite peaks at 23 — so any walk reaching this cap is a NON-REGULAR
+/// ("growing") bound whose obligations never repeat, and the walk would otherwise run forever
+/// while its `syn` types deepen until a `Clone`/`ToTokens` traversal overflows the proc-macro
+/// stack (rustc dies with SIGSEGV instead of an error). Fail closed with an actionable abort
+/// instead: no input in this class is compilable anyway (see the comment at the cap check).
+const REACHABLE_OBLIGATIONS_CAP: usize = 1000;
+
 fn reachable_side_bounds_ok(
     registering_impl: &ItemImpl,
     target_ty: &Type,
@@ -1564,6 +1574,28 @@ fn reachable_side_bounds_ok(
         );
         if !visited.insert(key) {
             continue;
+        }
+        // Fail closed on a NON-REGULAR cyclic bound — one whose target instantiation GROWS
+        // along a cycle edge (e.g. `A<Vec<X>>: Tr<Vec<X>>` on `impl<X> Tr<X> for A<X>`): each
+        // rewrite step then yields a strictly larger, never-repeating obligation, so this walk
+        // would diverge and eventually crash rustc (the deepening `syn` types overflow the
+        // stack inside the macro). Aborting here cannot reject a working program: the same
+        // per-level growth defeats rustc itself — the bounded-mode ladder overflows the trait
+        // solver (E0275) and the unbounded mode hits "reached the recursion limit while
+        // instantiating" at monomorphization — so there is no compilable input in this class.
+        if visited.len() > REACHABLE_OBLIGATIONS_CAP {
+            let ty_str = quote!(#ty).to_string();
+            let shown: String = if ty_str.chars().count() > 60 {
+                format!("{}…", ty_str.chars().take(60).collect::<String>())
+            } else {
+                ty_str
+            };
+            abort!(
+                &registering_impl.self_ty,
+                "decycle: the cyclic where-bounds reachable from this impl never close — after {} distinct obligations the walk is still growing (currently proving `{}: {}<…>`); a bound's type argument grows along a cycle edge (a non-regular bound such as `A<Vec<X>>: Tr` on `impl<X> Tr for A<X>`), which no engine can break — rustc itself cannot monomorphize it",
+                REACHABLE_OBLIGATIONS_CAP, shown, trait_ident;
+                help = "make every cycle edge re-state the same instantiation (only the impl's own type parameters, unchanged, in the bound's arguments), or erase the growing argument behind one fixed type (e.g. a `&mut dyn …` stream) at the recursion boundary"
+            );
         }
         let Some((_, _, impls)) = replacing_table.get(&trait_ident) else {
             return false;

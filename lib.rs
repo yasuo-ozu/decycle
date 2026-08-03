@@ -28,8 +28,8 @@ pub use decycle_impl::structural;
 ///
 /// They break the same cycles and are interchangeable for ordinary method recursion, but differ
 /// in cost and in what each can't do (structural is zero-cost and fails every unsupported shape at
-/// compile time; ranked is more expressive for growing-type-argument recursion but a residual set
-/// of shapes fails closed at runtime). See the crate README's *Two algorithms* section for the full
+/// compile time; ranked can re-enter across several instantiations of a generic method, but a residual
+/// set of shapes fails closed at runtime). See the crate README's *Two algorithms* section for the full
 /// per-engine matrix. Both engines require the whole cycle in one *inline* `#[decycle]` module over
 /// traits **you** annotate — either `#[decycle]` on the trait definition, or a `#[decycle] use` of a
 /// trait defined elsewhere.
@@ -174,8 +174,8 @@ pub use decycle_impl::structural;
 ///
 /// An `unsafe trait` **is** supported (the generated impls are emitted as `unsafe impl`). A
 /// third-party trait may participate in the cycle when brought in with `#[decycle] use` and
-/// implemented for your own types. For the complete per-engine matrix — growing-type-argument
-/// recursion, `#[track_caller]`, `no_std`, higher-order `Self`-mentioning arguments
+/// implemented for your own types. For the complete per-engine matrix — multi-instantiation re-entry,
+/// `#[track_caller]`, `no_std`, higher-order `Self`-mentioning arguments
 /// (`fn(&Self)` / `dyn` / `impl Fn(&Self)`), and more — see the crate README's *Two algorithms*
 /// section.
 ///

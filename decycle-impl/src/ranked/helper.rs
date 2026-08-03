@@ -13,6 +13,29 @@ const PARENTHESIZED_ARGS_MSG: &str = "unsupported parenthesized generic argument
 /// #[decycle] trait is recognized the same way the bare name is. A leading `self` is only
 /// ever a no-op module-path prefix (it can't itself carry generic arguments), so stripping
 /// it is always semantics-preserving.
+/// The head (outermost path) ident of a type: `Box` for `Box<Stmt>`, `Stmt` for `Stmt<S>`.
+/// `None` for a non-path type (`&Stmt`, `(A, B)`) or a `<T as Tr>::X` qself.
+///
+/// Used to decide whether a bound's *target* is something the ranked chain actually descends
+/// through — see `finalize::remove_cyclic_bounds` and `process_module`'s rank-lowerability check.
+pub fn type_head_ident(ty: &Type) -> Option<Ident> {
+    match ty {
+        Type::Path(TypePath { qself: None, path }) => path.segments.last().map(|s| s.ident.clone()),
+        _ => None,
+    }
+}
+
+/// Is `path` **depth-fragile** — i.e. does its meaning change when the item carrying it is re-emitted
+/// inside a deeper module? Only `super::`/`self::`-rooted paths are: an absolute (`::a::b`) or
+/// `crate::`-rooted path denotes the same item at any depth.
+pub fn path_is_depth_fragile(path: &Path) -> bool {
+    path.leading_colon.is_none()
+        && path
+            .segments
+            .first()
+            .is_some_and(|seg| seg.ident == "super" || seg.ident == "self")
+}
+
 pub fn strip_leading_self(path: &mut Path) {
     if path.leading_colon.is_none()
         && path.segments.len() > 1

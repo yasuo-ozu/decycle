@@ -172,12 +172,25 @@ mod cycle {
 | --- | --- | --- |
 | Deep-recursion **runtime cost** | not zero-cost (vtable hop) | **zero-cost** |
 | **Unbounded depth** | only when `support_infinite_cycle = true` | always |
-| **Growing-type-arg** recursion | **✓** (fn-pointer re-entry) | ✗ (layout cast can't) |
+| Re-entry across **several instantiations** of a generic method | **✓** (fn-pointer re-entry) | ✗ (layout cast can't) |
+| Genuinely **growing** type argument (one wrapper per level) | ✗ — see note below | ✗ |
 | **`no_std`** | only when `support_infinite_cycle = false` | **✓** |
 | Arg mentioning `Self`: **`impl Fn(&Self)`** (APIT) | **✓** | ✗ (use generics) |
 | Arg mentioning `Self`: **`fn(&Self)`** / **`&dyn Fn(&Self)`** | ✗ | **✓** |
 | Non-`#[decycle]` **supertrait** on the trait | **✓** | ✗ |
 | Third-party trait *in* the cycle | only when `#[decycle]`-annotated at its definition | **✓**  |
+
+> **Note on "growing" type arguments.** Neither engine can make a *genuinely* growing recursion work —
+> one whose instantiation strictly grows every level, e.g. `A<Vec<X>>: Tr` on `impl<X> Tr for A<X>`, or a
+> `Dup<Dup<…>>` stream tower threaded unerased. That is not an engine limitation but a language one:
+> the instantiation family is infinite, so rustc stops it regardless — the trait solver overflows
+> (`E0275`) or the monomorphizer reports *"reached the recursion limit while instantiating"*. The ranked
+> engine rejects such a cyclic bound up front rather than diverging.
+>
+> What the ranked engine *does* add over structural is re-entry across a **finite set** of
+> instantiations past the recursion floor. The way to make a growing tower finite is to **erase it at
+> the recursion boundary** — pin the stream to one fixed `&mut dyn Trait` layer — after which the cycle
+> works under *both* engines (`tests/dyn_stream_reentry.rs`).
 
 
 ## How the algorithms work?
@@ -190,9 +203,10 @@ mod cycle {
 original trait gets a hidden "Ranked" version that carries an extra type parameter
 representing recursion depth. Implementations are duplicated with that rank parameter, and
 calls are delegated through the ranked trait for the current depth. This breaks the direct
-cycle at the type level. It is the engine that handles **growing-type-argument** recursion —
-a backtracking `Dup<…>`-style stream whose type would otherwise grow one wrapper per descent
-level — so prefer it unless you specifically want zero runtime machinery.
+cycle at the type level. Past the floor it can re-enter through a type-erased fn pointer, which lets
+one cycle serve **several instantiations** of a generic method — so prefer it unless you specifically
+want zero runtime machinery. (It does not make a genuinely *growing* type argument work; nothing can —
+see the note above.)
 
 Smallest example (two mutually recursive traits):
 
@@ -415,9 +429,11 @@ and methods taking an already-erased `&mut dyn Trait` argument. When a *wrapped*
 is stripped (e.g. `Box<Stmt>: Tr`) it also emits a compile-time forwarding assertion
 `for<T: Tr> Box<T>: Tr`.
 
-**Limitations.** The headline: no **growing-type-argument recursion** (a `Dup<…>`-style stream whose
-type grows one wrapper per descent level — the layout cast can't express it; that's what the ranked
-engine's fn-pointer re-entry is for). Return-position `impl Trait` and `async fn` are rejected
+**Limitations.** The headline: the layout cast is monomorphic, so a cycle cannot serve **several
+instantiations** of a generic method — that is what the ranked engine's fn-pointer re-entry is for. (An
+unerased `Dup<…>`-style stream tower is out of reach for both engines; erase it to a fixed
+`&mut dyn Trait` and structural handles it fine — `tests/dyn_stream_reentry.rs`.) Return-position
+`impl Trait` and `async fn` are rejected
 up-front in both engines (declare an associated type, or return a boxed type). See
 [Two algorithms](#two-algorithms) for the full per-engine breakdown of what each side can't do.
 

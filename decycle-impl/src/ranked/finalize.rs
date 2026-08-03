@@ -164,14 +164,25 @@ impl syn::visit_mut::VisitMut for TraitReplacer {
 
 /// Strips the cyclic (`#[decycle]`-trait) bounds from a `Generics`, returning the rest verbatim.
 ///
-/// A bound is the cyclic one being stripped iff its LAST segment actually names a #[decycle] trait —
-/// an unrelated bound (multi-segment `::std::fmt::Debug`, or any single-segment trait not in the
-/// table) must survive untouched. Matching on the last segment (not requiring a single segment) is
-/// deliberate: a side-bound on a non-cyclic type is allowed to reference a #[decycle] trait through a
-/// qualified path to reach the ORIGINAL trait (`Foreign: super::MyTrait`, bypassing ranking on
-/// purpose for a type that isn't part of the cycle) — such a bound is positionally fragile once
-/// copied into the generated impls at different module depths (its `super::`/`crate::` prefix no
-/// longer points at the same place), so it's stripped here exactly like a same-named bare reference.
+/// A bound is *cyclic* — and so must be stripped here, to be re-introduced rank-lowered — when BOTH
+/// hold:
+///
+/// 1. its LAST segment names a `#[decycle]` trait (matching the last segment rather than requiring a
+///    single segment is deliberate: a qualified reference reaches the same trait), and
+/// 2. its **target** is something the ranked chain actually descends through — a cycle self type
+///    (a head that implements a cyclic trait in this module), `Self`, or a bare type parameter of
+///    the impl.
+///
+/// Condition 2 is what keeps an ordinary **leaf** bound alive. `Integer: Spanned<Span = X>` names a
+/// decycle trait but its target has no ranked impl to descend into; it is a premise the *body* needs,
+/// not an edge to contract. Stripping it used to force callers to launder such bounds through a
+/// semantically-empty supertrait alias (`trait SpannedBound: Spanned {}`) purely so the last segment
+/// would differ — a workaround for this function's imprecision, not for anything fundamental.
+///
+/// One exception preserves the original intent: a bound whose trait path is **depth-fragile**
+/// (`super::`/`self::`-rooted) is stripped regardless of its target, because these impls are re-emitted
+/// inside deeper modules where such a prefix no longer denotes the same item. Absolute and
+/// `crate::`-rooted paths are depth-independent and so may safely survive.
 ///
 /// When `keep_bareparam` is set, a cyclic bound whose bounded type is a bare type parameter of the
 /// impl (`impl<T: Cb> …` / `where T: Cb`) is PRESERVED. The FINAL delegating impl retains the real,
@@ -184,31 +195,77 @@ fn remove_cyclic_bounds(
     replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
     keep_bareparam: bool,
 ) -> Generics {
-    let param_idents: std::collections::HashSet<Ident> = if keep_bareparam {
-        generics
-            .params
-            .iter()
-            .filter_map(|p| match p {
-                GenericParam::Type(t) => Some(t.ident.clone()),
-                _ => None,
-            })
-            .collect()
-    } else {
-        std::collections::HashSet::new()
-    };
+    // Needed unconditionally now: a bare-param target counts as a cycle participant either way
+    // (`keep_bareparam` only decides whether such a bound is RETAINED, not whether it is cyclic).
+    let param_idents: std::collections::HashSet<Ident> = generics
+        .params
+        .iter()
+        .filter_map(|p| match p {
+            GenericParam::Type(t) => Some(t.ident.clone()),
+            _ => None,
+        })
+        .collect();
+    let self_heads = cycle_self_heads(replacing_table);
     let mut g = generics.clone();
     replace_constraints(&mut g, |ty, trait_path| {
-        let is_cyclic_bound = trait_path
+        // How the trait is SPELLED decides whether this is a cyclic reference at all — matching the
+        // convention every other matcher here already uses (`TraitReplacer`, `cyclic_where_bounds`,
+        // `impl_has_bare_param_cyclic_bound`, `validate_impl_where_bounds` are all single-segment).
+        // This function used to be the lone exception, keying on the LAST segment, which meant a
+        // deliberately-qualified reference was stripped too — and that is the caller's only way to
+        // say "this is an ordinary leaf premise, not an edge".
+        let mut probe = trait_path.clone();
+        crate::helper::strip_leading_self(&mut probe);
+        let last_names_cyclic = probe
             .segments
             .last()
             .is_some_and(|seg| replacing_table.contains_key(&seg.ident));
-        let is_bareparam = keep_bareparam
-            && matches!(&ty, Type::Path(TypePath { qself: None, path })
-                if path.segments.len() == 1 && param_idents.contains(&path.segments[0].ident));
+        // A `super::`-rooted spelling must still be stripped whatever its target: these impls are
+        // re-emitted at other module depths, where that prefix no longer denotes the same item.
+        let names_cyclic_trait =
+            last_names_cyclic && crate::helper::path_is_depth_fragile(&trait_path);
+        let bare_names_cyclic = last_names_cyclic && probe.segments.len() == 1;
+        let is_bareparam_target = matches!(&ty, Type::Path(TypePath { qself: None, path })
+            if path.segments.len() == 1 && param_idents.contains(&path.segments[0].ident));
+        let is_self_target = matches!(&ty, Type::Path(TypePath { qself: None, path })
+            if path.is_ident("Self"));
+        // Targets the ranked chain can descend: a cycle self type, `Self`, or a bare impl param.
+        //
+        // A bare param must stay here even though it is often just a leaf premise
+        // (`Atom: Spanned`), because the two cases are INDISTINGUISHABLE at this level: decycle sees
+        // only impls, and `impl<T: Cb> Ca for Wrap<T>` (a real cyclic edge through `T`) and
+        // `impl<S, T, A> Parse<A> for Expr<S, T> where T: Parse<A>` (a leaf premise) have the same
+        // shape — bound on a bare param, naming a cyclic trait, on a cycle-self-typed impl. Telling
+        // them apart needs the *field* graph, which decycle deliberately never reads. Excluding bare
+        // params here breaks `bareparam_reentry`/`limitation`; a caller that needs such a leaf bound
+        // to survive must still route it through a non-cyclic supertrait alias.
+        let target_is_participant = is_self_target
+            || is_bareparam_target
+            || crate::helper::type_head_ident(&ty).is_some_and(|h| self_heads.contains(&h));
+        // Cyclic iff: a depth-fragile spelling (always), or a BARE spelling whose target the ranked
+        // chain can actually descend. A crate-rooted or absolute path is never cyclic — that is the
+        // opt-out, and it is what lets a leaf premise on a bare type parameter survive, which no
+        // target inspection can decide (`impl<T: Cb> Ca for Wrap<T>` and a leaf `T: Parse<A>` are
+        // indistinguishable from the impls alone).
+        let is_cyclic_bound = names_cyclic_trait || (bare_names_cyclic && target_is_participant);
+        let is_bareparam = keep_bareparam && is_bareparam_target;
         // keep iff not a cyclic bound, OR it is a bare-param cyclic bound we deliberately retain
         (!is_cyclic_bound || is_bareparam).then_some((ty, trait_path))
     });
     g
+}
+
+/// The head idents of every type that IMPLEMENTS a cyclic trait in this module — the set of targets
+/// a rank-lowered bound can actually descend into. Derived from `replacing_table` (which already
+/// holds each cyclic trait's impls), so no extra plumbing from `process_module` is needed.
+fn cycle_self_heads(
+    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+) -> std::collections::HashSet<Ident> {
+    replacing_table
+        .values()
+        .flat_map(|(_, _, impls)| impls.iter())
+        .filter_map(|im| crate::helper::type_head_ident(&im.self_ty))
+        .collect()
 }
 
 /// Replaces every bare `Self` type (not `Self::Assoc` — no qualifying trait path is known at

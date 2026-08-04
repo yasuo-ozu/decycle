@@ -203,3 +203,113 @@ fn an_empty_graph_disables_structural_unrolling() {
     );
     assert!(full.contains("Term"), "sanity: the derived run does generate one");
 }
+/// The qualified spelling is the "not an edge" opt-out, and that cuts both ways: a module whose
+/// bounds are *all* qualified has no participants at all.
+///
+/// This is the state a caller like syan's `#[recurse]` is in before it rewrites spellings — the
+/// derive emits every bound fully qualified. So `analyze_module` cannot be used to *discover* a
+/// caller's cycles: it reads a classification that the caller has already expressed. A caller that
+/// wants to state its own set passes it to `process_module_with_graph` instead.
+#[test]
+fn a_fully_qualified_module_has_no_participants() {
+    let m: syn::ItemMod = parse_quote! {
+        mod ast {
+            #[decycle]
+            use ::syan::decycle_traits::Parse;
+            pub enum Expr<S> { Lit, Nest(Box<Stmt<S>>) }
+            pub enum Stmt<S> { E(Box<Expr<S>>) }
+            impl<S, A> ::syan::parse::parse::Parse<A> for Expr<S>
+            where Box<Stmt<S>>: ::syan::parse::parse::Parse<A> {}
+            impl<S, A> ::syan::parse::parse::Parse<A> for Stmt<S>
+            where Box<Expr<S>>: ::syan::parse::parse::Parse<A> {}
+        }
+    };
+    assert!(
+        nodes(&m).is_empty(),
+        "a qualified impl is deliberately not adopted, so it cannot make its self type a participant"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Graph utilities: cycle detection and node extension
+// ---------------------------------------------------------------------------------------------
+
+use decycle_impl::analysis::{cyclic_subgraph, with_nodes};
+
+/// Build a graph the way a caller supplying its own reference relation would.
+fn build(ns: &[&str], es: &[(&str, &str, EdgeKind)]) -> decycle_impl::safegraph::VecGraph<syn::Ident, EdgeKind> {
+    let m: syn::ItemMod = parse_quote!(mod empty {});
+    let base = analyze_module(&m, &parse_quote!(::decycle));
+    let g = with_nodes(
+        &base,
+        ns.iter()
+            .map(|n| syn::Ident::new(n, proc_macro2::Span::call_site())),
+    );
+    // `with_nodes` cannot add edges, so go through a module that states them instead when needed.
+    assert!(es.is_empty() || !ns.is_empty());
+    g
+}
+
+fn sorted_nodes(g: &decycle_impl::safegraph::VecGraph<syn::Ident, EdgeKind>) -> Vec<String> {
+    let mut v: Vec<String> = g.nodes().map(|n| n.to_string()).collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn with_nodes_adds_without_duplicating() {
+    let g = build(&["A", "B", "A"], &[]);
+    assert_eq!(sorted_nodes(&g), vec!["A", "B"]);
+}
+
+#[test]
+fn cyclic_subgraph_keeps_only_recursive_nodes() {
+    // Expr <-> Stmt is a real cycle; Leaf is pointed at by Expr but points nowhere.
+    let m: syn::ItemMod = parse_quote! {
+        mod ast {
+            #[decycle] pub trait Tr { fn f(&self); }
+            pub enum Expr { A } pub enum Stmt { B } pub enum Leaf { C }
+            impl Tr for Expr where Box<Stmt>: Tr, Leaf: Tr { fn f(&self) {} }
+            impl Tr for Stmt where Expr: Tr { fn f(&self) {} }
+            impl Tr for Leaf { fn f(&self) {} }
+        }
+    };
+    let full = analyze_module(&m, &parse_quote!(::decycle));
+    assert_eq!(sorted_nodes(&full), vec!["Expr", "Leaf", "Stmt"]);
+
+    let cyc = cyclic_subgraph(&full);
+    assert_eq!(
+        sorted_nodes(&cyc),
+        vec!["Expr", "Stmt"],
+        "Leaf is referenced but not recursive"
+    );
+    // The Expr -> Leaf edge goes with it; Expr <-> Stmt survives.
+    assert_eq!(cyc.len_edge(), 2);
+}
+
+#[test]
+fn a_self_edge_is_a_cycle_of_one() {
+    let m: syn::ItemMod = parse_quote! {
+        mod ast {
+            #[decycle] pub trait Tr { fn f(&self); }
+            pub enum Expr { A }
+            impl Tr for Expr where Box<Expr>: Tr { fn f(&self) {} }
+        }
+    };
+    let cyc = cyclic_subgraph(&analyze_module(&m, &parse_quote!(::decycle)));
+    assert_eq!(sorted_nodes(&cyc), vec!["Expr"]);
+}
+
+#[test]
+fn a_lone_referenced_node_is_not_a_cycle() {
+    let m: syn::ItemMod = parse_quote! {
+        mod ast {
+            #[decycle] pub trait Tr { fn f(&self); }
+            pub enum A { X } pub enum B { Y }
+            impl Tr for A where B: Tr { fn f(&self) {} }   // A -> B, no way back
+            impl Tr for B { fn f(&self) {} }
+        }
+    };
+    let cyc = cyclic_subgraph(&analyze_module(&m, &parse_quote!(::decycle)));
+    assert!(sorted_nodes(&cyc).is_empty(), "a DAG has no cyclic nodes");
+}

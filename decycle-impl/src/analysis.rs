@@ -253,3 +253,113 @@ fn nested_participants(ty: &Type, participants: &HashSet<Ident>) -> Vec<Ident> {
     v.visit_type(ty);
     v.out
 }
+
+/// Read a graph back out as `(node names, (from, to, kind) edges)`, both in insertion order.
+///
+/// Indices of a `Vec`-backed graph only exist inside a scope, so anything that inspects one has to
+/// do it here and hand out owned data.
+fn decompose(
+    graph: &VecGraph<Ident, EdgeKind>,
+) -> (Vec<Ident>, Vec<(String, String, EdgeKind)>) {
+    graph.scope(|ctx| {
+        let nodes: Vec<Ident> = ctx.node_indices().map(|n| ctx.node(n).clone()).collect();
+        let edges = ctx
+            .edge_indices()
+            .map(|e| {
+                let [a, b] = ctx.endpoints(e);
+                (
+                    ctx.node(a).to_string(),
+                    ctx.node(b).to_string(),
+                    *ctx.edge(e),
+                )
+            })
+            .collect();
+        (nodes, edges)
+    })
+}
+
+/// Assemble a graph from node names and `(from, to, kind)` edges. Edges naming an absent node are
+/// dropped; nodes are inserted in the order given.
+fn compose(nodes: Vec<Ident>, edges: Vec<(String, String, EdgeKind)>) -> VecGraph<Ident, EdgeKind> {
+    let mut out = VecGraph::default();
+    out.scope_mut(|mut ctx| {
+        let index: HashMap<String, _> = nodes
+            .into_iter()
+            .map(|n| {
+                let key = n.to_string();
+                let ix = ctx
+                    .insert_node(n)
+                    .expect("insertion into a fresh VecGraph cannot fail");
+                (key, ix)
+            })
+            .collect();
+        for (from, to, kind) in edges {
+            if let (Some(a), Some(b)) = (index.get(&from), index.get(&to)) {
+                ctx.insert_edge(kind, [*a, *b])
+                    .expect("both endpoints exist");
+            }
+        }
+    });
+    out
+}
+
+/// Restrict `graph` to the nodes that actually **lie on a cycle**, keeping the edges between them.
+///
+/// A node is retained when it belongs to a strongly connected component of more than one node, or
+/// when it has a self-edge. A lone node with no self-edge is not recursive, however many other nodes
+/// point at it.
+///
+/// This is the counterpart to building a graph from a reference relation: a caller can hand over
+/// *everything* it knows — every type and every reference between them — and let this decide which of
+/// them recurse, rather than implementing a reachability search of its own. The result is in the
+/// shape [`crate::ranked::process_module_with_graph`] wants.
+pub fn cyclic_subgraph(graph: &VecGraph<Ident, EdgeKind>) -> VecGraph<Ident, EdgeKind> {
+    let (nodes, edges) = decompose(graph);
+    let self_looped: HashSet<String> = edges
+        .iter()
+        .filter(|(a, b, _)| a == b)
+        .map(|(a, _, _)| a.clone())
+        .collect();
+
+    let cyclic: HashSet<String> = graph.scope(|ctx| {
+        let mut out = HashSet::new();
+        for component in crate::safegraph::algo::connectivity::tarjan_scc(ctx) {
+            let names: Vec<String> = component
+                .iter()
+                .map(|ix| ctx.node(*ix).to_string())
+                .collect();
+            if names.len() > 1 || names.iter().any(|n| self_looped.contains(n)) {
+                out.extend(names);
+            }
+        }
+        out
+    });
+
+    let nodes = nodes
+        .into_iter()
+        .filter(|n| cyclic.contains(&n.to_string()))
+        .collect();
+    let edges = edges
+        .into_iter()
+        .filter(|(a, b, _)| cyclic.contains(a) && cyclic.contains(b))
+        .collect();
+    compose(nodes, edges)
+}
+
+/// `graph` plus `extra` nodes, edges unchanged.
+///
+/// For a caller that discovers further participants only after the graph is built — a macro that
+/// generates a helper type belonging to the cycle, say. Names already present are not duplicated.
+pub fn with_nodes(
+    graph: &VecGraph<Ident, EdgeKind>,
+    extra: impl IntoIterator<Item = Ident>,
+) -> VecGraph<Ident, EdgeKind> {
+    let (mut nodes, edges) = decompose(graph);
+    let mut have: HashSet<String> = nodes.iter().map(|n| n.to_string()).collect();
+    for name in extra {
+        if have.insert(name.to_string()) {
+            nodes.push(name);
+        }
+    }
+    compose(nodes, edges)
+}

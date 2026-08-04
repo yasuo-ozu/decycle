@@ -282,98 +282,6 @@ fn validate_impl_where_bounds(
 /// recognise `#[<crate>::decycle]` on inner items). `recurse_level` sets the compile-time expansion
 /// depth; `support_infinite_cycle` toggles the runtime re-entry registry (unbounded depth) versus a
 /// fixed-depth floor. For macro authors wrapping `#[decycle]`; most users should use the attribute.
-/// Reject a **by-value** cycle among the module's own types before anything is generated.
-///
-/// rustc catches an infinite-size type on its own (`E0072`), and the definitions here pass through
-/// verbatim, so that error arrives either way. What it does *not* do is stop the generated ranked
-/// impls from being type-checked against the broken type, which adds a pair of unhelpful
-/// `reached the recursion limit finding the struct tail for ...` errors. Aborting first replaces those
-/// with one message that names the offending field and the fix.
-///
-/// Scope is deliberately narrow: only types that implement a cyclic trait here, and only edges where
-/// one is stored **inline** in the other. `Box<T>` / `Vec<T>` / `Option<Box<T>>` are indirections and
-/// are not edges — those cycles are exactly the well-formed ones decycle exists to serve.
-fn check_by_value_type_cycle(contents: &[Item], cycle_self_heads: &HashSet<Ident>) {
-    // ident -> (span-bearing field type, referenced ident) for by-value references only.
-    let mut edges: Vec<(Ident, Ident, Type)> = Vec::new();
-    let mut fields_of = |name: &Ident, fields: &Fields| {
-        for f in fields.iter() {
-            // A field stores its head type inline; generic ARGUMENTS sit behind that head, so no
-            // descent — `Box<NodeB>` has head `Box` and is not a by-value reference to `NodeB`.
-            let Type::Path(TypePath { qself: None, path }) = &f.ty else {
-                continue;
-            };
-            let Some(seg) = path.segments.last() else {
-                continue;
-            };
-            if cycle_self_heads.contains(&seg.ident) {
-                edges.push((name.clone(), seg.ident.clone(), f.ty.clone()));
-            }
-        }
-    };
-    for item in contents {
-        match item {
-            Item::Struct(st) if cycle_self_heads.contains(&st.ident) => {
-                fields_of(&st.ident, &st.fields)
-            }
-            Item::Enum(en) if cycle_self_heads.contains(&en.ident) => {
-                for v in &en.variants {
-                    fields_of(&en.ident, &v.fields);
-                }
-            }
-            _ => (),
-        }
-    }
-    if edges.is_empty() {
-        return;
-    }
-    // Any cycle in this subgraph is an infinite-size type. Walk from each node; a node reachable
-    // from itself closes one.
-    let reaches = |start: &Ident| -> bool {
-        let mut seen: HashSet<Ident> = HashSet::new();
-        let mut stack: Vec<Ident> = edges
-            .iter()
-            .filter(|(f, _, _)| f == start)
-            .map(|(_, t, _)| t.clone())
-            .collect();
-        while let Some(n) = stack.pop() {
-            if &n == start {
-                return true;
-            }
-            if !seen.insert(n.clone()) {
-                continue;
-            }
-            stack.extend(
-                edges
-                    .iter()
-                    .filter(|(f, _, _)| f == &n)
-                    .map(|(_, t, _)| t.clone()),
-            );
-        }
-        false
-    };
-    for (from, _to, ty) in &edges {
-        if reaches(from) {
-            // NON-fatal: `abort!` would fall back to the un-decycled dummy, leaving the trait cycle
-            // unbroken and adding a pair of E0275s on top of the type error. Emitting and continuing
-            // keeps decycle's normal output and just prepends one actionable line.
-            emit_error!(
-                ty,
-                "decycle: `{}` stores `{}` by value, and following such fields leads back to `{}` — \
-                 the type is infinite-size (rustc reports this as E0072)",
-                from,
-                quote!(#ty).to_string().replace(' ', ""),
-                from;
-                help = "put an indirection on one field of the cycle, e.g. `Box<{}>`, `Vec<{}>` or \
-                        `Option<Box<{}>>`",
-                quote!(#ty).to_string().replace(' ', ""),
-                quote!(#ty).to_string().replace(' ', ""),
-                quote!(#ty).to_string().replace(' ', "")
-            );
-        }
-    }
-}
-
 pub fn process_module(
     mut module: ItemMod,
     decycle: &Path,
@@ -520,7 +428,6 @@ pub fn process_module(
                 .flatten()
         })
         .collect();
-    check_by_value_type_cycle(contents, &cycle_self_heads);
     for item in contents.iter() {
         if let Item::Impl(item_impl) = item {
             validate_impl_where_bounds(item_impl, &all_traits, &cycle_self_heads);

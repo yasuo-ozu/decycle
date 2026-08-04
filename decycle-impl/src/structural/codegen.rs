@@ -496,6 +496,126 @@ fn nat_method(
     }
 }
 
+/// See through `(T)` and the invisible groups a macro-expanded type can be wrapped in, so the
+/// trait-object checks below match on the real shape.
+fn strip_group(ty: &Type) -> &Type {
+    match ty {
+        Type::Group(g) => strip_group(&g.elem),
+        Type::Paren(p) => strip_group(&p.elem),
+        other => other,
+    }
+}
+
+/// Re-wrap a `&dyn Fn(..)`-shaped argument that mentions `Self` into `target`-space.
+///
+/// The type-punning cast is unsound for trait objects: `dyn Fn(&A) -> R` and `dyn Fn(&ATerm) -> R`
+/// are *different traits*, so `transmute`-ing the wide pointer leaves it carrying a vtable that
+/// names the wrong one (miri: "wrong trait in wide pointer vtable"). Both are pointer-pair sized,
+/// so `__DecycleSizeGuard` cannot see it.
+///
+/// Instead of punning, build a fresh closure whose parameters are already in `target`-space and
+/// which casts each argument back before calling the user's object. `&closure` then coerces to
+/// `&dyn Fn(..)` the ordinary way, so the vtable is produced by the compiler rather than forged.
+/// The closure is a temporary living to the end of the forwarding call, so this costs no
+/// allocation.
+///
+/// Returns `Ok(None)` when `ty` is not a trait object at all (the caller's plain cast is correct
+/// for those — a bare `fn(&Self)` pointer is ABI-compatible and stays punned). Shapes that are
+/// trait objects but cannot be rebuilt this way are rejected rather than silently punned.
+fn dyn_fn_adapter(
+    ty: &Type,
+    target: &Type,
+    id: &syn::Ident,
+    nonce: u64,
+) -> syn::Result<Option<TokenStream>> {
+    // Only `&dyn ..` is in scope here; `Box<dyn ..>`/`&mut dyn ..` fall through to the reject
+    // below via `mentions_self` on their inner object.
+    let Type::Reference(r) = ty else {
+        return match strip_group(ty) {
+            Type::TraitObject(_) => Err(syn::Error::new(
+                ty.span(),
+                "#[decycle(structural)]: a by-value or boxed trait object mentioning `Self` \
+                 cannot be forwarded soundly (its vtable names a different trait once `Self` is \
+                 substituted). Take it by shared reference (`&dyn Fn(&Self) -> _`), or use a \
+                 generic parameter instead of a trait object.",
+            )),
+            _ => Ok(None),
+        };
+    };
+    let Type::TraitObject(to) = strip_group(&r.elem) else {
+        return Ok(None);
+    };
+    if r.mutability.is_some() {
+        return Err(syn::Error::new(
+            ty.span(),
+            "#[decycle(structural)]: `&mut dyn ..` mentioning `Self` cannot be forwarded soundly \
+             (its vtable names a different trait once `Self` is substituted). Take it by shared \
+             reference (`&dyn Fn(&Self) -> _`), or use a generic parameter instead.",
+        ));
+    }
+    // Exactly one trait bound, spelled with `Fn(..)` sugar. Extra trait bounds (`+ Send`) are
+    // refused because the rebuilt closure would have to prove them itself.
+    let mut fn_bound = None;
+    for b in &to.bounds {
+        match b {
+            syn::TypeParamBound::Lifetime(_) => {}
+            syn::TypeParamBound::Trait(tb) => {
+                if fn_bound.is_some() {
+                    fn_bound = None;
+                    break;
+                }
+                fn_bound = Some(tb);
+            }
+            _ => {
+                fn_bound = None;
+                break;
+            }
+        }
+    }
+    let sugar = fn_bound.and_then(|tb| {
+        let seg = tb.path.segments.last()?;
+        match (&seg.arguments, seg.ident.to_string().as_str()) {
+            (PathArguments::Parenthesized(pa), "Fn") => Some(pa),
+            _ => None,
+        }
+    });
+    let Some(pa) = sugar else {
+        return Err(syn::Error::new(
+            ty.span(),
+            "#[decycle(structural)]: only `&dyn Fn(..)` trait objects mentioning `Self` can be \
+             forwarded. `FnMut`/`FnOnce`, additional bounds such as `+ Send`, and user traits \
+             mentioning `Self` would need a vtable for a trait that does not exist after `Self` \
+             is substituted. Use a generic parameter (`F: FnMut(&Self)`) instead.",
+        ));
+    };
+
+    let cast = cast_ident(nonce);
+    let mut params = Vec::new();
+    let mut args = Vec::new();
+    for (i, src_ty) in pa.inputs.iter().enumerate() {
+        let p = syn::Ident::new(&format!("__dcl_adapt_{i}_{nonce:x}"), Span::call_site());
+        let dst_ty = subst_self(src_ty, target);
+        // The adapter is declared in target-space and casts each argument back before handing it
+        // to the user's closure, which still expects natural-space types.
+        if mentions_self(src_ty) {
+            args.push(quote! { unsafe { #cast::<#dst_ty, #src_ty>(#p) } });
+        } else {
+            args.push(quote! { #p });
+        }
+        params.push(quote! { #p: #dst_ty });
+    }
+    let call = quote! { #id(#(#args),*) };
+    // A `Self`-mentioning return travels the other way: natural-space result out to target-space.
+    let body = match &pa.output {
+        syn::ReturnType::Type(_, rt) if mentions_self(rt) => {
+            let dst_rt = subst_self(rt, target);
+            quote! { unsafe { #cast::<#rt, #dst_rt>(#call) } }
+        }
+        _ => call,
+    };
+    Ok(Some(quote! { &move |#(#params),*| #body }))
+}
+
 /// Forward the non-receiver parameters (receiver handled separately). An argument whose type mentions
 /// `Self` (e.g. `other: &Self` in `PartialEq::eq`) is cast into `target`-space, exactly like the
 /// receiver; others pass through by ident.
@@ -515,6 +635,14 @@ fn forward_args(sig: &syn::Signature, target: &Type, nonce: u64) -> syn::Result<
             };
             let ty = &pt.ty;
             if mentions_self(ty) {
+                // A trait object may NOT be punned: `dyn Fn(&A)` and `dyn Fn(&ATerm)` are
+                // different traits, so transmuting the wide pointer keeps a vtable naming the
+                // wrong one. They are the same size, so the size guard cannot catch it. Rebuild
+                // the object by coercion instead — see `dyn_fn_adapter`.
+                if let Some(adapter) = dyn_fn_adapter(ty, target, id, nonce)? {
+                    out.push(adapter);
+                    continue;
+                }
                 let dst = subst_self(ty, target);
                 out.push(quote! { unsafe { #cast::<#ty, #dst>(#id) } });
             } else {

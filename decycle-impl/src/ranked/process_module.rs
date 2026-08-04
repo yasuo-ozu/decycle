@@ -118,7 +118,7 @@ fn collect_trait_renames(item: &Item) -> Vec<(Ident, Ident)> {
     out
 }
 
-fn is_local_impl_bound_target(ty: &Type, impl_type_params: &HashSet<Ident>) -> bool {
+pub(crate) fn is_local_impl_bound_target(ty: &Type, impl_type_params: &HashSet<Ident>) -> bool {
     let Type::Path(TypePath { qself: None, path }) = ty else {
         return false;
     };
@@ -283,7 +283,57 @@ fn validate_impl_where_bounds(
 /// depth; `support_infinite_cycle` toggles the runtime re-entry registry (unbounded depth) versus a
 /// fixed-depth floor. For macro authors wrapping `#[decycle]`; most users should use the attribute.
 pub fn process_module(
+    module: ItemMod,
+    decycle: &Path,
+    recurse_level: usize,
+    support_infinite_cycle: bool,
+) -> TokenStream {
+    process_module_inner(module, None, decycle, recurse_level, support_infinite_cycle)
+}
+
+/// [`process_module`], but with the participant set supplied by the caller instead of derived.
+///
+/// `graph` is an obligation graph in the shape [`crate::analysis::analyze_module`] returns. Its
+/// **node set replaces** the engine's own `cycle_self_heads` — the types it would otherwise take to
+/// be cycle participants, namely every head with a bare-spelled impl of a routed trait. Everything
+/// downstream keys off that set: which impls get contracted, which where-bounds count as cycle edges,
+/// which wrapped bounds are peeled and which are rejected, and which local names need aliasing
+/// against the helper-module nesting.
+///
+/// Passing `analyze_module(&module, decycle)` reproduces [`process_module`] exactly. Passing a subset
+/// narrows the cycle: the omitted types keep verbatim impls, and a bound naming one becomes an
+/// ordinary premise rather than an edge. That is the useful direction — a caller that already knows
+/// its cycles (from field structure, say) can state them instead of relying on the bare/qualified
+/// trait spelling to signal them.
+///
+/// The **edges are not consumed**. Direct-vs-`Peeled` is re-derived per bound from the node set,
+/// because a bound has to be matched by its own syntax, and a graph keyed on type idents cannot say
+/// *which* bound of *which* impl an edge came from. They are still worth passing — they are what the
+/// caller inspects to decide on the node set — but adding or removing one changes nothing here.
+///
+/// A node naming a type with no routed impl in this module is ignored rather than rejected: the
+/// engine only ever asks whether a given head is in the set.
+pub fn process_module_with_graph(
+    module: ItemMod,
+    graph: &crate::safegraph::VecGraph<Ident, crate::analysis::EdgeKind>,
+    decycle: &Path,
+    recurse_level: usize,
+    support_infinite_cycle: bool,
+) -> TokenStream {
+    use crate::safegraph::graph::Graph;
+    let heads: HashSet<Ident> = graph.nodes().cloned().collect();
+    process_module_inner(
+        module,
+        Some(heads),
+        decycle,
+        recurse_level,
+        support_infinite_cycle,
+    )
+}
+
+fn process_module_inner(
     mut module: ItemMod,
+    head_override: Option<HashSet<Ident>>,
     decycle: &Path,
     recurse_level: usize,
     support_infinite_cycle: bool,
@@ -416,18 +466,38 @@ pub fn process_module(
     // Head idents of the types that IMPLEMENT a cyclic trait here — the only heads a bare cyclic
     // where-bound may target (besides `Self` / an impl type-param). A bound whose head is a foreign
     // container (`Box<Stmt>: Tr`) has no ranked impl to descend through, so it's flagged below.
-    let cycle_self_heads: HashSet<Ident> = contents
-        .iter()
-        .filter_map(|item| {
-            let Item::Impl(im) = item else { return None };
-            let (_, trait_path, _) = im.trait_.as_ref()?;
-            let mut tp = trait_path.clone();
-            crate::helper::strip_leading_self(&mut tp);
-            (tp.segments.len() == 1 && all_traits.contains(&tp.segments[0].ident))
-                .then(|| type_head_ident(&im.self_ty))
-                .flatten()
-        })
-        .collect();
+    let cycle_self_heads: HashSet<Ident> = head_override.unwrap_or_else(|| {
+        contents
+            .iter()
+            .filter_map(|item| {
+                let Item::Impl(im) = item else { return None };
+                let (_, trait_path, _) = im.trait_.as_ref()?;
+                let mut tp = trait_path.clone();
+                crate::helper::strip_leading_self(&mut tp);
+                (tp.segments.len() == 1 && all_traits.contains(&tp.segments[0].ident))
+                    .then(|| type_head_ident(&im.self_ty))
+                    .flatten()
+            })
+            .collect()
+    });
+    // Peel wrapped cyclic bounds (`Vec<Box<Stmt>>: Tr` ⇒ `Stmt: Tr`) BEFORE validating, so the
+    // validation below only rejects heads that genuinely cannot be made rankable.
+    for item in contents.iter_mut() {
+        if let Item::Impl(im) = item {
+            let impl_type_params: HashSet<Ident> = im
+                .generics
+                .params
+                .iter()
+                .filter_map(|param| match param {
+                    GenericParam::Type(ty) => Some(ty.ident.clone()),
+                    _ => None,
+                })
+                .collect();
+            crate::ranked::peel::peel_cyclic_bounds(im, &all_traits, &cycle_self_heads, &|ty| {
+                is_local_impl_bound_target(ty, &impl_type_params)
+            });
+        }
+    }
     for item in contents.iter() {
         if let Item::Impl(item_impl) = item {
             validate_impl_where_bounds(item_impl, &all_traits, &cycle_self_heads);
@@ -473,6 +543,47 @@ pub fn process_module(
                 (raw_contents, contents)
             },
         );
+    // Neutralise the hazards our own nesting creates (glob ambiguity, shifted relative paths)
+    // before `finalize` re-emits these impls two modules deep — see `crate::nesting`.
+    let mut contents = contents;
+    // Every impl of one cyclic trait forms a group whose members must be able to prove each other's
+    // leaf premises — see `crate::ranked::sharing`.
+    for trait_ident in &all_traits {
+        let mut group: Vec<&mut ItemImpl> = contents
+            .iter_mut()
+            .filter(|im| {
+                im.trait_.as_ref().is_some_and(|(_, path, _)| {
+                    path.segments.last().is_some_and(|s| s.ident == *trait_ident)
+                })
+            })
+            .collect();
+        if group.len() > 1 {
+            crate::ranked::sharing::share_side_predicates(&mut group, trait_ident);
+        }
+    }
+
+    // Restricted to types this module DEFINES: a foreign self type (`impl Tr for &str`) is reachable
+    // by one path only, so it is neither ambiguous nor bindable as `use self::…`.
+    let local_types: HashSet<Ident> = raw_contents
+        .iter()
+        .filter_map(|item| match item {
+            Item::Struct(it) => Some(it.ident.clone()),
+            Item::Enum(it) => Some(it.ident.clone()),
+            Item::Union(it) => Some(it.ident.clone()),
+            Item::Type(it) => Some(it.ident.clone()),
+            _ => None,
+        })
+        .collect();
+    let local_cycle_heads: HashSet<Ident> =
+        cycle_self_heads.intersection(&local_types).cloned().collect();
+    let alias_items =
+        crate::ranked::nesting::defuse_nesting(
+        &mut contents,
+        &local_cycle_heads,
+        &all_traits,
+        &module.ident,
+    );
+
     let first_path = working_list.first().cloned();
     let mut args = crate::finalize::FinalizeArgs {
         working_list,
@@ -492,6 +603,8 @@ pub fn process_module(
     quote! {
         #(for attr in &module.attrs) { #attr }
         #{&module.vis} #{&module.unsafety} #{&module.mod_token} #{&module.ident} {
+
+            #(for alias_item in &alias_items) { #alias_item }
 
             #(for raw_content in raw_contents) { #raw_content }
 

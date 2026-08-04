@@ -3,6 +3,9 @@ use std::collections::HashMap;
 use syn::visit_mut::VisitMut;
 use syn::*;
 
+// ===== Shared, code-free analysis =====
+pub mod analysis;
+
 // ===== Ranked engine (default) =====
 pub mod ranked;
 // Root re-exports kept for `decycle-macro` and the internal `crate::finalize` / `crate::helper`
@@ -30,6 +33,7 @@ pub(crate) const NO_DECYCLE_TRAITS_MSG: &str =
     "cannot detect traits nor `use` statement annotated with #[decycle]";
 
 pub use proc_macro_error;
+pub use safegraph;
 pub use type_leak;
 
 #[derive(Clone)]

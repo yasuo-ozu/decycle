@@ -39,9 +39,17 @@ struct Graph {
 impl Model {
     /// Every cyclic SCC over the `#[decycle]`-annotated traits (`allowed_traits`, keyed by
     /// last-segment ident). Impls of other traits are left untouched.
-    pub fn cyclic_sccs(&self, allowed_traits: &HashSet<String>) -> Vec<Scc> {
+    ///
+    /// `allowed_types`, when given, additionally restricts participation to those self-type idents —
+    /// see `process_module_with_graph`. It can only narrow: a pair is a node when its trait is
+    /// annotated *and* its self type is listed.
+    pub fn cyclic_sccs(
+        &self,
+        allowed_traits: &HashSet<String>,
+        allowed_types: Option<&HashSet<String>>,
+    ) -> Vec<Scc> {
         let adt_names: HashSet<String> = self.adts.keys().cloned().collect();
-        let graph = self.build_graph(allowed_traits, &adt_names);
+        let graph = self.build_graph(allowed_traits, allowed_types, &adt_names);
         let mut out = Vec::new();
         for comp in graph.sccs() {
             if !graph.is_cyclic_component(&comp) {
@@ -52,18 +60,29 @@ impl Model {
         out
     }
 
-    fn build_graph(&self, allowed: &HashSet<String>, adt_names: &HashSet<String>) -> Graph {
+    fn build_graph(
+        &self,
+        allowed: &HashSet<String>,
+        allowed_types: Option<&HashSet<String>>,
+        adt_names: &HashSet<String>,
+    ) -> Graph {
+        let participates = |im: &crate::structural::collect::ImplBlock| {
+            allowed.contains(&im.trait_key)
+                // `map_or(true, …)`, not `is_none_or`: the latter is stable only since 1.82 and this
+                // crate's MSRV is 1.71.
+                && allowed_types.map_or(true, |t| t.contains(&im.self_ident.to_string()))
+        };
         let mut adj: BTreeMap<Pair, BTreeSet<Pair>> = BTreeMap::new();
         // node: (self type, trait) for every impl of an allowed trait
         for im in &self.impls {
-            if allowed.contains(&im.trait_key) {
+            if participates(im) {
                 adj.entry((im.self_ident.to_string(), im.trait_key.clone()))
                     .or_default();
             }
         }
         // edge: `impl Tr for A where <ref B>: TrB`  =>  (A, Tr) -> (B, TrB), when (B, TrB) is a node.
         for im in &self.impls {
-            if !allowed.contains(&im.trait_key) {
+            if !participates(im) {
                 continue;
             }
             let src: Pair = (im.self_ident.to_string(), im.trait_key.clone());

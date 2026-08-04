@@ -19,6 +19,9 @@ proc-macro-error = { version = "1.0", default-features = false }
 # type-leak 0.7 (safegraph-backed, MSRV 1.56) replaces 0.6 (gotgraph-backed, empirical
 # MSRV 1.87) — well below the 1.71 `syn` floor, so it is a non-optional dependency.
 type-leak = "0.7.0"
+# Re-exported as `decycle_impl::safegraph`: `analysis::analyze_module` returns a `VecGraph`, so
+# callers must be able to name the type without depending on it themselves.
+safegraph = "0.1.0"
 template-quote = "0.4.0"
 # Used only by the `structural` unroll (the ranked engine uses `template-quote`).
 quote = "1.0"

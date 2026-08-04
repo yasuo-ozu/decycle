@@ -1,0 +1,255 @@
+//! Read-only inspection of a `#[decycle]` module's **obligation graph**.
+//!
+//! Both engines work out the same thing before they generate anything: which of the module's types
+//! participate in a cyclic trait obligation, and which other participant each of their where-bounds
+//! reaches. That analysis is useful on its own — for diagnostics, for tooling, or for a caller that
+//! wants to decide something before invoking an engine — so it is exposed here as a plain function
+//! that generates no code and mutates nothing.
+//!
+//! The graph is over **type idents**, not over the module's fields: an edge exists because an `impl`
+//! *stated* a cyclic where-bound, not because one type happens to contain another. A type with no
+//! impl of a routed trait is not a node at all, even if a participant stores it.
+//!
+//! # Example
+//!
+//! ```ignore
+//! use decycle_impl::analysis::{analyze_module, EdgeKind};
+//! use decycle_impl::safegraph::graph::Graph;
+//!
+//! // mod ast {
+//! //     #[decycle] pub trait Tr { fn f(&self); }
+//! //     pub enum Expr { … }   impl Tr for Expr where Vec<Box<Stmt>>: Tr { … }
+//! //     pub enum Stmt { … }   impl Tr for Stmt where Expr: Tr          { … }
+//! // }
+//! let g = analyze_module(&module, &parse_quote!(::decycle));
+//! // nodes: Expr, Stmt
+//! // edges: Expr -Peeled-> Stmt   (the bound was written on `Vec<Box<Stmt>>`)
+//! //        Stmt -Direct-> Expr   (the bound named `Expr` itself)
+//! ```
+
+use crate::helper::{strip_leading_self, type_head_ident};
+use crate::safegraph::graph::Graph;
+use crate::safegraph::VecGraph;
+use proc_macro2::{Ident, Span};
+use std::collections::{HashMap, HashSet};
+use syn::visit::Visit;
+use syn::{Item, ItemImpl, ItemMod, Path, TraitBound, Type, TypeParamBound, UseTree, WherePredicate};
+
+/// How a cyclic where-bound names the participant it reaches.
+///
+/// The distinction is the ranked engine's: a bound can only be rank-lowered when its target's *head*
+/// is a participant, so a wrapped bound has to be peeled to one first (see [`crate::ranked::peel`]).
+/// The structural engine draws the same line for a different reason — it *strips* cyclic bounds, and
+/// stripping a wrapped one is only sound if the container forwards the trait, so it emits a
+/// forwarding assertion in exactly the [`EdgeKind::Peeled`] case.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum EdgeKind {
+    /// The bound names the participant directly: `Stmt: Tr` — its head *is* the target.
+    Direct,
+    /// The bound names a type that *contains* the participant: `Vec<Box<Stmt>>: Tr`. The head
+    /// (`Vec`) is not itself a participant, so reaching `Stmt` means looking inside the arguments.
+    Peeled,
+}
+
+/// Build the obligation graph of `module`.
+///
+/// Nodes are the head idents of types with an `impl` of a routed trait — the same set the engines
+/// call `cycle_self_heads`. Edges go **from** the type carrying the bound **to** the participant the
+/// bound reaches, labelled by how it was reached.
+///
+/// `decycle` is the path the caller passes to an engine (e.g. `::my_crate::__decycle`); only its
+/// first segment is used, to recognise `#[<crate>::decycle]` alongside the bare `#[decycle]`.
+///
+/// Not represented, deliberately:
+/// - bounds whose target is `Self` or one of the impl's own type parameters — those name no other
+///   participant, so there is no second endpoint to draw an edge to;
+/// - the trait each edge came from. Two impls of different routed traits relating the same pair the
+///   same way yield **one** edge, since the question this graph answers is about types.
+pub fn analyze_module(module: &ItemMod, decycle: &Path) -> VecGraph<Ident, EdgeKind> {
+    let mut graph = VecGraph::default();
+    let Some((_, items)) = module.content.as_ref() else {
+        return graph;
+    };
+    let decycle_crate = &decycle.segments.first().expect("empty decycle path").ident;
+
+    let routed = routed_traits(items, decycle_crate);
+    let participants = participants(items, &routed);
+
+    // Deterministic node order, so the indices a caller sees are reproducible across runs.
+    let mut names: Vec<String> = participants.iter().map(|i| i.to_string()).collect();
+    names.sort();
+
+    // Collect edges before touching the graph: `scope_mut` hands out scope-local indices, so nodes
+    // and edges have to be inserted together inside one scope.
+    let mut edges: Vec<(String, String, EdgeKind)> = Vec::new();
+    let mut seen: HashSet<(String, String, EdgeKind)> = HashSet::new();
+    for item in items {
+        let Item::Impl(im) = item else { continue };
+        if !impls_routed_trait(im, &routed) {
+            continue;
+        }
+        let Some(from) = type_head_ident(&im.self_ty) else {
+            continue;
+        };
+        if !participants.contains(&from) {
+            continue;
+        }
+        for (to, kind) in bound_edges(im, &routed, &participants) {
+            let key = (from.to_string(), to.to_string(), kind);
+            if seen.insert(key.clone()) {
+                edges.push(key);
+            }
+        }
+    }
+
+    // `VecGraph` is `Vec`-backed, so its indices are not stable across removals and `insert_node`
+    // is only offered inside a scope. Nothing is removed here, so one scope covers the whole build.
+    graph.scope_mut(|mut ctx| {
+        let index: HashMap<String, _> = names
+            .iter()
+            .map(|name| {
+                let ix = ctx
+                    .insert_node(Ident::new(name, Span::call_site()))
+                    .expect("insertion into a fresh VecGraph cannot fail");
+                (name.clone(), ix)
+            })
+            .collect();
+        for (from, to, kind) in &edges {
+            ctx.insert_edge(*kind, [index[from], index[to]])
+                .expect("both endpoints were just inserted");
+        }
+    });
+    graph
+}
+
+/// Trait idents routed through an engine: `#[decycle] trait …` plus every name bound by a
+/// `#[decycle] use …`.
+fn routed_traits(items: &[Item], decycle_crate: &Ident) -> HashSet<Ident> {
+    let mut out = HashSet::new();
+    for item in items {
+        match item {
+            Item::Trait(t) if has_decycle_attr(&t.attrs, decycle_crate) => {
+                out.insert(t.ident.clone());
+            }
+            Item::Use(u) if has_decycle_attr(&u.attrs, decycle_crate) => {
+                collect_use_idents(&u.tree, &mut out);
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn has_decycle_attr(attrs: &[syn::Attribute], decycle_crate: &Ident) -> bool {
+    attrs
+        .iter()
+        .any(|a| crate::is_decycle_attribute(a, decycle_crate))
+}
+
+fn collect_use_idents(tree: &UseTree, out: &mut HashSet<Ident>) {
+    match tree {
+        UseTree::Path(p) => collect_use_idents(&p.tree, out),
+        UseTree::Name(n) => {
+            out.insert(n.ident.clone());
+        }
+        UseTree::Rename(r) => {
+            out.insert(r.rename.clone());
+        }
+        UseTree::Group(g) => g.items.iter().for_each(|t| collect_use_idents(t, out)),
+        UseTree::Glob(_) => {}
+    }
+}
+
+/// Head idents of the types implementing a routed trait here — the engines' `cycle_self_heads`.
+fn participants(items: &[Item], routed: &HashSet<Ident>) -> HashSet<Ident> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let Item::Impl(im) = item else { return None };
+            impls_routed_trait(im, routed)
+                .then(|| type_head_ident(&im.self_ty))
+                .flatten()
+        })
+        .collect()
+}
+
+/// Does this impl's trait path name a routed trait in the form the engines adopt — a single segment
+/// after `self::`-normalisation? A crate-rooted or `super::` spelling is the documented opt-out.
+fn impls_routed_trait(im: &ItemImpl, routed: &HashSet<Ident>) -> bool {
+    let Some((_, path, _)) = im.trait_.as_ref() else {
+        return false;
+    };
+    let mut path = path.clone();
+    strip_leading_self(&mut path);
+    path.segments.len() == 1 && routed.contains(&path.segments[0].ident)
+}
+
+/// The participants reached by this impl's cyclic where-bounds, with how each was reached.
+fn bound_edges(
+    im: &ItemImpl,
+    routed: &HashSet<Ident>,
+    participants: &HashSet<Ident>,
+) -> Vec<(Ident, EdgeKind)> {
+    let Some(where_clause) = im.generics.where_clause.as_ref() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for pred in &where_clause.predicates {
+        let WherePredicate::Type(pt) = pred else {
+            continue;
+        };
+        if !pt.bounds.iter().any(|b| is_routed_bound(b, routed)) {
+            continue;
+        }
+        match type_head_ident(&pt.bounded_ty) {
+            // The head is itself a participant — the bound names it outright.
+            Some(head) if participants.contains(&head) => out.push((head, EdgeKind::Direct)),
+            // Otherwise look inside: a container may still be carrying one.
+            _ => out.extend(
+                nested_participants(&pt.bounded_ty, participants)
+                    .into_iter()
+                    .map(|t| (t, EdgeKind::Peeled)),
+            ),
+        }
+    }
+    out
+}
+
+fn is_routed_bound(bound: &TypeParamBound, routed: &HashSet<Ident>) -> bool {
+    let TypeParamBound::Trait(TraitBound { path, .. }) = bound else {
+        return false;
+    };
+    let mut path = path.clone();
+    strip_leading_self(&mut path);
+    path.segments.len() == 1 && routed.contains(&path.segments[0].ident)
+}
+
+/// Participant idents appearing anywhere inside `ty`, outermost first, without repeats.
+fn nested_participants(ty: &Type, participants: &HashSet<Ident>) -> Vec<Ident> {
+    struct V<'a> {
+        participants: &'a HashSet<Ident>,
+        seen: HashSet<String>,
+        out: Vec<Ident>,
+    }
+    impl Visit<'_> for V<'_> {
+        fn visit_type_path(&mut self, tp: &syn::TypePath) {
+            if tp.qself.is_none() {
+                if let Some(seg) = tp.path.segments.last() {
+                    if self.participants.contains(&seg.ident)
+                        && self.seen.insert(seg.ident.to_string())
+                    {
+                        self.out.push(seg.ident.clone());
+                    }
+                }
+            }
+            syn::visit::visit_type_path(self, tp);
+        }
+    }
+    let mut v = V {
+        participants,
+        seen: HashSet::new(),
+        out: Vec::new(),
+    };
+    v.visit_type(ty);
+    v.out
+}

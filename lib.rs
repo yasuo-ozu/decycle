@@ -14,6 +14,13 @@ pub use decycle_impl::ranked;
 /// The **structural** unroll engine's programmatic API (`#[decycle(structural)]`) — a compile-time
 /// unroll with no runtime and no `type-leak` dependency.
 pub use decycle_impl::structural;
+/// Engine-independent, code-free inspection: the module's obligation graph over type idents, with
+/// each edge labelled `Direct` or `Peeled`. Also reachable as [`ranked::analyze_module`] and
+/// [`structural::analyze_module`].
+pub use decycle_impl::analysis;
+/// Re-exported so callers can name the [`safegraph::VecGraph`] that
+/// [`analysis::analyze_module`] returns without depending on `safegraph` themselves.
+pub use decycle_impl::safegraph;
 /// Attribute macro that expands a module or trait to break circular trait
 /// obligations within the annotated module. Also see module-level documentation.
 ///

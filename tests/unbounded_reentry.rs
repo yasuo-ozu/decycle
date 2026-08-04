@@ -56,7 +56,18 @@ mod mutual_default {
 #[test]
 fn deep_recursion_default_level() {
     use mutual_default::Ca;
-    assert_eq!(mutual_default::A.ca(20000), 20000);
+    // Run on an explicitly sized thread. Each inductive frame now holds an 8-byte
+    // `__reentry::scope()` guard across its recursive call — the guard is what rolls back a
+    // nested descent's registrations, so it cannot be released any earlier. That costs roughly
+    // 12% more stack per frame (20_000 frames needed ~2.0 MiB before, ~2.25 MiB now), which
+    // straddles the 2 MiB default of a libtest thread. The depth under test is the point of the
+    // test, so size the thread rather than shrink the depth.
+    std::thread::Builder::new()
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| assert_eq!(mutual_default::A.ca(20000), 20000))
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 #[decycle(recurse_level = 3)]

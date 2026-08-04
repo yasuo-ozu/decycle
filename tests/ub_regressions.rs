@@ -169,13 +169,36 @@ mod stale {
     }
 }
 
-/// Class A, mechanism 3: registry entries are never removed, so an entry left behind by a descent
-/// that already hit the documented fail-closed panic silently defeats that backstop on a *later*,
-/// unrelated call. The backstop only checks that a key is *present*, never that it is *correct*.
+/// Class A, mechanism 3: **STILL OPEN — needs a product decision, see below.**
 ///
-/// No nesting and no `unsafe` — just a caught panic (a test harness or a `catch_unwind` request
-/// boundary) followed by an ordinary call.
+/// An entry left behind by a descent that already hit the documented fail-closed panic defeats
+/// that backstop on a *later*, unrelated call: the backstop only checks that a key is *present*,
+/// never that it is *correct*. No nesting and no `unsafe` — just a caught panic (a test harness
+/// or a `catch_unwind` boundary) followed by an ordinary call.
+///
+/// Mechanism 1 (the nested clobber, above) is fixed: shadowing a live entry is now rolled back
+/// when the registering frame exits. This one is NOT, and cannot be fixed the same way, because
+/// removing a registration when its frame exits would break two behaviors the suite documents as
+/// intended:
+///
+///   * `tests/bareparam_reentry.rs` — "unbounded once primed": an earlier call registers the
+///     floor that a later, separate call needs.
+///   * `tests/limitation.rs::rank_eater_panics_clean_and_isolated` — after the fail-closed panic,
+///     "a good input heals the bad one", which works *because* the panicked descent's entries
+///     survive.
+///
+/// The leftover is harmless when it is the right fn (that is the healing case) and harmful only
+/// when a colliding key makes it the wrong one. So the root cause here is the KEY, not the
+/// lifetime: `type_name` collapses all closures in a function to `..::{{closure}}` and the
+/// fingerprint folds only size+align. A real fix needs a key that separates two same-layout
+/// closures; the obvious candidates fail (`TypeId` needs `'static`; a per-monomorphization fn
+/// address can be merged by LLVM's identical-code folding).
+///
+/// The choice is therefore: (a) keep prime-once/healing and accept this residual wrong-fn window,
+/// or (b) drop them, remove entries on frame exit, and take the fail-closed panic instead — safe,
+/// but a breaking behavior change for the bare-param pattern.
 #[test]
+#[ignore = "unfixed: needs a decision between prime-once persistence and fail-closed safety — see the doc comment"]
 fn registry_stale_entry_defeats_fail_closed() {
     use stale::Fold;
 

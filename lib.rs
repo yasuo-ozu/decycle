@@ -230,9 +230,22 @@ pub mod __reentry {
     use std::cell::RefCell;
     use std::collections::HashMap;
 
+    // The value is a `*const ()`, never a `usize`: a fn pointer laundered through an integer
+    // loses its provenance, and calling the result of `transmute::<usize, fn(..)>` is undefined
+    // behavior (miri: "pointer not dereferenceable: .. it has no provenance"). Keeping a real
+    // pointer carries provenance end to end. A raw pointer is fine here because the map is
+    // thread-local and never crosses a thread boundary.
     thread_local! {
-        static REG: RefCell<HashMap<(&'static str, u64), usize>> = RefCell::new(HashMap::new());
+        static REG: RefCell<HashMap<(&'static str, u64), *const ()>> = RefCell::new(HashMap::new());
+        /// Undo log for [`Registration`]. Every registration appends what it displaced; a guard
+        /// records only its own index into this log. Keeping the payload here rather than in the
+        /// guard is what keeps the guard 8 bytes: a deep unbounded descent holds one guard set
+        /// per live frame, and fatter guards overflow the stack well before the recursion does
+        /// (20_000 frames is an ordinary depth for this engine).
+        static UNDO: RefCell<Vec<Undo>> = const { RefCell::new(Vec::new()) };
     }
+
+    type Undo = ((&'static str, u64), Option<*const ()>);
 
     /// FNV-1a offset basis: the seed of every generated fingerprint fold.
     pub const FP_SEED: u64 = 0xcbf29ce484222325;
@@ -250,25 +263,108 @@ pub mod __reentry {
         (acc ^ w).wrapping_mul(FP_PRIME)
     }
 
-    /// Register the full-height re-entry fn (as `fn`-pointer-cast-to-`usize`) for key
-    /// `(K, fp)` on this thread.
-    pub fn register<K: ?Sized>(fp: u64, f: usize) {
-        REG.with(|reg| reg.borrow_mut().insert((type_name::<K>(), fp), f));
+    /// Puts back the entries that were *displaced* inside one registration scope.
+    ///
+    /// Registration is no longer last-writer-wins. [`scope`] returns this guard, the generated
+    /// prologue binds it for the rest of the method body, and dropping it restores whatever
+    /// occupied those slots before — including on unwind.
+    ///
+    /// This matters because keys can collide: two closures written in one function share a
+    /// `type_name` exactly, so two same-layout closures map to one slot. Without the restore, a
+    /// nested descent started from the middle of a method body overwrites the slot, and when the
+    /// outer frame reaches its floor it calls the *other* closure's fn — observably wrong
+    /// results, and a segfault when the two closures' captures differ in kind.
+    ///
+    /// A registration that *created* its slot is deliberately left in place when the guard drops.
+    /// Two documented behaviors depend on that persistence: the bare-param `impl<T: Cb> Ca for
+    /// Wrap<T>` case is "unbounded once primed" (an earlier call through the Final delegating
+    /// impl registers the floor a later call needs), and a descent that hit the fail-closed panic
+    /// below leaves its registrations behind so a subsequent good call succeeds. Only *shadowing*
+    /// is scoped; priming is not.
+    #[must_use = "displaced entries are only restored when this guard drops; binding it to `_` \
+                  drops it immediately and re-opens the wrong-fn window it exists to close"]
+    pub struct Registration {
+        /// Length of `UNDO` when this scope opened. Everything logged at or after this index
+        /// belongs to the scope and is rolled back when it closes. One 8-byte guard covers a
+        /// whole frame's registrations, which matters: a deep unbounded descent holds one per
+        /// live frame, and per-registration guards cost enough stack to cut the reachable
+        /// recursion depth by a third.
+        mark: usize,
     }
 
-    /// Look up the re-entry fn for key `(K, fp)`, copied out as `usize`. The value is copied
-    /// and the `RefCell` borrow released before the not-registered panic can fire.
-    pub fn lookup<K: ?Sized>(fp: u64) -> usize {
-        let found = REG.with(|reg| reg.borrow().get(&(type_name::<K>(), fp)).copied());
+    impl Drop for Registration {
+        fn drop(&mut self) {
+            let mark = self.mark;
+            // Roll back every record at or after this guard's mark. Truncating to a mark rather
+            // than popping exactly one record keeps this correct no matter what order the guards
+            // are dropped in — tuple fields drop front-to-back while locals drop back-to-front,
+            // and both shapes appear in generated code.
+            loop {
+                // `try_with`: a decycled call can run from a TLS destructor, where the registry
+                // is already gone. Nothing to restore in that case.
+                let rec = match UNDO.try_with(|u| {
+                    let mut log = u.borrow_mut();
+                    if log.len() > mark {
+                        log.pop()
+                    } else {
+                        None
+                    }
+                }) {
+                    Ok(Some(rec)) => rec,
+                    _ => return,
+                };
+                // `None` => that registration created its slot; leave it in place (see the type
+                // docs: priming and healing depend on it). Only displacement is undone.
+                if let (key, Some(prev)) = rec {
+                    let _ = REG.try_with(|reg| {
+                        reg.borrow_mut().insert(key, prev);
+                    });
+                }
+            }
+        }
+    }
+
+    /// Open a registration scope. Every [`register`] call made while the returned
+    /// [`Registration`] is alive is rolled back when it drops — including on unwind. The
+    /// generated method prologue opens one of these before its registrations and holds it for
+    /// the rest of the body, so the entries stay live for exactly the descent they serve.
+    pub fn scope() -> Registration {
+        let mark = UNDO
+            .try_with(|u| u.borrow().len())
+            .unwrap_or(usize::MAX);
+        Registration { mark }
+    }
+
+    /// Register the full-height re-entry fn for key `(K, fp)` on this thread, within the
+    /// innermost open [`scope`].
+    ///
+    /// Call this only inside a live [`scope`]: the displacement record it logs is reclaimed when
+    /// a scope closes, so registering outside one leaves a record that is never reclaimed. All
+    /// generated code opens a scope first.
+    pub fn register<K: ?Sized>(fp: u64, f: *const ()) {
+        let key = (type_name::<K>(), fp);
+        let prev = REG
+            .try_with(|reg| reg.borrow_mut().insert(key, f))
+            .ok()
+            .flatten();
+        let _ = UNDO.try_with(|u| u.borrow_mut().push((key, prev)));
+    }
+
+    /// Look up the re-entry fn for key `(K, fp)`, copied out as a `*const ()`. The value is
+    /// copied and the `RefCell` borrow released before the not-registered panic can fire.
+    pub fn lookup<K: ?Sized>(fp: u64) -> *const () {
+        let found = REG
+            .try_with(|reg| reg.borrow().get(&(type_name::<K>(), fp)).copied())
+            .ok()
+            .flatten();
         found.expect(
             "decycle: re-entry fn not registered before the floor was reached. This floor's \
              key had no same-instantiation frame run on this thread's descent first — e.g. a \
              generic method's first descent at cycle width > recurse_level (including \
              self-recursion consuming ranks before the first generic cross-edge call), or an \
-             impl whose cyclic bound targets a bare type parameter. Increase recurse_level; \
-             if two same-LAYOUT closures share this method's floor (even with different \
-             signatures or bodies — `type_name` collapses closures and the key folds only \
-             layout), give them distinct named types.",
+             impl whose cyclic bound targets a bare type parameter. Increase recurse_level. \
+             (This can also fire when the call runs from a thread-local destructor, after the \
+             registry for this thread has already been torn down.)",
         )
     }
 }

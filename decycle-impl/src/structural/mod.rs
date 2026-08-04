@@ -30,10 +30,6 @@ pub(crate) use codegen::*;
 pub(crate) use collect::*;
 pub(crate) use rho::*;
 
-/// The module's obligation graph. Engine-independent — the [`EdgeKind::Peeled`] edges are exactly
-/// the bounds this engine has to guard with a forwarding assertion when it strips them.
-pub use crate::analysis::{analyze_module, EdgeKind};
-
 /// Apply the structural `#[decycle(structural)]` transformation to `module`, programmatically —
 /// the no-runtime unroll. `decycle` is the path to the decycle crate (its leading segment names the
 /// crate, used to recognise `#[<crate>::decycle]` on inner items). For macro authors wrapping
@@ -108,6 +104,33 @@ fn expand(
     // Only impls of traits annotated `#[decycle]` in this module participate — collect their idents
     // and strip the `#[decycle]` attrs from the trait/use items.
     let decycle_traits = collect_decycle_traits(brace_items, &decycle_crate);
+
+    // A caller supplying a graph is generating these impls, which means a cycle member and its helper
+    // types are separate impls that each declare only their OWN leaf premises — and the generated
+    // terminator for one has to prove what a sibling's impl demands. Share the union across each
+    // trait's impls first, the same gap `ranked::sharing` closes on the other engine. Skipped without a
+    // graph: hand-written impls state their own premises, and rewriting a caller's `where`-clause
+    // uninvited is the sort of thing the graph is the opt-in for.
+    if allowed_types.is_some() {
+        for trait_name in &decycle_traits {
+            let marker = Ident::new(trait_name, Span::call_site());
+            let mut group: Vec<&mut ItemImpl> = brace_items
+                .iter_mut()
+                .filter_map(|item| match item {
+                    Item::Impl(im)
+                        if impl_trait_key(im).as_deref() == Some(trait_name.as_str()) =>
+                    {
+                        Some(im)
+                    }
+                    _ => None,
+                })
+                .collect();
+            if group.len() > 1 {
+                crate::ranked::sharing::share_side_predicates(&mut group, &marker);
+            }
+        }
+    }
+
     let items = brace_items.clone();
 
     // No `#[decycle]`-annotated trait/use → no cyclic participants. Re-emit the module unchanged (its

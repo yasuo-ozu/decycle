@@ -15,8 +15,13 @@ pub use decycle_impl::ranked;
 /// unroll with no runtime and no `type-leak` dependency.
 pub use decycle_impl::structural;
 /// Engine-independent, code-free inspection: the module's obligation graph over type idents, with
-/// each edge labelled `Direct` or `Peeled`. Also reachable as [`ranked::analyze_module`] and
-/// [`structural::analyze_module`].
+/// each edge labelled `Direct` or `Peeled`.
+///
+/// The analysis itself is the same whichever engine you go on to use — it lives here, and only here.
+/// What differs per engine is how a graph is *consumed*: [`ranked::process_module_with_graph`]
+/// **replaces** its participant set with the graph's nodes, whereas
+/// [`structural::process_module_with_graph`] can only **filter** with them, its model being keyed on
+/// `(type, trait)` pairs rather than on types.
 /// Engine-independent, code-free inspection: the module's obligation graph over type idents, with
 /// each edge labelled `Direct` or `Peeled`.
 ///
@@ -26,8 +31,7 @@ pub use decycle_impl::structural;
 /// - [`analysis::with_nodes`] adds participants discovered after the graph was built.
 ///
 /// The result is what [`ranked::process_module_with_graph`] and
-/// [`structural::process_module_with_graph`] take. Also reachable as `ranked::analyze_module` /
-/// `structural::analyze_module`.
+/// [`structural::process_module_with_graph`] take.
 pub use decycle_impl::analysis;
 /// Re-exported so callers can name the [`safegraph::VecGraph`] that
 /// [`analysis::analyze_module`] returns without depending on `safegraph` themselves.

@@ -1,11 +1,7 @@
-//! `emit_contracts = true`: the graph is the only statement of the cycle.
-//!
-//! Every trait path in the module below is **fully qualified** — header and bound alike — which is how
-//! a generating caller naturally emits them, and which the engine otherwise reads as "ordinary
-//! premise, leave alone". Nothing here says `Expr` and `Stmt` recurse except the participant set the
-//! bridge hands over, so this compiles only if `contract` re-spells the impls from that set.
+//! `finalize_with_graph` — the same graph + `contract` wiring at the lower-level entry point, for a
+//! wrapper macro that holds `FinalizeArgs` rather than an `ItemMod`.
 
-#[graph_bridge::decycle_via_graph_contract]
+#[graph_bridge::finalize_via_graph_contract]
 mod ast {
     #[decycle]
     pub trait Tr {
@@ -47,10 +43,10 @@ mod ast {
 use ast::{Expr, Stmt, Tr};
 
 #[test]
-fn contract_respells_a_fully_qualified_cycle() {
+fn finalize_with_graph_respells_and_ranks() {
     let mut e = Expr::Lit;
-    for _ in 0..30 {
+    for _ in 0..25 {
         e = Expr::Nest(Box::new(Stmt::E(Box::new(e))));
     }
-    assert_eq!(e.depth(), 30);
+    assert_eq!(e.depth(), 25);
 }

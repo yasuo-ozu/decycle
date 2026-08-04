@@ -7,7 +7,7 @@
 
 use decycle_impl::analysis::analyze_module;
 use proc_macro_error::proc_macro_error;
-use decycle_impl::ranked::{process_module, process_module_with_graph, GraphOptions};
+use decycle_impl::ranked::{process_module, process_module_with_graph};
 use proc_macro::TokenStream;
 use syn::{parse_macro_input, parse_quote, ItemMod};
 
@@ -25,7 +25,7 @@ pub fn decycle_via_graph(_attr: TokenStream, input: TokenStream) -> TokenStream 
     let supplied = process_module_with_graph(
         module.clone(),
         &graph,
-        GraphOptions::default(),
+        /* emit_contracts */ false,
         &decycle,
         2,
         true,
@@ -45,7 +45,7 @@ pub fn decycle_via_graph(_attr: TokenStream, input: TokenStream) -> TokenStream 
 /// Run the ranked engine with `contract: true`, stating the participants as *every `pub` type in the
 /// module* — so nothing in the source has to spell the cycle.
 ///
-/// This is the case `GraphOptions::contract` exists for: a generating caller whose impls are written
+/// This is the case `emit_contracts` exists for: a generating caller whose impls are written
 /// with fully-qualified trait paths throughout. Without `contract` the engine adopts neither impl (a
 /// qualified header is the documented opt-out) and the obligation cycle is left unbroken.
 #[proc_macro_attribute]
@@ -69,13 +69,66 @@ pub fn decycle_via_graph_contract(_attr: TokenStream, input: TokenStream) -> Tok
         .collect();
     let graph = with_nodes(&VecGraph::default(), participants);
 
-    process_module_with_graph(
-        module,
-        &graph,
-        GraphOptions { contract: true },
-        &decycle,
-        2,
-        true,
-    )
-    .into()
+    process_module_with_graph(module, &graph, /* emit_contracts */ true, &decycle, 2, true).into()
+}
+
+/// Same as [`decycle_via_graph_contract`], but through the LOWER-level entry: build `FinalizeArgs`
+/// by hand — the way a wrapper macro that has already split the module does — and call
+/// `finalize_with_graph`. Proves the graph and `contract` reach the ranking machinery from there too.
+#[proc_macro_attribute]
+#[proc_macro_error]
+pub fn finalize_via_graph_contract(_attr: TokenStream, input: TokenStream) -> TokenStream {
+    use decycle_impl::analysis::with_nodes;
+    use decycle_impl::finalize::{finalize_with_graph, FinalizeArgs};
+    use decycle_impl::safegraph::VecGraph;
+
+    let module = parse_macro_input!(input as ItemMod);
+    let items: Vec<syn::Item> = module.content.into_iter().flat_map(|(_, i)| i).collect();
+
+    let mut traits = Vec::new();
+    let mut impls = Vec::new();
+    let mut rest = Vec::new();
+    let mut participants = Vec::new();
+    for item in items {
+        match item {
+            syn::Item::Trait(mut t) => {
+                t.attrs.retain(|a| !a.path().is_ident("decycle"));
+                // The trait is emitted at module level AND described in `FinalizeArgs` — this is what
+                // `process_module` does (it leaves the item in `raw_contents` while also collecting
+                // it), and the ranked output refers to it from the enclosing scope.
+                rest.push(syn::Item::Trait(t.clone()));
+                traits.push(t);
+            }
+            syn::Item::Impl(im) if im.trait_.is_some() => impls.push(im),
+            other => {
+                if let syn::Item::Enum(e) = &other {
+                    participants.push(e.ident.clone());
+                } else if let syn::Item::Struct(st) = &other {
+                    participants.push(st.ident.clone());
+                }
+                rest.push(other);
+            }
+        }
+    }
+    let graph = with_nodes(&VecGraph::default(), participants);
+
+    let args = FinalizeArgs {
+        working_list: vec![parse_quote!(::decycle::__finalize)],
+        traits,
+        contents: impls,
+        recurse_level: 2,
+        support_infinite_cycle: true,
+        renames: Vec::new(),
+        also_rank: Vec::new(),
+        decycle_path: Some(parse_quote!(::decycle)),
+    };
+    let ident = &module.ident;
+    let expanded = finalize_with_graph(args, &graph, /* emit_contracts */ true);
+    let out = quote::quote! {
+        mod #ident {
+            #(#rest)*
+            #expanded
+        }
+    };
+    out.into()
 }

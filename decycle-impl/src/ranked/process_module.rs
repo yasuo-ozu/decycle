@@ -313,10 +313,20 @@ pub fn process_module(
 ///
 /// A node naming a type with no routed impl in this module is ignored rather than rejected: the
 /// engine only ever asks whether a given head is in the set.
+/// `emit_contracts` re-spells the adopted impls **from the graph** before anything else runs, via
+/// [`super::contract`]: bare the header trait path, bare a bound whose target reaches a participant,
+/// qualify every other bound naming a routed trait.
+///
+/// Pass `false` and the graph supplies the node set only, leaving everything else exactly as
+/// [`process_module`] does it — the engine's normal contract, where the *caller* expresses the
+/// classification in how it spells each bound. Pass `true` when the graph is the intended source of
+/// truth and the impls are generated code not yet spelled for the engine: then the cycle is stated
+/// once, rather than encoded into every bound by the caller and decoded again here. Rewriting a
+/// caller's spelling changes what a crate-rooted path means, which is why it is not the default.
 pub fn process_module_with_graph(
     module: ItemMod,
     graph: &crate::safegraph::VecGraph<Ident, crate::analysis::EdgeKind>,
-    options: GraphOptions,
+    emit_contracts: bool,
     decycle: &Path,
     recurse_level: usize,
     support_infinite_cycle: bool,
@@ -325,35 +335,16 @@ pub fn process_module_with_graph(
     let heads: HashSet<Ident> = graph.nodes().cloned().collect();
     process_module_inner(
         module,
-        Some((heads, options)),
+        Some((heads, emit_contracts)),
         decycle,
         recurse_level,
         support_infinite_cycle,
     )
 }
 
-/// What [`process_module_with_graph`] should do with the graph beyond taking its node set.
-///
-/// Defaults to the conservative choice — node set only, everything else exactly as
-/// [`process_module`] would do it — so adding a field here cannot change an existing caller's output.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct GraphOptions {
-    /// Re-spell the adopted impls **from the graph** before anything else runs, via
-    /// [`super::contract`]: bare the header trait path, bare a bound whose target reaches a
-    /// participant, qualify every other bound naming a routed trait.
-    ///
-    /// Off by default, because the engine's normal contract is that the *caller* expresses the
-    /// classification in how it spells each bound, and silently rewriting a caller's spelling would
-    /// change what a crate-rooted path means. Turn it on when the graph is the intended source of
-    /// truth and the impls are generated code that has not been spelled for the engine yet — then the
-    /// cycle is stated once, rather than encoded into every bound by the caller and decoded again
-    /// here.
-    pub contract: bool,
-}
-
 fn process_module_inner(
     mut module: ItemMod,
-    graph_input: Option<(HashSet<Ident>, GraphOptions)>,
+    graph_input: Option<(HashSet<Ident>, bool)>,
     decycle: &Path,
     recurse_level: usize,
     support_infinite_cycle: bool,
@@ -489,10 +480,8 @@ fn process_module_inner(
     // With a caller-supplied participant set, re-spell the impls here rather than requiring the
     // caller to have encoded the classification in how it wrote every bound — see `super::contract`.
     // Must run before everything below: adoption, peeling and validation all read the spelling.
-    if let Some((participants, options)) = graph_input.as_ref() {
-        if options.contract {
-            crate::ranked::contract::contract_from_graph(contents, &all_traits, participants);
-        }
+    if let Some((participants, true)) = graph_input.as_ref().map(|(p, e)| (p, *e)) {
+        crate::ranked::contract::contract_from_graph(contents, &all_traits, participants);
     }
 
     let cycle_self_heads: HashSet<Ident> = graph_input.map(|(heads, _)| heads).unwrap_or_else(|| {

@@ -11,6 +11,7 @@ path = "lib.rs"
 [dependencies]
 decycle-impl = { path = "../../decycle-impl" }
 proc-macro2 = "1.0"
+quote = "1.0"
 # `#[proc_macro_error]` expands to paths rooted at a crate literally named `proc_macro_error`.
 proc-macro-error = { version = "1.0", default-features = false }
 

@@ -2949,6 +2949,69 @@ fn check_no_decycle_supertraits(
 /// obligations the plain scan can't rank on its own — and call this to get the expanded output.
 /// The `#[decycle]` attribute ultimately routes here; call it directly only when building macro
 /// tooling on top of decycle. Stable and semver-committed.
+/// [`finalize`], with the caller's obligation graph.
+///
+/// The same relationship [`super::process_module_with_graph`] has to [`super::process_module`], at the
+/// lower level: `graph`'s nodes are the participants, and `emit_contracts` re-spells `args.contents`
+/// from them (see [`super::contract`]) before any of the ranking machinery reads a trait path. It also
+/// peels wrapped cyclic bounds, the other graph-dependent normalisation `process_module` would have
+/// done.
+///
+/// This is the entry point for a wrapper macro that has already split the module itself — it holds
+/// `FinalizeArgs` rather than an `ItemMod`, so it cannot go through `process_module_with_graph`, but it
+/// has the same reason to state its cycle instead of encoding it in spelling.
+///
+/// With `emit_contracts = false` this is exactly [`finalize`]: the node set is only consulted by those
+/// two passes, since everything below already works off `replacing_table`.
+pub fn finalize_with_graph(
+    mut args: FinalizeArgs,
+    graph: &crate::safegraph::VecGraph<Ident, crate::analysis::EdgeKind>,
+    emit_contracts: bool,
+) -> TokenStream {
+    if emit_contracts {
+        use crate::safegraph::graph::Graph;
+        let participants: std::collections::HashSet<Ident> = graph.nodes().cloned().collect();
+        let all_traits: std::collections::HashSet<Ident> = args
+            .traits
+            .iter()
+            .map(|t| t.ident.clone())
+            .chain(
+                args.working_list
+                    .iter()
+                    .filter_map(|p| p.segments.last().map(|s| s.ident.clone())),
+            )
+            .collect();
+        // `contract_from_graph` works over `Item`s; wrap and unwrap the impls around it.
+        let mut items: Vec<Item> = args.contents.drain(..).map(Item::Impl).collect();
+        crate::ranked::contract::contract_from_graph(&mut items, &all_traits, &participants);
+        args.contents = items
+            .into_iter()
+            .filter_map(|it| match it {
+                Item::Impl(im) => Some(im),
+                _ => None,
+            })
+            .collect();
+        // Peel too: a wrapped cyclic bound (`Box<Stmt>: Tr`) has no rankable head, and this entry
+        // point bypasses `process_module`, where that pass normally runs. Both are pre-ranking
+        // normalisations that only a participant set makes possible, so they belong together here.
+        for im in args.contents.iter_mut() {
+            let impl_type_params: std::collections::HashSet<Ident> = im
+                .generics
+                .params
+                .iter()
+                .filter_map(|p| match p {
+                    GenericParam::Type(t) => Some(t.ident.clone()),
+                    _ => None,
+                })
+                .collect();
+            crate::ranked::peel::peel_cyclic_bounds(im, &all_traits, &participants, &|ty| {
+                crate::ranked::process_module::is_local_impl_bound_target(ty, &impl_type_params)
+            });
+        }
+    }
+    finalize(args)
+}
+
 pub fn finalize(args: FinalizeArgs) -> TokenStream {
     // Apply this module's own use-site renames (`#[decycle] use path::T as R;`) BEFORE
     // indexing traits by ident: the `ItemTrait` arriving through the macro ping-pong

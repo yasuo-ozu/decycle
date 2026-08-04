@@ -66,14 +66,42 @@ pub enum EdgeKind {
 /// - the trait each edge came from. Two impls of different routed traits relating the same pair the
 ///   same way yield **one** edge, since the question this graph answers is about types.
 pub fn analyze_module(module: &ItemMod, decycle: &Path) -> VecGraph<Ident, EdgeKind> {
-    let mut graph = VecGraph::default();
     let Some((_, items)) = module.content.as_ref() else {
-        return graph;
+        return VecGraph::default();
     };
     let decycle_crate = &decycle.segments.first().expect("empty decycle path").ident;
-
     let routed = routed_traits(items, decycle_crate);
-    let participants = participants(items, &routed);
+    build(items, &routed, Spelling::BareOnly)
+}
+
+/// Build the obligation graph over `items`, taking the routed traits **as given** rather than
+/// discovering them from `#[decycle]` markers, and matching a trait path by its **last segment**.
+///
+/// This is the entry point for a caller that generates the impls it is about to hand to an engine.
+/// Such a caller knows its routed traits, and writes every path fully qualified — so neither the
+/// `#[decycle]` markers nor the bare/qualified spelling is available yet, and neither is needed:
+/// naming the traits *is* the signal. Contrast [`analyze_module`], which reads a module that has
+/// already been spelled for the engine and therefore honours the qualified opt-out.
+///
+/// Feed the result through [`cyclic_subgraph`] to get the participants, then pass that to
+/// [`crate::ranked::process_module_with_graph`] with `contract: true` — which re-spells the impls from
+/// it, closing the loop.
+pub fn analyze_items(items: &[Item], routed: &HashSet<Ident>) -> VecGraph<Ident, EdgeKind> {
+    build(items, routed, Spelling::AnySpelling)
+}
+
+/// How a trait path is matched against the routed set.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Spelling {
+    /// Single segment after `self::`-normalisation. A qualified path is the caller's opt-out.
+    BareOnly,
+    /// Last segment, whatever the qualification. For impls not yet spelled for the engine.
+    AnySpelling,
+}
+
+fn build(items: &[Item], routed: &HashSet<Ident>, how: Spelling) -> VecGraph<Ident, EdgeKind> {
+    let mut graph = VecGraph::default();
+    let participants = participants(items, routed, how);
 
     // Deterministic node order, so the indices a caller sees are reproducible across runs.
     let mut names: Vec<String> = participants.iter().map(|i| i.to_string()).collect();
@@ -85,7 +113,7 @@ pub fn analyze_module(module: &ItemMod, decycle: &Path) -> VecGraph<Ident, EdgeK
     let mut seen: HashSet<(String, String, EdgeKind)> = HashSet::new();
     for item in items {
         let Item::Impl(im) = item else { continue };
-        if !impls_routed_trait(im, &routed) {
+        if !impls_routed_trait(im, routed, how) {
             continue;
         }
         let Some(from) = type_head_ident(&im.self_ty) else {
@@ -94,7 +122,7 @@ pub fn analyze_module(module: &ItemMod, decycle: &Path) -> VecGraph<Ident, EdgeK
         if !participants.contains(&from) {
             continue;
         }
-        for (to, kind) in bound_edges(im, &routed, &participants) {
+        for (to, kind) in bound_edges(im, routed, &participants, how) {
             let key = (from.to_string(), to.to_string(), kind);
             if seen.insert(key.clone()) {
                 edges.push(key);
@@ -161,12 +189,12 @@ fn collect_use_idents(tree: &UseTree, out: &mut HashSet<Ident>) {
 }
 
 /// Head idents of the types implementing a routed trait here — the engines' `cycle_self_heads`.
-fn participants(items: &[Item], routed: &HashSet<Ident>) -> HashSet<Ident> {
+fn participants(items: &[Item], routed: &HashSet<Ident>, how: Spelling) -> HashSet<Ident> {
     items
         .iter()
         .filter_map(|item| {
             let Item::Impl(im) = item else { return None };
-            impls_routed_trait(im, routed)
+            impls_routed_trait(im, routed, how)
                 .then(|| type_head_ident(&im.self_ty))
                 .flatten()
         })
@@ -175,13 +203,23 @@ fn participants(items: &[Item], routed: &HashSet<Ident>) -> HashSet<Ident> {
 
 /// Does this impl's trait path name a routed trait in the form the engines adopt — a single segment
 /// after `self::`-normalisation? A crate-rooted or `super::` spelling is the documented opt-out.
-fn impls_routed_trait(im: &ItemImpl, routed: &HashSet<Ident>) -> bool {
+fn impls_routed_trait(im: &ItemImpl, routed: &HashSet<Ident>, how: Spelling) -> bool {
     let Some((_, path, _)) = im.trait_.as_ref() else {
         return false;
     };
+    path_names_routed(path, routed, how)
+}
+
+fn path_names_routed(path: &Path, routed: &HashSet<Ident>, how: Spelling) -> bool {
     let mut path = path.clone();
     strip_leading_self(&mut path);
-    path.segments.len() == 1 && routed.contains(&path.segments[0].ident)
+    match how {
+        Spelling::BareOnly => path.segments.len() == 1 && routed.contains(&path.segments[0].ident),
+        Spelling::AnySpelling => path
+            .segments
+            .last()
+            .is_some_and(|s| routed.contains(&s.ident)),
+    }
 }
 
 /// The participants reached by this impl's cyclic where-bounds, with how each was reached.
@@ -189,6 +227,7 @@ fn bound_edges(
     im: &ItemImpl,
     routed: &HashSet<Ident>,
     participants: &HashSet<Ident>,
+    how: Spelling,
 ) -> Vec<(Ident, EdgeKind)> {
     let Some(where_clause) = im.generics.where_clause.as_ref() else {
         return Vec::new();
@@ -198,7 +237,7 @@ fn bound_edges(
         let WherePredicate::Type(pt) = pred else {
             continue;
         };
-        if !pt.bounds.iter().any(|b| is_routed_bound(b, routed)) {
+        if !pt.bounds.iter().any(|b| is_routed_bound(b, routed, how)) {
             continue;
         }
         match type_head_ident(&pt.bounded_ty) {
@@ -215,13 +254,11 @@ fn bound_edges(
     out
 }
 
-fn is_routed_bound(bound: &TypeParamBound, routed: &HashSet<Ident>) -> bool {
+fn is_routed_bound(bound: &TypeParamBound, routed: &HashSet<Ident>, how: Spelling) -> bool {
     let TypeParamBound::Trait(TraitBound { path, .. }) = bound else {
         return false;
     };
-    let mut path = path.clone();
-    strip_leading_self(&mut path);
-    path.segments.len() == 1 && routed.contains(&path.segments[0].ident)
+    path_names_routed(path, routed, how)
 }
 
 /// Participant idents appearing anywhere inside `ty`, outermost first, without repeats.

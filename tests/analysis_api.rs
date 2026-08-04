@@ -1,10 +1,14 @@
-//! The obligation-graph API is reachable from every documented path.
+//! The obligation-graph API is reachable from the facade, and its result is accepted by both engines.
+//!
+//! There is exactly one path to the analysis — `decycle::analysis` — because the analysis is
+//! engine-independent. It used to be re-exported under `ranked::` and `structural::` as well, which
+//! only suggested the two might differ.
 
 use decycle::safegraph::graph::Graph;
 use syn::parse_quote;
 
 #[test]
-fn reachable_from_all_three_paths() {
+fn reachable_and_accepted_by_both_engines() {
     let m: syn::ItemMod = parse_quote! {
         mod ast {
             #[decycle] pub trait Tr { fn f(&self); }
@@ -16,20 +20,18 @@ fn reachable_from_all_three_paths() {
     };
     let p: syn::Path = parse_quote!(::decycle);
 
-    // The shared module, and the two engine namespaces that re-export it.
-    let a = decycle::analysis::analyze_module(&m, &p);
-    let b = decycle::ranked::analyze_module(&m, &p);
-    let c = decycle::structural::analyze_module(&m, &p);
+    let g = decycle::analysis::analyze_module(&m, &p);
+    let mut ns: Vec<String> = g.nodes().map(|n| n.to_string()).collect();
+    ns.sort();
+    assert_eq!(ns, vec!["Expr", "Stmt"]);
+    assert_eq!(g.len_edge(), 2);
 
-    for g in [&a, &b, &c] {
-        let mut ns: Vec<String> = g.nodes().map(|n| n.to_string()).collect();
-        ns.sort();
-        assert_eq!(ns, vec!["Expr", "Stmt"]);
-        assert_eq!(g.len_edge(), 2);
-    }
+    let kinds: Vec<decycle::analysis::EdgeKind> = g.edges().copied().collect();
+    assert!(kinds.contains(&decycle::analysis::EdgeKind::Peeled));
+    assert!(kinds.contains(&decycle::analysis::EdgeKind::Direct));
 
-    // `EdgeKind` is the same type through every path.
-    let kinds: Vec<decycle::analysis::EdgeKind> = a.edges().copied().collect();
-    assert!(kinds.contains(&decycle::ranked::EdgeKind::Peeled));
-    assert!(kinds.contains(&decycle::structural::EdgeKind::Direct));
+    // The same graph is accepted by an engine's graph-taking entry point. Only `structural` can be
+    // called from here — `ranked` reports through `proc_macro_error`, which panics outside a
+    // proc-macro entry point, so it is covered by `tests/graph_bridge` instead.
+    let _structural = decycle::structural::process_module_with_graph(m, &g, &p);
 }

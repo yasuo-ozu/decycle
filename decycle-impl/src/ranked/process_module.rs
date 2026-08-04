@@ -316,6 +316,7 @@ pub fn process_module(
 pub fn process_module_with_graph(
     module: ItemMod,
     graph: &crate::safegraph::VecGraph<Ident, crate::analysis::EdgeKind>,
+    options: GraphOptions,
     decycle: &Path,
     recurse_level: usize,
     support_infinite_cycle: bool,
@@ -324,16 +325,35 @@ pub fn process_module_with_graph(
     let heads: HashSet<Ident> = graph.nodes().cloned().collect();
     process_module_inner(
         module,
-        Some(heads),
+        Some((heads, options)),
         decycle,
         recurse_level,
         support_infinite_cycle,
     )
 }
 
+/// What [`process_module_with_graph`] should do with the graph beyond taking its node set.
+///
+/// Defaults to the conservative choice — node set only, everything else exactly as
+/// [`process_module`] would do it — so adding a field here cannot change an existing caller's output.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GraphOptions {
+    /// Re-spell the adopted impls **from the graph** before anything else runs, via
+    /// [`super::contract`]: bare the header trait path, bare a bound whose target reaches a
+    /// participant, qualify every other bound naming a routed trait.
+    ///
+    /// Off by default, because the engine's normal contract is that the *caller* expresses the
+    /// classification in how it spells each bound, and silently rewriting a caller's spelling would
+    /// change what a crate-rooted path means. Turn it on when the graph is the intended source of
+    /// truth and the impls are generated code that has not been spelled for the engine yet — then the
+    /// cycle is stated once, rather than encoded into every bound by the caller and decoded again
+    /// here.
+    pub contract: bool,
+}
+
 fn process_module_inner(
     mut module: ItemMod,
-    head_override: Option<HashSet<Ident>>,
+    graph_input: Option<(HashSet<Ident>, GraphOptions)>,
     decycle: &Path,
     recurse_level: usize,
     support_infinite_cycle: bool,
@@ -466,7 +486,16 @@ fn process_module_inner(
     // Head idents of the types that IMPLEMENT a cyclic trait here — the only heads a bare cyclic
     // where-bound may target (besides `Self` / an impl type-param). A bound whose head is a foreign
     // container (`Box<Stmt>: Tr`) has no ranked impl to descend through, so it's flagged below.
-    let cycle_self_heads: HashSet<Ident> = head_override.unwrap_or_else(|| {
+    // With a caller-supplied participant set, re-spell the impls here rather than requiring the
+    // caller to have encoded the classification in how it wrote every bound — see `super::contract`.
+    // Must run before everything below: adoption, peeling and validation all read the spelling.
+    if let Some((participants, options)) = graph_input.as_ref() {
+        if options.contract {
+            crate::ranked::contract::contract_from_graph(contents, &all_traits, participants);
+        }
+    }
+
+    let cycle_self_heads: HashSet<Ident> = graph_input.map(|(heads, _)| heads).unwrap_or_else(|| {
         contents
             .iter()
             .filter_map(|item| {

@@ -17,6 +17,17 @@ pub use decycle_impl::structural;
 /// Engine-independent, code-free inspection: the module's obligation graph over type idents, with
 /// each edge labelled `Direct` or `Peeled`. Also reachable as [`ranked::analyze_module`] and
 /// [`structural::analyze_module`].
+/// Engine-independent, code-free inspection: the module's obligation graph over type idents, with
+/// each edge labelled `Direct` or `Peeled`.
+///
+/// - [`analysis::analyze_module`] reads a module's own classification back out;
+/// - [`analysis::cyclic_subgraph`] restricts a graph to the nodes that lie on a cycle, so a caller
+///   can supply a whole reference relation and let decycle decide what recurses;
+/// - [`analysis::with_nodes`] adds participants discovered after the graph was built.
+///
+/// The result is what [`ranked::process_module_with_graph`] and
+/// [`structural::process_module_with_graph`] take. Also reachable as `ranked::analyze_module` /
+/// `structural::analyze_module`.
 pub use decycle_impl::analysis;
 /// Re-exported so callers can name the [`safegraph::VecGraph`] that
 /// [`analysis::analyze_module`] returns without depending on `safegraph` themselves.

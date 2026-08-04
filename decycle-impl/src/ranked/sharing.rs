@@ -109,17 +109,22 @@ pub(crate) fn share_side_predicates(impls: &mut [&mut ItemImpl], cyclic_marker: 
     }
 }
 
-/// The type-parameter idents an impl declares — used to decide whether a sibling's predicate can be
+/// The generic-parameter idents an impl declares — used to decide whether a sibling's predicate can be
 /// injected into it (see [`share_side_predicates`]).
 fn impl_param_idents(item_impl: &ItemImpl) -> HashSet<String> {
     item_impl
         .generics
         .params
         .iter()
-        .filter_map(|p| match p {
-            syn::GenericParam::Type(t) => Some(t.ident.to_string()),
-            syn::GenericParam::Const(c) => Some(c.ident.to_string()),
-            _ => None,
+        .map(|p| match p {
+            syn::GenericParam::Type(t) => t.ident.to_string(),
+            syn::GenericParam::Const(c) => c.ident.to_string(),
+            // Lifetimes count too. Leaving them out let a predicate naming a SIBLING's lifetime
+            // (`where &'a str: Clone`) past the "declares everything it mentions" guard and into
+            // an impl with no `'a` of its own — E0261 on code that is valid without the macro.
+            // `freshen_binder_lifetimes` does not help: it renames `for<>` binders, not free
+            // lifetimes.
+            syn::GenericParam::Lifetime(l) => l.lifetime.ident.to_string(),
         })
         .collect()
 }
@@ -130,6 +135,15 @@ fn pred_idents(pred: &WherePredicate) -> HashSet<String> {
     impl syn::visit::Visit<'_> for V {
         fn visit_ident(&mut self, i: &Ident) {
             self.0.insert(i.to_string());
+        }
+        // `'static` and `'_` are always in scope, so they must not count as something the
+        // receiving impl has to declare — otherwise, now that `impl_param_idents` reports
+        // lifetimes, an ordinary `T: 'static` co-bound would never be shared. Deliberately does
+        // not recurse: the default impl would feed the bare ident to `visit_ident`.
+        fn visit_lifetime(&mut self, lt: &syn::Lifetime) {
+            if lt.ident != "static" && lt.ident != "_" {
+                self.0.insert(lt.ident.to_string());
+            }
         }
     }
     let mut v = V(HashSet::new());

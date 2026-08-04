@@ -177,25 +177,35 @@ pub(crate) fn codegen_scc(model: &Model, scc: &Scc) -> syn::Result<TokenStream> 
     Ok(out)
 }
 
-/// `#[repr(transparent)] <vis> struct __MTerm<params>(<vis> M<params>);` — the per-member terminator, a
-/// same-layout wrapper of the natural type. Its visibility (and its field's) matches `M`, so wrapping a
-/// private cycle type doesn't expose it through a `pub` interface (no `private_interfaces`).
+/// `#[repr(transparent)] <vis> struct __MTerm<params>(<vis> M<params>) <where M's own clause>;` — the
+/// per-member terminator, a same-layout wrapper of the natural type. Its visibility (and its field's)
+/// matches `M`, so wrapping a private cycle type doesn't expose it through a `pub` interface (no
+/// `private_interfaces`).
+///
+/// The wrapped type's predicates **come along, in both spellings**: inline bounds via
+/// `DeclBounds::Keep` (`enum Expr<S: Span>`) and the `where`-clause verbatim (`where S: Clone`).
+/// Without them a type whose own well-formedness needs a predicate gives a wrapper whose single field
+/// is ill-formed — `E0277 … required by a bound in Expr`, reported against the *generated* struct and
+/// therefore reading as if the caller's type were at fault. `Bare` is right for the impl generics
+/// below (the impl re-states what it needs) but never for this wrapper, which must be exactly as
+/// constrained as what it wraps.
 pub(crate) fn make_term_item(member: &Adt, nonce: u64) -> TokenStream {
     let term = term_ident(&member.ident.to_string(), nonce);
     let m_id = &member.ident;
     let vis = member.vis();
-    let decl = params_decl(&member.generics, DeclBounds::Bare);
+    let decl = params_decl(&member.generics, DeclBounds::Keep);
     let uses = params_use(&member.generics);
     let decl_angle = wrap_angle(&decl);
     let use_angle = wrap_angle(&uses);
     // Replicate the type's `#[cfg]`s so a cfg-gated cyclic type's terminator strips with it (else the
     // terminator would wrap a type rustc removed → E0412).
     let cfgs = crate::extract_cfg_attrs(member.attrs());
+    let where_clause = member.generics.where_clause.as_ref();
     quote! {
         #(#cfgs)*
         #[repr(transparent)]
         #[allow(dead_code)]
-        #vis struct #term #decl_angle ( #vis #m_id #use_angle );
+        #vis struct #term #decl_angle ( #vis #m_id #use_angle ) #where_clause ;
     }
 }
 
@@ -806,6 +816,15 @@ fn type_mentions(ty: &Type, idents: &HashSet<String>) -> bool {
     found
 }
 
+/// Does `path` mention any of `idents` — as a segment, a type argument, **or inside an
+/// associated-type binding**?
+///
+/// The binding case is not a detail: a cyclic bound of the form `Tr<Assoc = X>` puts `X` somewhere no
+/// type *argument* appears, and `X` is very often an invented impl generic (syan's `Spanned` cyclic
+/// bound always carries `Span = __Syan_Span`). Missing it made the forwarding-assertion guard above
+/// fail to fire, and the assertion was then emitted referring to a parameter that is not in scope
+/// inside its `const _` block — `E0412: cannot find type __Syan_Span`, pointing at the macro rather
+/// than at anything the caller wrote.
 fn path_mentions(path: &syn::Path, idents: &HashSet<String>) -> bool {
     let mut found = false;
     for seg in &path.segments {
@@ -814,10 +833,18 @@ fn path_mentions(path: &syn::Path, idents: &HashSet<String>) -> bool {
         }
         if let PathArguments::AngleBracketed(ab) = &seg.arguments {
             for a in &ab.args {
-                if let GenericArgument::Type(t) = a {
-                    if type_mentions(t, idents) {
-                        found = true;
-                    }
+                let mentions = match a {
+                    GenericArgument::Type(t) => type_mentions(t, idents),
+                    GenericArgument::AssocType(at) => type_mentions(&at.ty, idents),
+                    // A `Tr<Assoc: Bound>` constraint can name a param in the bound itself.
+                    GenericArgument::Constraint(c) => c.bounds.iter().any(|b| match b {
+                        syn::TypeParamBound::Trait(tb) => path_mentions(&tb.path, idents),
+                        _ => false,
+                    }),
+                    _ => false,
+                };
+                if mentions {
+                    found = true;
                 }
             }
         }

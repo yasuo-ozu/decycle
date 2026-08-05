@@ -1,0 +1,5 @@
+error: #[decycle] is already applied to this module
+ --> tests/ui/double_decycle_module.rs:6:1
+  |
+6 | #[decycle::decycle]
+  | ^

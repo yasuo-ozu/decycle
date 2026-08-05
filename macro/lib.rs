@@ -18,6 +18,20 @@ struct Args {
     recurse_level: Option<usize>,
     support_infinite_cycle: Option<bool>,
     structural: bool,
+    /// First repeated keyword seen: the SECOND occurrence's span, plus the keyword name. A repeat
+    /// used to silently last-win; it is now rejected — but only AFTER the item is processed and
+    /// `set_dummy` holds a valid expansion, so the abort does not cascade (see `reject_duplicate`).
+    duplicate: Option<(proc_macro2::Span, &'static str)>,
+}
+
+impl Args {
+    /// Record a repeated keyword (keeping the FIRST value, purely so parsing can finish — the
+    /// duplicate is rejected before any of it matters).
+    fn note_duplicate(&mut self, span: proc_macro2::Span, name: &'static str) {
+        if self.duplicate.is_none() {
+            self.duplicate = Some((span, name));
+        }
+    }
 }
 
 impl Parse for Args {
@@ -30,6 +44,7 @@ impl Parse for Args {
             recurse_level: None,
             support_infinite_cycle: None,
             structural: false,
+            duplicate: None,
         };
         syn::custom_keyword!(decycle);
         syn::custom_keyword!(marker);
@@ -41,37 +56,67 @@ impl Parse for Args {
         while !input.is_empty() {
             let lookahead = input.lookahead1();
             if lookahead.peek(structural) {
-                input.parse::<structural>()?;
+                let kw: structural = input.parse()?;
+                if args.structural {
+                    args.note_duplicate(kw.span, "structural");
+                }
                 args.structural = true;
             } else if lookahead.peek(decycle) {
-                input.parse::<decycle>()?;
+                let kw: decycle = input.parse()?;
                 input.parse::<Token![=]>()?;
-                args.decycle = Some(input.parse()?);
+                let value = input.parse()?;
+                if args.decycle.is_some() {
+                    args.note_duplicate(kw.span, "decycle");
+                } else {
+                    args.decycle = Some(value);
+                }
             } else if lookahead.peek(marker) {
-                input.parse::<marker>()?;
+                let kw: marker = input.parse()?;
                 input.parse::<Token![=]>()?;
-                args.marker = Some(input.parse()?);
+                let value = input.parse()?;
+                if args.marker.is_some() {
+                    args.note_duplicate(kw.span, "marker");
+                } else {
+                    args.marker = Some(value);
+                }
             } else if lookahead.peek(alter_macro_name) {
-                input.parse::<alter_macro_name>()?;
+                let kw: alter_macro_name = input.parse()?;
                 input.parse::<Token![=]>()?;
-                args.alter_macro_name = Some(input.parse()?);
+                let value = input.parse()?;
+                if args.alter_macro_name.is_some() {
+                    args.note_duplicate(kw.span, "alter_macro_name");
+                } else {
+                    args.alter_macro_name = Some(value);
+                }
             } else if lookahead.peek(allowed_paths) {
-                input.parse::<allowed_paths>()?;
+                let kw: allowed_paths = input.parse()?;
                 input.parse::<Token![=]>()?;
                 let content;
                 bracketed!(content in input);
                 let paths = content.parse_terminated(Path::parse, Token![,])?;
-                args.allowed_paths = Some(paths.into_iter().collect());
+                if args.allowed_paths.is_some() {
+                    args.note_duplicate(kw.span, "allowed_paths");
+                } else {
+                    args.allowed_paths = Some(paths.into_iter().collect());
+                }
             } else if lookahead.peek(recurse_level) {
-                input.parse::<recurse_level>()?;
+                let kw: recurse_level = input.parse()?;
                 input.parse::<Token![=]>()?;
                 let lit: LitInt = input.parse()?;
-                args.recurse_level = Some(lit.base10_parse()?);
+                if args.recurse_level.is_some() {
+                    args.note_duplicate(kw.span, "recurse_level");
+                } else {
+                    args.recurse_level = Some(lit.base10_parse()?);
+                }
             } else if lookahead.peek(support_infinite_cycle) {
-                input.parse::<support_infinite_cycle>()?;
+                let kw: support_infinite_cycle = input.parse()?;
                 input.parse::<Token![=]>()?;
                 let lit: LitBool = input.parse()?;
-                args.support_infinite_cycle = Some(lit.value);
+                if args.support_infinite_cycle.is_some() {
+                    args.note_duplicate(kw.span, "support_infinite_cycle");
+                } else {
+                    args.support_infinite_cycle = Some(lit.value);
+                }
             } else {
                 abort!(
                     input.span(),
@@ -86,14 +131,52 @@ impl Parse for Args {
     }
 }
 
+/// Reject the first repeated keyword argument, pointing at its SECOND occurrence.
+///
+/// Called only after `set_dummy` holds the processed item, so the abort emits exactly one error —
+/// the same no-cascade ordering the unsupported-argument rejections already follow.
+fn reject_duplicate(args: &Args) {
+    if let Some((span, name)) = &args.duplicate {
+        abort!(span, "duplicate argument '{}'", name);
+    }
+}
+
+/// The span of a still-pending `#[decycle]` attribute on the item itself — the shape left behind
+/// when `#[decycle]` is written TWICE on one item: attribute macros expand outermost-first, so the
+/// outer invocation sees the inner attribute verbatim in the item's `attrs`. Letting it through
+/// used to fail incomprehensibly later (the inner expansion trips over the outer's generated
+/// paths on a module, and redefines names on a trait — E0252 with an unusable rustc suggestion).
+///
+/// Matches the same spellings `decycle_impl::is_decycle_attribute` accepts on inner items: bare
+/// `#[decycle]`, or two-segment `#[<crate>::decycle]` where `<crate>` is `decycle` or the leading
+/// segment of the `decycle = …` path argument.
+fn pending_decycle_attr(attrs: &[Attribute], decycle_path: &Path) -> Option<proc_macro2::Span> {
+    let decycle_crate = decycle_path.segments.first().map(|seg| &seg.ident);
+    attrs.iter().find_map(|attr| {
+        let path = attr.path();
+        let matched = path.is_ident("decycle")
+            || (path.segments.len() == 2
+                && (path.segments[0].ident == "decycle"
+                    || Some(&path.segments[0].ident) == decycle_crate)
+                && path.segments[1].ident == "decycle");
+        matched.then(|| syn::spanned::Spanned::span(attr))
+    })
+}
+
 #[proc_macro_error]
 #[proc_macro_attribute]
 pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
     set_dummy(input.clone().into());
     let args = parse_macro_input!(attr as Args);
-    let decycle_path = args.decycle.unwrap_or_else(|| parse_quote!(::decycle));
+    let decycle_path = args.decycle.clone().unwrap_or_else(|| parse_quote!(::decycle));
 
     if let Ok(module) = parse::<ItemMod>(input.clone()) {
+        // Applied twice? Abort here, where it can still be said plainly. The dummy is the raw
+        // input, whose remaining `#[decycle]` will expand the original module cleanly — so this
+        // stays a single error.
+        if let Some(span) = pending_decycle_attr(&module.attrs, &decycle_path) {
+            abort!(span, "#[decycle] is already applied to this module")
+        }
         // Fail closed up front, for BOTH engines, on an empty `#[decycle]` module: a bodyless
         // `mod m;` or an empty `mod m {}` has nothing to expand.
         if module
@@ -130,6 +213,7 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
         // Process FIRST so the dummy fallback is the (valid) expanded module, THEN reject unsupported
         // args — matching the original ordering so an unsupported-arg abort doesn't cascade.
         set_dummy(quote!(#ret));
+        reject_duplicate(&args);
         if let Some(marker) = &args.marker {
             abort!(marker, "unsupported argument 'marker'")
         }
@@ -144,6 +228,12 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
         }
         ret.into()
     } else if let Ok(item) = parse::<ItemTrait>(input.clone()) {
+        // Applied twice? Same detection as the module branch, same reasoning: the outer invocation
+        // sees the inner attribute still attached and would otherwise expand right over it,
+        // re-defining the trait name (E0252) with a rustc suggestion that isn't valid Rust.
+        if let Some(span) = pending_decycle_attr(&item.attrs, &decycle_path) {
+            abort!(span, "#[decycle] is already applied to this trait")
+        }
         let mut config = type_leak::LeakerConfig::new();
         if let Some(paths) = &args.allowed_paths {
             config.allowed_paths.extend(paths.clone());
@@ -159,6 +249,7 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
             config,
         );
         set_dummy(quote!(#ret));
+        reject_duplicate(&args);
         if args.recurse_level.is_some() {
             abort!(
                 Span::call_site(),
@@ -169,6 +260,13 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
             abort!(
                 Span::call_site(),
                 "support_infinite_cycle is not supported for trait items"
+            )
+        }
+        if args.structural {
+            abort!(
+                Span::call_site(),
+                "structural is not supported for trait items";
+                hint = "structural selects the module-level engine; write it on the enclosing #[decycle(structural)] mod instead"
             )
         }
         ret.into()

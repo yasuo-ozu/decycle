@@ -30,7 +30,7 @@
 use crate::helper::{strip_leading_self, type_head_ident};
 use crate::safegraph::graph::Graph;
 use crate::safegraph::VecGraph;
-use proc_macro2::{Ident, Span};
+use proc_macro2::Ident;
 use std::collections::{HashMap, HashSet};
 use syn::visit::Visit;
 use syn::{Item, ItemImpl, ItemMod, Path, TraitBound, Type, TypeParamBound, UseTree, WherePredicate};
@@ -58,7 +58,8 @@ pub enum EdgeKind {
 /// bound reaches, labelled by how it was reached.
 ///
 /// `decycle` is the path the caller passes to an engine (e.g. `::my_crate::__decycle`); only its
-/// first segment is used, to recognise `#[<crate>::decycle]` alongside the bare `#[decycle]`.
+/// first segment is used, to recognise `#[<crate>::decycle]` alongside the bare `#[decycle]`. A
+/// path with no segments names no crate, so nothing is routed and the graph is empty.
 ///
 /// Not represented, deliberately:
 /// - bounds whose target is `Self` or one of the impl's own type parameters — those name no other
@@ -69,7 +70,11 @@ pub fn analyze_module(module: &ItemMod, decycle: &Path) -> VecGraph<Ident, EdgeK
     let Some((_, items)) = module.content.as_ref() else {
         return VecGraph::default();
     };
-    let decycle_crate = &decycle.segments.first().expect("empty decycle path").ident;
+    // An empty path can only be hand-built, but this is a public API: fail soft, not via `expect`.
+    let Some(first_segment) = decycle.segments.first() else {
+        return VecGraph::default();
+    };
+    let decycle_crate = &first_segment.ident;
     let routed = routed_traits(items, decycle_crate);
     build(items, &routed, Spelling::BareOnly)
 }
@@ -84,8 +89,8 @@ pub fn analyze_module(module: &ItemMod, decycle: &Path) -> VecGraph<Ident, EdgeK
 /// already been spelled for the engine and therefore honours the qualified opt-out.
 ///
 /// Feed the result through [`cyclic_subgraph`] to get the participants, then pass that to
-/// [`crate::ranked::process_module_with_graph`] with `contract: true` — which re-spells the impls from
-/// it, closing the loop.
+/// [`crate::ranked::process_module_with_graph`] with `emit_contracts` set to `true` — which
+/// re-spells the impls from it, closing the loop.
 pub fn analyze_items(items: &[Item], routed: &HashSet<Ident>) -> VecGraph<Ident, EdgeKind> {
     build(items, routed, Spelling::AnySpelling)
 }
@@ -103,9 +108,11 @@ fn build(items: &[Item], routed: &HashSet<Ident>, how: Spelling) -> VecGraph<Ide
     let mut graph = VecGraph::default();
     let participants = participants(items, routed, how);
 
-    // Deterministic node order, so the indices a caller sees are reproducible across runs.
-    let mut names: Vec<String> = participants.iter().map(|i| i.to_string()).collect();
-    names.sort();
+    // Deterministic node order, so the indices a caller sees are reproducible across runs. The
+    // idents themselves are CLONED from the source — never re-created via `Ident::new`, which
+    // rejects the `to_string()` rendering of a raw identifier (`"r#loop"`).
+    let mut node_idents: Vec<Ident> = participants.iter().cloned().collect();
+    node_idents.sort_by_key(|i| i.to_string());
 
     // Collect edges before touching the graph: `scope_mut` hands out scope-local indices, so nodes
     // and edges have to be inserted together inside one scope.
@@ -133,13 +140,14 @@ fn build(items: &[Item], routed: &HashSet<Ident>, how: Spelling) -> VecGraph<Ide
     // `VecGraph` is `Vec`-backed, so its indices are not stable across removals and `insert_node`
     // is only offered inside a scope. Nothing is removed here, so one scope covers the whole build.
     graph.scope_mut(|mut ctx| {
-        let index: HashMap<String, _> = names
-            .iter()
-            .map(|name| {
+        let index: HashMap<String, _> = node_idents
+            .into_iter()
+            .map(|ident| {
+                let name = ident.to_string();
                 let ix = ctx
-                    .insert_node(Ident::new(name, Span::call_site()))
+                    .insert_node(ident)
                     .expect("insertion into a fresh VecGraph cannot fail");
-                (name.clone(), ix)
+                (name, ix)
             })
             .collect();
         for (from, to, kind) in &edges {
@@ -232,6 +240,20 @@ fn bound_edges(
     let Some(where_clause) = im.generics.where_clause.as_ref() else {
         return Vec::new();
     };
+    // The impl's own type parameters. A bound on one of them (`impl<Stmt> Tr for Expr where
+    // Stmt: Tr`) targets the parameter, not a same-named participant it may shadow — the doc
+    // above promises such bounds are not represented, and the engine's own matchers
+    // (`remove_cyclic_bounds` / `cyclic_where_bounds` in `ranked/finalize.rs`) already consult
+    // exactly this set.
+    let param_idents: HashSet<Ident> = im
+        .generics
+        .params
+        .iter()
+        .filter_map(|p| match p {
+            syn::GenericParam::Type(t) => Some(t.ident.clone()),
+            _ => None,
+        })
+        .collect();
     let mut out = Vec::new();
     for pred in &where_clause.predicates {
         let WherePredicate::Type(pt) = pred else {
@@ -239,6 +261,14 @@ fn bound_edges(
         };
         if !pt.bounds.iter().any(|b| is_routed_bound(b, routed, how)) {
             continue;
+        }
+        // Target is `Self` or a bare impl type param: no second endpoint, no edge (documented).
+        if let Type::Path(syn::TypePath { qself: None, path }) = &pt.bounded_ty {
+            if path.is_ident("Self")
+                || (path.segments.len() == 1 && param_idents.contains(&path.segments[0].ident))
+            {
+                continue;
+            }
         }
         match type_head_ident(&pt.bounded_ty) {
             // The head is itself a participant — the bound names it outright.
@@ -291,47 +321,42 @@ fn nested_participants(ty: &Type, participants: &HashSet<Ident>) -> Vec<Ident> {
     v.out
 }
 
-/// Read a graph back out as `(node names, (from, to, kind) edges)`, both in insertion order.
+/// Read a graph back out as `(nodes, (from, to, kind) edges)`, nodes in enumeration order and
+/// edges referring to nodes by **position** in that order — not by name, so two same-named nodes
+/// in a caller-built graph stay distinct through a round-trip.
 ///
 /// Indices of a `Vec`-backed graph only exist inside a scope, so anything that inspects one has to
 /// do it here and hand out owned data.
-fn decompose(
-    graph: &VecGraph<Ident, EdgeKind>,
-) -> (Vec<Ident>, Vec<(String, String, EdgeKind)>) {
+fn decompose(graph: &VecGraph<Ident, EdgeKind>) -> (Vec<Ident>, Vec<(usize, usize, EdgeKind)>) {
     graph.scope(|ctx| {
-        let nodes: Vec<Ident> = ctx.node_indices().map(|n| ctx.node(n).clone()).collect();
+        let order: Vec<_> = ctx.node_indices().collect();
+        let pos: HashMap<_, usize> = order.iter().enumerate().map(|(i, ix)| (*ix, i)).collect();
+        let nodes: Vec<Ident> = order.iter().map(|ix| ctx.node(*ix).clone()).collect();
         let edges = ctx
             .edge_indices()
             .map(|e| {
                 let [a, b] = ctx.endpoints(e);
-                (
-                    ctx.node(a).to_string(),
-                    ctx.node(b).to_string(),
-                    *ctx.edge(e),
-                )
+                (pos[&a], pos[&b], *ctx.edge(e))
             })
             .collect();
         (nodes, edges)
     })
 }
 
-/// Assemble a graph from node names and `(from, to, kind)` edges. Edges naming an absent node are
-/// dropped; nodes are inserted in the order given.
-fn compose(nodes: Vec<Ident>, edges: Vec<(String, String, EdgeKind)>) -> VecGraph<Ident, EdgeKind> {
+/// Assemble a graph from nodes and `(from, to, kind)` edges given by node **position**. Edges
+/// referring to an absent position are dropped; nodes are inserted in the order given.
+fn compose(nodes: Vec<Ident>, edges: Vec<(usize, usize, EdgeKind)>) -> VecGraph<Ident, EdgeKind> {
     let mut out = VecGraph::default();
     out.scope_mut(|mut ctx| {
-        let index: HashMap<String, _> = nodes
+        let index: Vec<_> = nodes
             .into_iter()
             .map(|n| {
-                let key = n.to_string();
-                let ix = ctx
-                    .insert_node(n)
-                    .expect("insertion into a fresh VecGraph cannot fail");
-                (key, ix)
+                ctx.insert_node(n)
+                    .expect("insertion into a fresh VecGraph cannot fail")
             })
             .collect();
         for (from, to, kind) in edges {
-            if let (Some(a), Some(b)) = (index.get(&from), index.get(&to)) {
+            if let (Some(a), Some(b)) = (index.get(from), index.get(to)) {
                 ctx.insert_edge(kind, [*a, *b])
                     .expect("both endpoints exist");
             }
@@ -351,34 +376,49 @@ fn compose(nodes: Vec<Ident>, edges: Vec<(String, String, EdgeKind)>) -> VecGrap
 /// them recurse, rather than implementing a reachability search of its own. The result is in the
 /// shape [`crate::ranked::process_module_with_graph`] wants.
 pub fn cyclic_subgraph(graph: &VecGraph<Ident, EdgeKind>) -> VecGraph<Ident, EdgeKind> {
-    let (nodes, edges) = decompose(graph);
-    let self_looped: HashSet<String> = edges
-        .iter()
-        .filter(|(a, b, _)| a == b)
-        .map(|(a, _, _)| a.clone())
-        .collect();
-
-    let cyclic: HashSet<String> = graph.scope(|ctx| {
-        let mut out = HashSet::new();
+    // Everything is computed inside ONE scope, keyed by node position rather than by name, so a
+    // caller-built graph with two same-named nodes keeps them distinct throughout.
+    let (nodes, edges, cyclic) = graph.scope(|ctx| {
+        let order: Vec<_> = ctx.node_indices().collect();
+        let pos: HashMap<_, usize> = order.iter().enumerate().map(|(i, ix)| (*ix, i)).collect();
+        let nodes: Vec<Ident> = order.iter().map(|ix| ctx.node(*ix).clone()).collect();
+        let edges: Vec<(usize, usize, EdgeKind)> = ctx
+            .edge_indices()
+            .map(|e| {
+                let [a, b] = ctx.endpoints(e);
+                (pos[&a], pos[&b], *ctx.edge(e))
+            })
+            .collect();
+        let self_looped: HashSet<usize> = edges
+            .iter()
+            .filter(|(a, b, _)| a == b)
+            .map(|(a, _, _)| *a)
+            .collect();
+        let mut cyclic: HashSet<usize> = HashSet::new();
         for component in crate::safegraph::algo::connectivity::tarjan_scc(ctx) {
-            let names: Vec<String> = component
-                .iter()
-                .map(|ix| ctx.node(*ix).to_string())
-                .collect();
-            if names.len() > 1 || names.iter().any(|n| self_looped.contains(n)) {
-                out.extend(names);
+            let members: Vec<usize> = component.iter().map(|ix| pos[ix]).collect();
+            if members.len() > 1 || members.iter().any(|p| self_looped.contains(p)) {
+                cyclic.extend(members);
             }
         }
-        out
+        (nodes, edges, cyclic)
     });
 
+    // Retained nodes keep their relative order; edge endpoints are remapped into that subsequence.
+    let remap: HashMap<usize, usize> = (0..nodes.len())
+        .filter(|i| cyclic.contains(i))
+        .enumerate()
+        .map(|(new, old)| (old, new))
+        .collect();
     let nodes = nodes
         .into_iter()
-        .filter(|n| cyclic.contains(&n.to_string()))
+        .enumerate()
+        .filter(|(i, _)| cyclic.contains(i))
+        .map(|(_, n)| n)
         .collect();
     let edges = edges
         .into_iter()
-        .filter(|(a, b, _)| cyclic.contains(a) && cyclic.contains(b))
+        .filter_map(|(a, b, kind)| Some((*remap.get(&a)?, *remap.get(&b)?, kind)))
         .collect();
     compose(nodes, edges)
 }

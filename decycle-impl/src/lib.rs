@@ -203,6 +203,28 @@ fn get_random() -> u64 {
     identity_to_u64(&get_crate_identity())
 }
 
+/// A fresh value identifying ONE macro invocation.
+///
+/// Deliberately random, and deliberately not a counter. A process-wide counter is wrong under
+/// incremental compilation: only a subset of invocations are re-expanded, so the value a given
+/// piece of source gets depends on which other invocations happened to run in the same process —
+/// it is neither stable for one item nor reliably distinct between two.
+///
+/// Nothing outside the emitting expansion depends on this value, so it does not need to be
+/// reproducible: the temporal macro and the `use <macro> as <Trait>` alias that renames it are
+/// emitted together in a single token stream, and every call site refers to the trait's own ident
+/// through that alias. The mangled name is never reconstructed anywhere, and a `macro_rules!` name
+/// does not reach the compiled artifact.
+///
+/// `RandomState` is std's own entropy source, so this needs no extra dependency and keeps no
+/// shared mutable state of ours.
+fn fresh_invocation_id() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
+}
+
 fn get_crate_identity() -> String {
     "decycle".to_string()
 }

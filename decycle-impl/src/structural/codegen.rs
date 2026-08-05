@@ -35,6 +35,13 @@ pub(crate) fn subst_self(ty: &Type, replacement: &Type) -> Type {
         Type::Path(tp) if tp.qself.is_none() && tp.path.is_ident("Self") => replacement.clone(),
         Type::Path(tp) => {
             let mut tp = tp.clone();
+            // A `Self` in qself position (`<Self as Tr>::Out`) is substituted too. (Callers resolve
+            // `Self`-rooted projections via `normalize_projections` FIRST, so by the time a type
+            // reaches this substitution no unresolvable projection remains — this arm is
+            // belt-and-braces for the resolvable leftovers.)
+            if let Some(q) = &mut tp.qself {
+                q.ty = Box::new(subst_self(&q.ty, replacement));
+            }
             for seg in tp.path.segments.iter_mut() {
                 subst_self_in_args(&mut seg.arguments, replacement);
             }
@@ -270,8 +277,21 @@ fn make_impls(model: &Model, scc: &Scc, im: &ImplBlock) -> syn::Result<TokenStre
     // Pass 2: methods.
     for it in &im.item.items {
         if let ImplItem::Fn(f) = it {
-            term_methods.extend(rec_method(f, &natural, &local, &assoc_items, model.nonce)?);
-            nat_methods.extend(nat_method(f, &term_ty, &trait_path, model.nonce)?);
+            term_methods.extend(rec_method(
+                f,
+                &natural,
+                &local,
+                &assoc_items,
+                &trait_path,
+                model.nonce,
+            )?);
+            nat_methods.extend(nat_method(
+                f,
+                &term_ty,
+                &trait_path,
+                &assoc_items,
+                model.nonce,
+            )?);
         }
     }
 
@@ -323,10 +343,12 @@ fn rec_method(
     natural: &Type,
     reduced: &syn::Generics,
     assoc_items: &[&ImplItem],
+    trait_path: &syn::Path,
     nonce: u64,
 ) -> syn::Result<TokenStream> {
     let attrs = &f.attrs;
     let vis = &f.vis;
+    let ctx = ProjCtx::new(assoc_items, trait_path);
     // `async fn` returns an OPAQUE future (`impl Future`). The dispatch would `transmute_copy` the
     // terminator's future into the natural type's future — two distinct anonymous types — which is
     // unsound (the layout cast reinterprets an un-polled future). The size guard catches it only when
@@ -357,7 +379,11 @@ fn rec_method(
     // those concrete forms.
     for input in &f.sig.inputs {
         if let syn::FnArg::Typed(pt) = input {
-            if has_self_mentioning_impl_trait(&pt.ty) {
+            // Resolve `Self::Out`-style projections first, so the check sees what the type MEANS
+            // (`impl Fn(&Self::Out)` with `type Out = Self` is the unnameable shape; with
+            // `type Out = i64` it is harmless). Unresolvable projections error here, up-front.
+            let nty = normalize_projections(&pt.ty, &ctx, 0)?;
+            if has_self_mentioning_impl_trait(&nty) {
                 return Err(syn::Error::new_spanned(
                     &pt.ty,
                     "#[decycle(structural)]: an argument-position `impl Trait` that mentions `Self` \
@@ -368,8 +394,10 @@ fn rec_method(
         }
     }
     // Rewrite destructured / `mut` / `ref` params to fresh idents so the dispatch can forward them;
-    // the original patterns are rebound at the top of the body.
-    let (norm_sig, rebinds) = normalize_sig(&f.sig, nonce);
+    // the original patterns are rebound at the top of the body. A `mut self` receiver's `mut` is
+    // stripped the same way (it is a pattern, illegal in the bodiless `__run` decl) and returned so
+    // it can be re-applied on the body-holding impl fn below.
+    let (norm_sig, rebinds, receiver_mut) = normalize_sig(&f.sig, nonce);
     let outer_sig = &norm_sig;
     // Splice the user body's STATEMENTS (not the whole `{ .. }` block): re-wrapping the block as
     // `{ #body }` would double-brace a single-expression body (`{ { 1 } }`), tripping `unused_braces`
@@ -380,9 +408,29 @@ fn rec_method(
     let body_tr = body_ident(nonce);
     let run = run_ident(nonce);
 
-    // `fn __run(<normalized sig>)` — same signature, renamed.
+    // `fn __run(<normalized sig>)` — same signature, renamed. Its parameter/return types get their
+    // `Self` projections resolved too: a verbatim `<Self as Tr>::Out` would need a `Self: Tr` bound
+    // the local `__DecycleBody` trait deliberately does not have, and the resolved form is what the
+    // dispatch's cast target is computed from, so decl, impl and call site agree by construction.
     let mut run_sig = norm_sig.clone();
     run_sig.ident = run.clone();
+    for input in run_sig.inputs.iter_mut() {
+        if let syn::FnArg::Typed(pt) = input {
+            pt.ty = Box::new(normalize_projections(&pt.ty, &ctx, 0)?);
+        }
+    }
+    if let ReturnType::Type(_, t) = &mut run_sig.output {
+        *t = Box::new(normalize_projections(t, &ctx, 0)?);
+    }
+    // The body-holding impl fn carries the user's `mut self` back (stripped from the decl above) so
+    // the body's mutation of `self` still compiles; a by-value receiver's binding mode is free to
+    // differ between a trait decl and its impl.
+    let mut run_sig_impl = run_sig.clone();
+    if let Some(m) = receiver_mut {
+        if let Some(syn::FnArg::Receiver(r)) = run_sig_impl.inputs.first_mut() {
+            r.mutability = Some(m);
+        }
+    }
 
     let (impl_g, _, where_g) = reduced.split_for_impl();
     let trait_g = wrap_angle(&params_decl(reduced, DeclBounds::Bare)); // `<Span, Token>` for the trait decl
@@ -399,7 +447,7 @@ fn rec_method(
     if let Some(r) = outer_sig.receiver() {
         call_args.push(receiver_cast(r, natural, nonce));
     }
-    call_args.extend(forward_args(outer_sig, natural, nonce)?);
+    call_args.extend(forward_args(outer_sig, natural, &ctx, nonce)?);
     let turbofish = method_turbofish(outer_sig);
     let call = quote! {
         < #natural as #body_tr #use_g >::#run #turbofish ( #(#call_args),* )
@@ -427,7 +475,10 @@ fn rec_method(
             }
             impl #impl_g #body_tr #use_g for #natural #where_g {
                 #(#assoc_defs)*
-                #(#prop)* #run_sig { #(#rebinds)* #(#body_stmts)* }
+                // `run_sig_impl`, not `run_sig`: this copy carries the user's `mut self` back.
+                // The trait decl above must not have it (a receiver pattern is illegal in a
+                // bodiless fn), but the body below may well assign through `self`.
+                #(#prop)* #run_sig_impl { #(#rebinds)* #(#body_stmts)* }
             }
             #dispatch
         }
@@ -471,18 +522,24 @@ fn nat_method(
     f: &syn::ImplItemFn,
     closed_rec: &Type,
     trait_path: &syn::Path,
+    assoc_items: &[&ImplItem],
     nonce: u64,
 ) -> syn::Result<TokenStream> {
     let attrs = &f.attrs;
     let vis = &f.vis;
-    let (norm_sig, _) = normalize_sig(&f.sig, nonce);
+    // Same projection context as the terminator side, so both classify `Self::Out` identically —
+    // if they disagreed, one side would cast an argument the other forwards verbatim.
+    let ctx = ProjCtx::new(assoc_items, trait_path);
+    // The receiver's `mut` is dropped: this natural method only forwards, it never mutates
+    // `self`, and the binding mode of a by-value receiver is local to each fn.
+    let (norm_sig, _, _) = normalize_sig(&f.sig, nonce);
     let sig = &norm_sig;
     let name = &sig.ident;
     let mut call_args: Vec<TokenStream> = Vec::new();
     if let Some(r) = sig.receiver() {
         call_args.push(receiver_cast(r, closed_rec, nonce));
     }
-    call_args.extend(forward_args(sig, closed_rec, nonce)?);
+    call_args.extend(forward_args(sig, closed_rec, &ctx, nonce)?);
     // forward the method's own type/const generics (lifetimes inferred) so non-inferable params resolve
     let turbofish = method_turbofish(sig);
     let call = quote! { < #closed_rec as #trait_path >::#name #turbofish ( #(#call_args),* ) };
@@ -619,7 +676,17 @@ fn dyn_fn_adapter(
 /// Forward the non-receiver parameters (receiver handled separately). An argument whose type mentions
 /// `Self` (e.g. `other: &Self` in `PartialEq::eq`) is cast into `target`-space, exactly like the
 /// receiver; others pass through by ident.
-fn forward_args(sig: &syn::Signature, target: &Type, nonce: u64) -> syn::Result<Vec<TokenStream>> {
+///
+/// Types are first run through [`normalize_projections`], so a parameter typed via a `Self`
+/// projection is classified by what the projection RESOLVES to: `s: Self::Out` with
+/// `type Out = Self` is cast (as `Self`), with `type Out = i64` it is forwarded untouched — never
+/// cast on the strength of the spelling alone.
+fn forward_args(
+    sig: &syn::Signature,
+    target: &Type,
+    ctx: &ProjCtx,
+    nonce: u64,
+) -> syn::Result<Vec<TokenStream>> {
     let mut out = Vec::new();
     let cast = cast_ident(nonce);
     for a in &sig.inputs {
@@ -633,17 +700,29 @@ fn forward_args(sig: &syn::Signature, target: &Type, nonce: u64) -> syn::Result<
                     ))
                 }
             };
-            let ty = &pt.ty;
-            if mentions_self(ty) {
+            let ty = normalize_projections(&pt.ty, ctx, 0)?;
+            if mentions_self(&ty) {
                 // A trait object may NOT be punned: `dyn Fn(&A)` and `dyn Fn(&ATerm)` are
                 // different traits, so transmuting the wide pointer keeps a vtable naming the
                 // wrong one. They are the same size, so the size guard cannot catch it. Rebuild
                 // the object by coercion instead — see `dyn_fn_adapter`.
-                if let Some(adapter) = dyn_fn_adapter(ty, target, id, nonce)? {
+                if let Some(adapter) = dyn_fn_adapter(&ty, target, id, nonce)? {
                     out.push(adapter);
                     continue;
                 }
-                let dst = subst_self(ty, target);
+                // The same vtable forgery hides behind any other pointer shape (`Box<dyn ..>`,
+                // `&&dyn ..`, `fn(&dyn ..)`); none of those can be rebuilt by coercion here, so
+                // refuse them rather than pun them.
+                if contains_self_dyn(&ty) {
+                    return Err(syn::Error::new(
+                        pt.ty.span(),
+                        "#[decycle(structural)]: a trait object mentioning `Self` in this position \
+                         cannot be forwarded soundly (its vtable would name a different trait once \
+                         `Self` is substituted). Only a direct `&dyn Fn(..)` argument is rebuilt by \
+                         coercion; use that, a `fn(..)` pointer, or a generic parameter instead.",
+                    ));
+                }
+                let dst = subst_self(&ty, target);
                 out.push(quote! { unsafe { #cast::<#ty, #dst>(#id) } });
             } else {
                 out.push(quote!(#id));
@@ -660,34 +739,431 @@ fn forward_args(sig: &syn::Signature, target: &Type, nonce: u64) -> syn::Result<
 /// subpattern) is left alone — a `mut x` / `ref x` / destructured param must be rewritten too, else it
 /// lands verbatim in the bodiless trait method decl and trips `E0642` (patterns in a fn without a
 /// body) / the deny-by-default `patterns_in_fns_without_body` lint (for `mut`).
-fn normalize_sig(sig: &syn::Signature, nonce: u64) -> (syn::Signature, Vec<TokenStream>) {
+///
+/// The RECEIVER gets the same treatment: a by-value `mut self` (incl. `mut self: Box<Self>`) is a
+/// binding-mode pattern, illegal in the bodiless `__run` decl for the same reason — but `self` cannot
+/// be rebound with a `let`, so instead of a rebind the stripped `mut` token is RETURNED (third
+/// element) and re-applied by the caller onto the body-holding impl fn only, where the user's body
+/// still expects a mutable `self`. (`&mut self` has `reference` set and is untouched — there the
+/// `mut` is part of the type, not a pattern.)
+fn normalize_sig(
+    sig: &syn::Signature,
+    nonce: u64,
+) -> (syn::Signature, Vec<TokenStream>, Option<syn::token::Mut>) {
     let mut renamed = sig.clone();
     let mut rebinds = Vec::new();
+    let mut receiver_mut = None;
     for (i, input) in renamed.inputs.iter_mut().enumerate() {
-        if let syn::FnArg::Typed(pt) = input {
-            let is_plain_ident = matches!(&*pt.pat,
-                syn::Pat::Ident(pi)
-                    if pi.subpat.is_none() && pi.by_ref.is_none() && pi.mutability.is_none());
-            if !is_plain_ident {
-                let fresh = arg_ident(i, nonce);
-                let orig = (*pt.pat).clone();
-                rebinds.push(quote! { let #orig = #fresh; });
-                pt.pat = Box::new(parse_quote!(#fresh));
+        match input {
+            syn::FnArg::Receiver(r) if r.reference.is_none() && r.mutability.is_some() => {
+                receiver_mut = r.mutability.take();
+            }
+            syn::FnArg::Typed(pt) => {
+                let is_plain_ident = matches!(&*pt.pat,
+                    syn::Pat::Ident(pi)
+                        if pi.subpat.is_none() && pi.by_ref.is_none() && pi.mutability.is_none());
+                if !is_plain_ident {
+                    let fresh = arg_ident(i, nonce);
+                    let orig = (*pt.pat).clone();
+                    rebinds.push(quote! { let #orig = #fresh; });
+                    pt.pat = Box::new(parse_quote!(#fresh));
+                }
+            }
+            _ => {}
+        }
+    }
+    (renamed, rebinds, receiver_mut)
+}
+
+/// Whether `ty` mentions the `Self` type anywhere. Unlike [`walk_type`] (which visits only a path's
+/// LAST segment, the right granularity for ADT-name matching), this checks EVERY path segment plus
+/// the `qself` position and associated-type bindings — so `Self::Out`, `<Self as Tr>::Out` and
+/// `dyn Tr<Item = Self>` are all detected. Detection must err on the side of "mentions", because a
+/// missed `Self` is forwarded un-cast (E0308 at best).
+fn mentions_self(ty: &Type) -> bool {
+    match ty {
+        Type::Path(tp) => {
+            tp.qself.as_ref().is_some_and(|q| mentions_self(&q.ty))
+                || tp.path.segments.iter().any(|seg| {
+                    seg.ident == "Self" || args_mention_self(&seg.arguments)
+                })
+        }
+        Type::Reference(r) => mentions_self(&r.elem),
+        Type::Ptr(p) => mentions_self(&p.elem),
+        Type::Array(a) => mentions_self(&a.elem),
+        Type::Slice(s) => mentions_self(&s.elem),
+        Type::Paren(p) => mentions_self(&p.elem),
+        Type::Group(g) => mentions_self(&g.elem),
+        Type::Tuple(t) => t.elems.iter().any(mentions_self),
+        Type::BareFn(bf) => {
+            bf.inputs.iter().any(|i| mentions_self(&i.ty))
+                || matches!(&bf.output, syn::ReturnType::Type(_, t) if mentions_self(t))
+        }
+        Type::TraitObject(to) => bounds_mention_self(&to.bounds),
+        Type::ImplTrait(it) => bounds_mention_self(&it.bounds),
+        _ => false,
+    }
+}
+
+fn args_mention_self(args: &PathArguments) -> bool {
+    match args {
+        PathArguments::AngleBracketed(ab) => ab.args.iter().any(|a| match a {
+            GenericArgument::Type(t) => mentions_self(t),
+            GenericArgument::AssocType(at) => mentions_self(&at.ty),
+            GenericArgument::Constraint(c) => c.bounds.iter().any(|b| match b {
+                syn::TypeParamBound::Trait(tb) => {
+                    tb.path.segments.iter().any(|s| args_mention_self(&s.arguments))
+                }
+                _ => false,
+            }),
+            _ => false,
+        }),
+        PathArguments::Parenthesized(p) => {
+            p.inputs.iter().any(mentions_self)
+                || matches!(&p.output, syn::ReturnType::Type(_, t) if mentions_self(t))
+        }
+        PathArguments::None => false,
+    }
+}
+
+fn bounds_mention_self(
+    bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
+) -> bool {
+    bounds.iter().any(|b| match b {
+        syn::TypeParamBound::Trait(tb) => tb
+            .path
+            .segments
+            .iter()
+            .any(|s| s.ident == "Self" || args_mention_self(&s.arguments)),
+        _ => false,
+    })
+}
+
+/// Does `ty` contain a trait object whose bounds mention `Self` — in ANY position (`Box<dyn ..>`,
+/// `&&dyn ..`, `fn(&dyn ..)`)? Such an object must never reach the plain layout cast: `dyn Fn(&A)`
+/// and `dyn Fn(&ATerm)` are different traits, so punning the wide pointer (or a pointer leading to
+/// it) leaves a vtable naming the wrong trait, and both sides are pointer-sized so the size guard
+/// cannot see it. The one supported shape (a direct `&dyn Fn(..)` argument) is rebuilt by coercion
+/// in [`dyn_fn_adapter`] before this check runs; everything else is rejected.
+fn contains_self_dyn(ty: &Type) -> bool {
+    match ty {
+        Type::TraitObject(_) => mentions_self(ty),
+        Type::Reference(r) => contains_self_dyn(&r.elem),
+        Type::Ptr(p) => contains_self_dyn(&p.elem),
+        Type::Array(a) => contains_self_dyn(&a.elem),
+        Type::Slice(s) => contains_self_dyn(&s.elem),
+        Type::Paren(p) => contains_self_dyn(&p.elem),
+        Type::Group(g) => contains_self_dyn(&g.elem),
+        Type::Tuple(t) => t.elems.iter().any(contains_self_dyn),
+        Type::BareFn(bf) => {
+            bf.inputs.iter().any(|i| contains_self_dyn(&i.ty))
+                || matches!(&bf.output, syn::ReturnType::Type(_, t) if contains_self_dyn(t))
+        }
+        Type::Path(tp) => {
+            tp.qself.as_ref().is_some_and(|q| contains_self_dyn(&q.ty))
+                || tp.path.segments.iter().any(|seg| match &seg.arguments {
+                    PathArguments::AngleBracketed(ab) => ab.args.iter().any(|a| match a {
+                        GenericArgument::Type(t) => contains_self_dyn(t),
+                        GenericArgument::AssocType(at) => contains_self_dyn(&at.ty),
+                        _ => false,
+                    }),
+                    PathArguments::Parenthesized(p) => {
+                        p.inputs.iter().any(contains_self_dyn)
+                            || matches!(&p.output,
+                                syn::ReturnType::Type(_, t) if contains_self_dyn(t))
+                    }
+                    PathArguments::None => false,
+                })
+        }
+        _ => false,
+    }
+}
+
+/// Recursion cap for [`normalize_projections`] — guards against a self-referential associated-type
+/// definition (`type Out = Self::Out;`), which rustc itself rejects but must not hang the macro.
+const MAX_PROJ_DEPTH: u8 = 16;
+
+/// The impl's own associated-type definitions plus its trait name — the context in which a `Self`
+/// projection in a method signature can be resolved at macro time.
+struct ProjCtx {
+    /// assoc-type name → (definition type, whether the assoc type has its own generics).
+    assoc: BTreeMap<String, (Type, bool)>,
+    /// Last-segment ident of the trait this impl implements (the crate-wide coherence key).
+    trait_ident: String,
+}
+
+impl ProjCtx {
+    fn new(assoc_items: &[&ImplItem], trait_path: &syn::Path) -> Self {
+        let mut assoc = BTreeMap::new();
+        for it in assoc_items {
+            if let ImplItem::Type(t) = it {
+                assoc.insert(
+                    t.ident.to_string(),
+                    (t.ty.clone(), !t.generics.params.is_empty()),
+                );
+            }
+        }
+        let trait_ident = trait_path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .unwrap_or_default();
+        ProjCtx { assoc, trait_ident }
+    }
+}
+
+/// Is `ty` (through parens/groups) exactly the plain `Self` path?
+fn is_plain_self(ty: &Type) -> bool {
+    matches!(strip_group(ty),
+        Type::Path(tp) if tp.qself.is_none() && tp.path.is_ident("Self"))
+}
+
+/// Resolve every `Self`-rooted associated-type projection in `ty` against the impl's OWN assoc-type
+/// definitions, macro-side: `Self::Out` (and `<Self as Tr>::Out` for this impl's trait, and chains
+/// like `Self::Out::Inner`) is replaced by the definition of `Out`, recursively. This is what makes
+/// the cast decision correct — `type Out = Self` means the parameter must be cast into
+/// terminator-space, `type Out = i64` means it must NOT be — and what keeps the `__DecycleBody`
+/// `__run` signature legal (a verbatim `<Self as Tr>::Out` would demand a `Self: Tr` bound the local
+/// trait deliberately does not have).
+///
+/// Projections that cannot be resolved here are rejected with an explanation rather than emitted
+/// broken: `Self::X` where `X` is not defined in this impl (a supertrait's or another trait's assoc
+/// type), `<Self as OtherTrait>::X`, a projection whose base mentions `Self` without being `Self`
+/// (`<Box<Self> as Tr>::X`), and generic associated types.
+fn normalize_projections(ty: &Type, ctx: &ProjCtx, depth: u8) -> syn::Result<Type> {
+    if depth > MAX_PROJ_DEPTH {
+        return Err(syn::Error::new(
+            ty.span(),
+            "#[decycle(structural)]: recursion limit while resolving `Self::..` associated-type \
+             projections (self-referential associated type definition?)",
+        ));
+    }
+    match ty {
+        Type::Path(tp) => {
+            // `Self::Out[::Inner..]` — a bare Self-rooted projection.
+            if tp.qself.is_none()
+                && tp.path.leading_colon.is_none()
+                && tp.path.segments.len() >= 2
+                && tp.path.segments[0].ident == "Self"
+            {
+                let segs: Vec<syn::PathSegment> =
+                    tp.path.segments.iter().skip(1).cloned().collect();
+                return resolve_self_projection(&segs, ty.span(), ctx, depth);
+            }
+            if let Some(q) = &tp.qself {
+                let base = normalize_projections(&q.ty, ctx, depth + 1)?;
+                if is_plain_self(&base) {
+                    // `<Self as Tr>::Out[..]` (position ≥ 1) or `<Self>::Out[..]` (position 0).
+                    if q.position >= 1 {
+                        let tr_seg = &tp.path.segments[q.position - 1];
+                        if tr_seg.ident != ctx.trait_ident {
+                            return Err(syn::Error::new(
+                                ty.span(),
+                                format!(
+                                    "#[decycle(structural)]: a `Self` projection through a \
+                                     different trait (`<Self as {}>::..`) is not supported — the \
+                                     generated terminator implements only this impl's trait, so \
+                                     the projection would not resolve on it. Spell the concrete \
+                                     type instead.",
+                                    tr_seg.ident
+                                ),
+                            ));
+                        }
+                    }
+                    let segs: Vec<syn::PathSegment> =
+                        tp.path.segments.iter().skip(q.position).cloned().collect();
+                    if segs.is_empty() {
+                        return Ok(base);
+                    }
+                    return resolve_self_projection(&segs, ty.span(), ctx, depth);
+                }
+                if mentions_self(&base) {
+                    return Err(syn::Error::new(
+                        ty.span(),
+                        "#[decycle(structural)]: cannot resolve a qualified projection whose base \
+                         mentions `Self` without being `Self` (e.g. `<Box<Self> as Tr>::Out`). \
+                         Spell the concrete type instead.",
+                    ));
+                }
+                // Self-free base: keep the projection, normalizing base + segment arguments.
+                let mut tp2 = tp.clone();
+                tp2.qself.as_mut().unwrap().ty = Box::new(base);
+                for seg in tp2.path.segments.iter_mut() {
+                    normalize_in_args(&mut seg.arguments, ctx, depth)?;
+                }
+                return Ok(Type::Path(tp2));
+            }
+            let mut tp2 = tp.clone();
+            for seg in tp2.path.segments.iter_mut() {
+                normalize_in_args(&mut seg.arguments, ctx, depth)?;
+            }
+            Ok(Type::Path(tp2))
+        }
+        Type::Reference(r) => {
+            let mut r = r.clone();
+            r.elem = Box::new(normalize_projections(&r.elem, ctx, depth)?);
+            Ok(Type::Reference(r))
+        }
+        Type::Ptr(p) => {
+            let mut p = p.clone();
+            p.elem = Box::new(normalize_projections(&p.elem, ctx, depth)?);
+            Ok(Type::Ptr(p))
+        }
+        Type::Array(a) => {
+            let mut a = a.clone();
+            a.elem = Box::new(normalize_projections(&a.elem, ctx, depth)?);
+            Ok(Type::Array(a))
+        }
+        Type::Slice(s) => {
+            let mut s = s.clone();
+            s.elem = Box::new(normalize_projections(&s.elem, ctx, depth)?);
+            Ok(Type::Slice(s))
+        }
+        Type::Paren(p) => {
+            let mut p = p.clone();
+            p.elem = Box::new(normalize_projections(&p.elem, ctx, depth)?);
+            Ok(Type::Paren(p))
+        }
+        Type::Group(g) => {
+            let mut g = g.clone();
+            g.elem = Box::new(normalize_projections(&g.elem, ctx, depth)?);
+            Ok(Type::Group(g))
+        }
+        Type::Tuple(t) => {
+            let mut t2 = t.clone();
+            t2.elems.clear();
+            for e in &t.elems {
+                t2.elems.push(normalize_projections(e, ctx, depth)?);
+            }
+            Ok(Type::Tuple(t2))
+        }
+        Type::BareFn(bf) => {
+            let mut bf = bf.clone();
+            for input in bf.inputs.iter_mut() {
+                input.ty = normalize_projections(&input.ty, ctx, depth)?;
+            }
+            if let syn::ReturnType::Type(_, t) = &mut bf.output {
+                *t = Box::new(normalize_projections(t, ctx, depth)?);
+            }
+            Ok(Type::BareFn(bf))
+        }
+        Type::TraitObject(to) => {
+            let mut to = to.clone();
+            normalize_in_bounds(&mut to.bounds, ctx, depth)?;
+            Ok(Type::TraitObject(to))
+        }
+        Type::ImplTrait(it) => {
+            let mut it = it.clone();
+            normalize_in_bounds(&mut it.bounds, ctx, depth)?;
+            Ok(Type::ImplTrait(it))
+        }
+        other => Ok(other.clone()),
+    }
+}
+
+fn normalize_in_args(args: &mut PathArguments, ctx: &ProjCtx, depth: u8) -> syn::Result<()> {
+    match args {
+        PathArguments::AngleBracketed(ab) => {
+            for a in ab.args.iter_mut() {
+                match a {
+                    GenericArgument::Type(t) => *t = normalize_projections(t, ctx, depth)?,
+                    GenericArgument::AssocType(at) => {
+                        at.ty = normalize_projections(&at.ty, ctx, depth)?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        PathArguments::Parenthesized(p) => {
+            for t in p.inputs.iter_mut() {
+                *t = normalize_projections(t, ctx, depth)?;
+            }
+            if let syn::ReturnType::Type(_, t) = &mut p.output {
+                *t = Box::new(normalize_projections(t, ctx, depth)?);
+            }
+        }
+        PathArguments::None => {}
+    }
+    Ok(())
+}
+
+fn normalize_in_bounds(
+    bounds: &mut syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
+    ctx: &ProjCtx,
+    depth: u8,
+) -> syn::Result<()> {
+    for b in bounds.iter_mut() {
+        if let syn::TypeParamBound::Trait(tb) = b {
+            for seg in tb.path.segments.iter_mut() {
+                normalize_in_args(&mut seg.arguments, ctx, depth)?;
             }
         }
     }
-    (renamed, rebinds)
+    Ok(())
 }
 
-/// Whether `ty` mentions the `Self` type anywhere.
-fn mentions_self(ty: &Type) -> bool {
-    let mut found = false;
-    walk_type(ty, &mut |id| {
-        if id == "Self" {
-            found = true;
-        }
-    });
-    found
+/// Resolve the projection chain `Self::segs[0]::segs[1]::..` — `segs[0]` must be an associated type
+/// defined in THIS impl; its definition becomes the new base, and any remaining segments project off
+/// that (recursing while the base keeps resolving to `Self`).
+fn resolve_self_projection(
+    segs: &[syn::PathSegment],
+    span: Span,
+    ctx: &ProjCtx,
+    depth: u8,
+) -> syn::Result<Type> {
+    let first = &segs[0];
+    let name = first.ident.to_string();
+    let Some((def, has_generics)) = ctx.assoc.get(&name) else {
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "#[decycle(structural)]: cannot resolve the projection `Self::{name}` — `{name}` \
+                 is not an associated type defined in this impl (a supertrait's or another trait's \
+                 associated type?), so the engine cannot tell whether it names the cycle type. \
+                 Spell the concrete type instead.",
+            ),
+        ));
+    };
+    if *has_generics || !matches!(first.arguments, PathArguments::None) {
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "#[decycle(structural)]: generic associated type projections (`Self::{name}<..>`) \
+                 are not supported. Spell the concrete type instead.",
+            ),
+        ));
+    }
+    let base = normalize_projections(def, ctx, depth + 1)?;
+    if segs.len() == 1 {
+        return Ok(base);
+    }
+    // A chained projection `Self::Out::Inner`: keep resolving while the base is `Self` again …
+    if is_plain_self(&base) {
+        return resolve_self_projection(&segs[1..], span, ctx, depth + 1);
+    }
+    if mentions_self(&base) {
+        return Err(syn::Error::new(
+            span,
+            "#[decycle(structural)]: cannot resolve a chained `Self` projection whose intermediate \
+             type mentions `Self` without being `Self`. Spell the concrete type instead.",
+        ));
+    }
+    // … otherwise the rest projects off a Self-free base: emit `<base>::Rest` and let rustc resolve
+    // it (nothing left for the cast to care about).
+    let path = syn::Path {
+        leading_colon: None,
+        segments: segs[1..].iter().cloned().collect(),
+    };
+    Ok(Type::Path(syn::TypePath {
+        qself: Some(syn::QSelf {
+            lt_token: Default::default(),
+            ty: Box::new(base),
+            position: 0,
+            as_token: None,
+            gt_token: Default::default(),
+        }),
+        path,
+    }))
 }
 
 /// A cyclic `where`-predicate that was stripped and whose bounded type is a *wrapped* member

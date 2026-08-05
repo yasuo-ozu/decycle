@@ -276,6 +276,125 @@ fn validate_impl_where_bounds(
     }
 }
 
+/// For each impl of one routed trait, which of its siblings' premises it may inherit — the
+/// obligation-reachability scoping behind [`crate::ranked::sharing::share_side_predicates`].
+///
+/// `members` are the adopted impls of `trait_ident`, in group order; the result is indexed the same
+/// way: `sources[i]` lists the indices of the members whose premises member `i`'s rank chain can
+/// actually be obligated by, i.e. the members reachable from `i` over the trait's own cyclic-bound
+/// edges. Within one strongly connected component every member reaches every other, so a genuine
+/// cycle keeps the full union it always had; an impl with no obligation path to a sibling — a
+/// standalone acyclic impl, a member of a *different* disjoint cycle of the same trait, or two
+/// unrelated instantiations of one generic trait on disjoint types — inherits nothing from it.
+///
+/// An edge exists when a member's where-predicate carries a bound naming `trait_ident` in the
+/// spelling the engine ranks (bare or `self::`-qualified — matching `peel`/`validate`), and its
+/// target's head is another member's self-type head. Consistent with the rest of the engine (and
+/// with `analysis.rs`'s graph), nodes are identified by **head ident**: `impl Tr for A<u8>` and
+/// `impl Tr for A<i32>` share a node, so a bound `A<i32>: Tr` conservatively reaches both — the
+/// bound-to-impl matching is not finer-grained anywhere else either. A target that is `Self` or one
+/// of the impl's own generic params names no other member (and a param *shadowing* a member's name
+/// must not fabricate an edge), so it contributes none.
+fn sharing_sources(members: &[&ItemImpl], trait_ident: &Ident) -> Vec<Vec<usize>> {
+    use crate::safegraph::algo::dfs::Dfs;
+    use crate::safegraph::graph::Graph;
+    // Node key per member: its self type's head ident. An un-headed self type (`&A`, `(A, B)`)
+    // gets a synthetic key no bound can name: it can obligate others, never be obligated by ident.
+    let keys: Vec<String> = members
+        .iter()
+        .enumerate()
+        .map(|(i, im)| {
+            type_head_ident(&im.self_ty)
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| format!("#unheaded_{i}"))
+        })
+        .collect();
+    let member_heads: HashSet<&String> = keys.iter().collect();
+    let mut edges: Vec<(String, String)> = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    for (i, im) in members.iter().enumerate() {
+        let impl_type_params: HashSet<Ident> = im
+            .generics
+            .params
+            .iter()
+            .filter_map(|param| match param {
+                GenericParam::Type(ty) => Some(ty.ident.clone()),
+                _ => None,
+            })
+            .collect();
+        let Some(where_clause) = &im.generics.where_clause else {
+            continue;
+        };
+        for pred in &where_clause.predicates {
+            let WherePredicate::Type(pt) = pred else {
+                continue;
+            };
+            if is_local_impl_bound_target(&pt.bounded_ty, &impl_type_params) {
+                continue;
+            }
+            let names_this_trait = pt.bounds.iter().any(|b| {
+                let TypeParamBound::Trait(TraitBound { path, .. }) = b else {
+                    return false;
+                };
+                let mut path = path.clone();
+                crate::helper::strip_leading_self(&mut path);
+                path.segments.len() == 1 && path.segments[0].ident == *trait_ident
+            });
+            if !names_this_trait {
+                continue;
+            }
+            // Peeling already ran, so a surviving cyclic bound's own head names the member it
+            // obligates (or the bound is local, handled above).
+            let Some(head) = type_head_ident(&pt.bounded_ty) else {
+                continue;
+            };
+            let head = head.to_string();
+            if member_heads.contains(&head) {
+                let edge = (keys[i].clone(), head);
+                if seen.insert(edge.clone()) {
+                    edges.push(edge);
+                }
+            }
+        }
+    }
+    // Reuse the crate's own graph machinery (the same `safegraph` backing `crate::analysis`) for
+    // the reachability walk, mirroring how `analysis.rs` builds and reads its obligation graph.
+    let mut names: Vec<String> = member_heads.iter().map(|s| s.to_string()).collect();
+    names.sort();
+    let mut graph: crate::safegraph::VecGraph<String, ()> = Default::default();
+    graph.scope_mut(|mut ctx| {
+        let index: std::collections::HashMap<String, _> = names
+            .iter()
+            .map(|name| {
+                let ix = ctx
+                    .insert_node(name.clone())
+                    .expect("insertion into a fresh VecGraph cannot fail");
+                (name.clone(), ix)
+            })
+            .collect();
+        for (from, to) in &edges {
+            ctx.insert_edge((), [index[from], index[to]])
+                .expect("both endpoints were just inserted");
+        }
+    });
+    let reach: std::collections::HashMap<String, HashSet<String>> = graph.scope(|ctx| {
+        ctx.node_indices()
+            .map(|ix| {
+                let set: HashSet<String> = Dfs::new(ctx, ix).map(|n| ctx.node(n).clone()).collect();
+                (ctx.node(ix).clone(), set)
+            })
+            .collect()
+    });
+    (0..members.len())
+        .map(|i| {
+            let reachable = &reach[&keys[i]];
+            (0..members.len())
+                .filter(|j| *j != i && reachable.contains(&keys[*j]))
+                .collect()
+        })
+        .collect()
+}
+
 /// Apply the ranked `#[decycle]` transformation to `module`, programmatically.
 ///
 /// `decycle` is the path to the decycle crate (its leading segment names the crate, used to
@@ -564,20 +683,25 @@ fn process_module_inner(
     // Neutralise the hazards our own nesting creates (glob ambiguity, shifted relative paths)
     // before `finalize` re-emits these impls two modules deep — see `crate::nesting`.
     let mut contents = contents;
-    // Every impl of one cyclic trait forms a group whose members must be able to prove each other's
-    // leaf premises — see `crate::ranked::sharing`.
+    // The impls of one cyclic trait must be able to prove each other's leaf premises — but only the
+    // ones whose rank chains can actually REACH each other. The group used to be "every adopted impl
+    // of the trait", so a standalone acyclic impl silently inherited a cycle's premises (`C<T>`
+    // acquiring `T: Clone` rejects code that is valid without the macro), and two disjoint cycles of
+    // one trait unioned each other's. Scope each impl's inheritance to the impls its own cyclic
+    // bounds (transitively) obligate instead — see `sharing_sources` and `crate::ranked::sharing`.
     for trait_ident in &all_traits {
-        let mut group: Vec<&mut ItemImpl> = contents
-            .iter_mut()
-            .filter(|im| {
-                im.trait_.as_ref().is_some_and(|(_, path, _)| {
-                    path.segments.last().is_some_and(|s| s.ident == *trait_ident)
-                })
+        let is_member = |im: &ItemImpl| {
+            im.trait_.as_ref().is_some_and(|(_, path, _)| {
+                path.segments.last().is_some_and(|s| s.ident == *trait_ident)
             })
-            .collect();
-        if group.len() > 1 {
-            crate::ranked::sharing::share_side_predicates(&mut group, trait_ident);
+        };
+        let members: Vec<&ItemImpl> = contents.iter().filter(|im| is_member(im)).collect();
+        if members.len() < 2 {
+            continue;
         }
+        let sources = sharing_sources(&members, trait_ident);
+        let mut group: Vec<&mut ItemImpl> = contents.iter_mut().filter(|im| is_member(im)).collect();
+        crate::ranked::sharing::share_side_predicates_scoped(&mut group, &all_traits, &sources);
     }
 
     // Restricted to types this module DEFINES: a foreign self type (`impl Tr for &str`) is reachable

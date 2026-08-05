@@ -46,6 +46,24 @@ pub fn strip_leading_self(path: &mut Path) {
     }
 }
 
+/// Does `path` name one of `names` as a **module-local** item — i.e. is it a bare single-segment
+/// path, or its no-op `self::`-qualified form?
+///
+/// Only those two spellings can denote an item of the module being processed. A path rooted
+/// anywhere else — `crate::other::Stmt`, `super::Stmt`, `::dep::Stmt` — reaches a *different* item
+/// that merely happens to share its last segment, and must be treated as an ordinary outer type.
+///
+/// This is the type-side counterpart of `peel::is_bare_cyclic_bound`, which already applies the
+/// same bare-or-`self::` rule to the trait side of a bound.
+pub fn path_names_local_ident(path: &Path, names: &std::collections::HashSet<Ident>) -> bool {
+    if path.leading_colon.is_some() {
+        return false;
+    }
+    let mut probe = path.clone();
+    strip_leading_self(&mut probe);
+    probe.segments.len() == 1 && names.contains(&probe.segments[0].ident)
+}
+
 /// The fresh binding `reduce_pat` mints for a destructured parameter at position `ix`.
 ///
 /// Carries the crate-identity suffix so it cannot collide with a user parameter that happens to be

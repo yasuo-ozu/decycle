@@ -106,6 +106,16 @@ fn is_bare_cyclic_bound(bound: &TypeParamBound, all_traits: &HashSet<Ident>) -> 
 }
 
 /// Every distinct cycle-member type appearing anywhere inside `ty`, outermost first.
+///
+/// A member is recognised only by a **bare** (or `self::`-qualified) ident — the same rule
+/// `is_bare_cyclic_bound` applies to the trait side. A multi-segment path is an outer type in its
+/// entirety, even when its last segment matches a member's name: `crate::other::Stmt` is a
+/// different item from the local `Stmt`, and peeling it emitted rank-lowering obligations against
+/// a foreign type, which surfaced as a per-rank wall of `TrRanked<((((..` errors (or the
+/// "not a type the ranked engine can rank-lower" abort) instead of leaving the bound alone.
+///
+/// Recursion is unaffected: an outer path's generic arguments are still visited, so a genuine
+/// member nested inside a foreign wrapper (`crate::other::Wrap<Stmt>`) is still found.
 fn cycle_types_within(ty: &Type, cycle_self_heads: &HashSet<Ident>) -> Vec<Type> {
     struct V<'a> {
         heads: &'a HashSet<Ident>,
@@ -114,14 +124,13 @@ fn cycle_types_within(ty: &Type, cycle_self_heads: &HashSet<Ident>) -> Vec<Type>
     }
     impl Visit<'_> for V<'_> {
         fn visit_type_path(&mut self, tp: &TypePath) {
-            if tp.qself.is_none()
-                && tp
-                    .path
-                    .segments
-                    .last()
-                    .is_some_and(|s| self.heads.contains(&s.ident))
-            {
-                let t = Type::Path(tp.clone());
+            if tp.qself.is_none() && crate::helper::path_names_local_ident(&tp.path, self.heads) {
+                // Emit the canonical BARE spelling, exactly as the trait side is normalised above:
+                // a peeled target is re-emitted two modules deeper, where a `self::`-qualified
+                // path would resolve against the wrong module.
+                let mut tp = tp.clone();
+                crate::helper::strip_leading_self(&mut tp.path);
+                let t = Type::Path(tp);
                 if self.seen.insert(quote!(#t).to_string()) {
                     self.out.push(t);
                 }

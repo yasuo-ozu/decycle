@@ -46,15 +46,40 @@ pub fn strip_leading_self(path: &mut Path) {
     }
 }
 
+/// The fresh binding `reduce_pat` mints for a destructured parameter at position `ix`.
+///
+/// Carries the crate-identity suffix so it cannot collide with a user parameter that happens to be
+/// named `__arg_1_`; deterministic across compilations, like every other generated ident here.
+fn arg_ident_name(ix: usize) -> String {
+    static RANDOM_SUFFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let suffix = RANDOM_SUFFIX.get_or_init(|| crate::get_random().to_string());
+    format!("__arg_{ix}_{suffix}")
+}
+
 /// Inserts a `Type` as a `GenericArgument::Type` at the given position
 /// in the last segment's arguments of `path`.
+///
+/// `index` is the rank parameter's slot in the trait's *declaration* — i.e. the number of
+/// lifetime params, since a declaration must list lifetimes first. The arguments actually written
+/// at a use site need not match that: path lifetime arguments are elided all-or-nothing (a partial
+/// list is E0107), and in expression position (`Tr::f(..)`, `<B as Tr>::f(..)`) they almost always
+/// are. So the correct slot is `index` clamped to the number of leading lifetime arguments PRESENT
+/// — 0 when they are elided.
+///
+/// Without the clamp, a trait with one lifetime param produced `args.insert(1, ..)` on an empty
+/// list, which panics (`Punctuated::insert: index out of range`) — a bare proc-macro panic, with no
+/// span, on legal code. When some args were present it was worse than a panic: `Tr::<u32>::f` on
+/// `trait Tr<'a, T>` inserted at 1 and silently emitted `TrRanked<u32, Rank>`, putting the user's
+/// type in the rank slot. Clamping also keeps the argument ahead of any associated-type binding,
+/// which must follow all generic arguments.
 pub fn path_insert_type_arg(path: &mut Path, index: usize, ty: Type) {
     let last_seg = path.segments.last_mut().unwrap();
     let arg = GenericArgument::Type(ty);
     match &mut last_seg.arguments {
         PathArguments::None => {
             let mut args = Punctuated::new();
-            args.insert(index, arg);
+            // Nothing was written, so every lifetime is elided: the rank argument goes first.
+            args.insert(0, arg);
             last_seg.arguments = PathArguments::AngleBracketed(AngleBracketedGenericArguments {
                 colon2_token: None,
                 lt_token: Default::default(),
@@ -63,7 +88,14 @@ pub fn path_insert_type_arg(path: &mut Path, index: usize, ty: Type) {
             });
         }
         PathArguments::AngleBracketed(ref mut angle_args) => {
-            angle_args.args.insert(index, arg);
+            // Clamp to the lifetime arguments actually spelled here (see the doc comment): the
+            // rank slot is declaration-relative, the written list may have elided its lifetimes.
+            let leading_lifetimes = angle_args
+                .args
+                .iter()
+                .take_while(|a| matches!(a, GenericArgument::Lifetime(_)))
+                .count();
+            angle_args.args.insert(index.min(leading_lifetimes), arg);
         }
         // A #[decycle] trait referenced with `Fn(...)`-sugar (`where B: Cb(usize) -> usize`)
         // reaches here through `TraitReplacer` (the where-clause/body rewriter): it steals
@@ -99,8 +131,13 @@ impl FnArgScheme for FnArg {
                     pat_ident.subpat = None;
                 }
                 _ => {
+                    // Nonce-suffixed: `__arg_{ix}_` alone is call-site hygiene, so a user
+                    // parameter literally named that collided with it (E0415, "bound more than
+                    // once"). Same mechanism the rest of the crate's generated idents use — a
+                    // pure function of the crate identity, so it stays deterministic across
+                    // compilations (reproducible builds, stable trybuild snapshots).
                     **pat = Pat::Ident(PatIdent {
-                        ident: Ident::new(&format!("__arg_{ix}_"), Span::call_site()),
+                        ident: Ident::new(&arg_ident_name(ix), Span::call_site()),
                         attrs: vec![],
                         by_ref: None,
                         mutability: None,

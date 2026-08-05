@@ -324,6 +324,44 @@ pub mod __reentry {
         }
     }
 
+    /// Is this `type_name` string a **unique** name for its type?
+    ///
+    /// The registry keys on `type_name::<Mk<..>>()`, so a key is only sound when that string
+    /// identifies exactly one type. Anonymous types break that: rustc renders every closure,
+    /// `async` block, and nested closure in one function as `{{closure}}`, with no
+    /// disambiguator, so two of them in the same function produce the *same* key.
+    ///
+    /// Names WITHOUT `{{closure}}` are unique and safe: named functions (`path::named_fn`),
+    /// function pointers (`fn(usize) -> usize` — one type, hence one monomorphisation, so
+    /// sharing a slot is correct), and ordinary named types.
+    fn key_is_nameable(name: &str) -> bool {
+        !name.contains("{{closure}}")
+    }
+
+    /// Panic if this key cannot be encoded uniquely.
+    ///
+    /// This fires on the FIRST registration or lookup made by a closure-instantiated method,
+    /// deterministically — it does not wait for an actual collision, so the failure does not
+    /// depend on which other closures happen to exist or on their layouts.
+    ///
+    /// It is a runtime check because a compile-time one is not expressible on stable: the
+    /// natural spelling is a `const` assertion over `type_name::<K>()`, but `type_name` is not
+    /// yet const-stable (`const_type_name`), and no stable alternative distinguishes two
+    /// closures (`TypeId` requires `'static`; a per-monomorphisation function address is merged
+    /// by identical-code folding in release builds).
+    fn assert_key_encodable(key: &'static str) {
+        assert!(
+            key_is_nameable(key),
+            "decycle: this method was instantiated with an anonymous type (a closure or `async` \
+             block), which cannot be encoded as a re-entry registry key: rustc names every \
+             closure in a function `{{{{closure}}}}`, so two of them in one function collide and \
+             the floor would call the wrong one. Pass a named function, coerce to a function \
+             pointer (`f as fn(_) -> _`), or set `support_infinite_cycle = false`. \
+             Offending key: {}",
+            key
+        );
+    }
+
     /// Open a registration scope. Every [`register`] call made while the returned
     /// [`Registration`] is alive is rolled back when it drops — including on unwind. The
     /// generated method prologue opens one of these before its registrations and holds it for
@@ -342,6 +380,7 @@ pub mod __reentry {
     /// a scope closes, so registering outside one leaves a record that is never reclaimed. All
     /// generated code opens a scope first.
     pub fn register<K: ?Sized>(fp: u64, f: *const ()) {
+        assert_key_encodable(type_name::<K>());
         let key = (type_name::<K>(), fp);
         let prev = REG
             .try_with(|reg| reg.borrow_mut().insert(key, f))
@@ -353,6 +392,7 @@ pub mod __reentry {
     /// Look up the re-entry fn for key `(K, fp)`, copied out as a `*const ()`. The value is
     /// copied and the `RefCell` borrow released before the not-registered panic can fire.
     pub fn lookup<K: ?Sized>(fp: u64) -> *const () {
+        assert_key_encodable(type_name::<K>());
         let found = REG
             .try_with(|reg| reg.borrow().get(&(type_name::<K>(), fp)).copied())
             .ok()

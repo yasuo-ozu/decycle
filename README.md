@@ -18,12 +18,25 @@ traits with circular dependencies that would otherwise fail to compile.
 
 ## Quick Start
 
-Add this to your `Cargo.toml`:
+The latest release published to crates.io is **0.3.0**:
 
 ```toml
 [dependencies]
-decycle = "0.4.0"
+decycle = "0.3.0"
 ```
+
+> **Version warning.** 0.3.0 (and every earlier release) is **unsound at default
+> settings**: with `support_infinite_cycle = true` (the default), recursion deeper
+> than `recurse_level` crashes (SIGSEGV). If you use 0.3.0, always set
+> `#[decycle(support_infinite_cycle = false)]`. The fix — and several features this
+> README documents (the structural engine, full-height unbounded re-entry, the
+> `analysis` API) — is not yet on crates.io; until the next version is published,
+> get it as a git dependency:
+>
+> ```toml
+> [dependencies]
+> decycle = { git = "https://github.com/yasuo-ozu/decycle" }
+> ```
 
 ## Why Decycle?
 
@@ -84,7 +97,8 @@ The `#[decycle]` macro solves this by breaking the circular dependency cycle.
 This example shows how to break circular trait dependencies using `#[decycle]`:
 
 ```rust
-# use decycle::decycle;
+use decycle::decycle;
+
 #[decycle]
 mod calculator {
     #[decycle]
@@ -100,16 +114,15 @@ mod calculator {
         Term: Evaluate,
     {
         fn evaluate(&self, input: &[&'static str], index: &mut usize) -> i32 {
-            // ...
-            # let left_val = Term.evaluate(input, index);
-            # let op = input[*index];
-            # *index += 1;
-            # let right_val = Term.evaluate(input, index);
-            # match op {
-            #     "+" => left_val + right_val,
-            #     "-" => left_val - right_val,
-            #     _ => left_val,
-            # }
+            let left_val = Term.evaluate(input, index);
+            let op = input[*index];
+            *index += 1;
+            let right_val = Term.evaluate(input, index);
+            match op {
+                "+" => left_val + right_val,
+                "-" => left_val - right_val,
+                _ => left_val,
+            }
         }
     }
 
@@ -118,16 +131,15 @@ mod calculator {
         Expr: Evaluate,
     {
         fn evaluate(&self, input: &[&'static str], index: &mut usize) -> i32 {
-            // ...
-            # let token = input[*index];
-            # *index += 1;
-            # if token == "(" {
-            #     let result = Expr.evaluate(input, index);
-            #     *index += 1; // skip closing ')'
-            #     result
-            # } else {
-            #     token.parse::<i32>().unwrap()
-            # }
+            let token = input[*index];
+            *index += 1;
+            if token == "(" {
+                let result = Expr.evaluate(input, index);
+                *index += 1; // skip closing ')'
+                result
+            } else {
+                token.parse::<i32>().unwrap()
+            }
         }
     }
 }
@@ -146,21 +158,22 @@ You can also annotate `use` items inside the module to use traits defined out of
 the module:
 
 ```rust
-# use decycle::decycle;
+use decycle::decycle;
+
 #[decycle]
 pub trait Evaluate {
     fn evaluate(&self, input: &[&'static str], index: &mut usize) -> i32;
 }
 
 #[decycle]
-##[allow(dead_code)]
+#[allow(dead_code)]
 mod cycle {
     #[decycle]
     use super::{Evaluate};
 
     // ...
 }
-# fn main() {}
+fn main() {}
 ```
 
 ## Two algorithms
@@ -175,8 +188,9 @@ mod cycle {
 | Re-entry across **several instantiations** of a generic method | **✓** (fn-pointer re-entry) | ✗ (layout cast can't) |
 | Genuinely **growing** type argument (one wrapper per level) | ✗ — see note below | ✗ |
 | **`no_std`** | only when `support_infinite_cycle = false` | **✓** |
-| Arg mentioning `Self`: **`impl Fn(&Self)`** (APIT) | **✓** | ✗ (use generics) |
+| Arg mentioning `Self`: **`impl Fn(&Self)`** (APIT) | **✓** with a named fn or `fn` pointer; a **closure** is rejected at runtime in unbounded mode — see the closure note below | ✗ (use generics) |
 | Arg mentioning `Self`: **`fn(&Self)`** / **`&dyn Fn(&Self)`** | ✗ | **✓** |
+| **`#[track_caller]`** on a cycle method | ✗ in unbounded mode (clean compile error) / **✓** when `support_infinite_cycle = false` | **✓** |
 | Non-`#[decycle]` **supertrait** on the trait | **✓** | ✗ |
 | Third-party trait *in* the cycle | only when `#[decycle]`-annotated at its definition | **✓**  |
 
@@ -191,6 +205,52 @@ mod cycle {
 > instantiations past the recursion floor. The way to make a growing tower finite is to **erase it at
 > the recursion boundary** — pin the stream to one fixed `&mut dyn Trait` layer — after which the cycle
 > works under *both* engines (`tests/dyn_stream_reentry.rs`).
+
+> **Note on closures (ranked engine, unbounded mode only).** The unbounded re-entry registry keys
+> each method instantiation by `type_name`, and rustc renders **every** closure and `async` block
+> in a function as `{{closure}}`, with no disambiguator — two closures in one function would share
+> a key, and the recursion floor would call the wrong one. So under
+> `support_infinite_cycle = true` (the default), instantiating a cyclic method with a closure or
+> `async` block — any `impl Fn(..)` or other generic argument, whether or not it mentions `Self` —
+> is **rejected at runtime** with a panic whose message contains "anonymous type". The rejection is
+> deterministic and fires on the method's first call, even when recursion never reaches the floor.
+> Named functions work as-is; a non-capturing closure works once coerced to a function pointer,
+> which is a uniquely named type:
+>
+> ```rust
+> use decycle::decycle;
+>
+> #[decycle]
+> mod fold_m {
+>     #[decycle]
+>     pub trait Fold {
+>         fn fold(&self, f: impl Fn(usize) -> usize, n: usize) -> usize;
+>     }
+>     pub struct A;
+>     impl Fold for A
+>     where
+>         A: Fold,
+>     {
+>         fn fold(&self, f: impl Fn(usize) -> usize, n: usize) -> usize {
+>             if n == 0 { f(0) } else { A.fold(f, n - 1) + 1 }
+>         }
+>     }
+> }
+>
+> fn main() {
+>     use fold_m::Fold;
+>     // Rejected at runtime (panic: "... anonymous type ..."): a closure.
+>     // fold_m::A.fold(|v| v + 7, 25);
+>     // Works, at any depth: a function pointer is uniquely named.
+>     assert_eq!(fold_m::A.fold((|v| v + 7) as fn(usize) -> usize, 25), 32);
+> }
+> ```
+>
+> A closure that *captures* cannot be coerced to a `fn` pointer — pass its captures as ordinary
+> arguments instead, or use bounded mode. The restriction does **not** apply with
+> `support_infinite_cycle = false`: bounded mode emits no registry and accepts closures unchanged.
+> It also does not apply to the structural engine (which rejects `impl Fn(&Self)` at compile time
+> for its own, unrelated reason — see the table).
 
 
 ## How the algorithms work?
@@ -211,7 +271,7 @@ see the note above.)
 Smallest example (two mutually recursive traits):
 
 ```rust
-# use decycle::decycle;
+use decycle::decycle;
 
 #[decycle]
 trait A { fn a(&self) -> ::core::primitive::usize; }
@@ -229,14 +289,15 @@ mod cycle {
     impl A for Left where Right: B { fn a(&self) -> usize { self.0 + 1 } }
     impl B for Right where Left: A { fn b(&self) -> usize { self.0 + 1 } }
 }
-# fn main() {}
+fn main() {}
 ```
 
 Expected expansion (simplified, with stable names):
 
 ```rust
-# trait A { fn a(&self) -> usize; }
-# trait B { fn b(&self) -> usize; }
+trait A { fn a(&self) -> usize; }
+trait B { fn b(&self) -> usize; }
+
 mod cycle {
     use super::{A, B};
     struct Left(usize);
@@ -275,15 +336,20 @@ mod cycle {
         fn b(&self) -> usize { unimplemented!("decycle: cycle limit reached") }
     }
 }
-# fn main() {}
+fn main() {}
 ```
 
 When `support_infinite_cycle = true` (the default), the deepest rank (the "floor")
 does not stop: it re-enters the *original* trait impl at full height through a
 type-erased fn pointer held in a **thread-local** registry, keyed by the
 `type_name` of a generated per-(trait, method, instantiation) marker type plus a
-layout fingerprint of the keyed types (`type_name` alone is not injective — e.g.
-two closures declared in one fn share a name). Every inductive frame idempotently
+layout fingerprint of the keyed types. A key is only sound when that string names
+exactly one type, and `type_name` is not injective for anonymous types — rustc
+renders every closure and `async` block declared in one fn as `{{closure}}`, with
+no disambiguator — so a method instantiated with a closure or `async` block is
+rejected at runtime on its first call with a panic mentioning "anonymous type"
+(pass a named function or coerce to a function pointer; see the closure note
+under *Two algorithms*). Every inductive frame idempotently
 registers the re-entry fns for itself and for its cyclic-bound siblings before
 descending — on the same call stack, hence the same thread — so the floor's
 lookup finds its target on every thread independently: for any cycle width, at
@@ -319,7 +385,8 @@ A second, self-contained algorithm with **no runtime and no `type-leak` dependen
 everything is resolved at compile time.
 
 ```rust
-# use decycle::decycle;
+use decycle::decycle;
+
 #[decycle(structural)]
 mod ast {
     #[decycle]

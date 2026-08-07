@@ -3,6 +3,13 @@
     html_favicon_url = "https://raw.githubusercontent.com/yasuo-ozu/decycle/main/decycle.png"
 )]
 #![doc = include_str!("README.md")]
+// The README's doctests spell out `fn main() {}` deliberately, so this lint is a false positive
+// there: several examples use `#[decycle] use super::Trait;` inside a module, and `super::` must
+// resolve to the doctest crate root — under rustdoc's implicit `fn main` wrapping those items
+// would become fn-local and the paths would not resolve. Visible mains (instead of hidden
+// `# fn main() {}` lines) also keep the README rendering as valid Rust on GitHub and crates.io,
+// where rustdoc's `#`-hiding does not apply.
+#![allow(clippy::needless_doctest_main)]
 
 #[doc(hidden)]
 pub use decycle_macro::__finalize;
@@ -22,8 +29,6 @@ pub use decycle_impl::structural;
 /// **replaces** its participant set with the graph's nodes, whereas
 /// [`structural::process_module_with_graph`] can only **filter** with them, its model being keyed on
 /// `(type, trait)` pairs rather than on types.
-/// Engine-independent, code-free inspection: the module's obligation graph over type idents, with
-/// each edge labelled `Direct` or `Peeled`.
 ///
 /// - [`analysis::analyze_module`] reads a module's own classification back out;
 /// - [`analysis::cyclic_subgraph`] restricts a graph to the nodes that lie on a cycle, so a caller
@@ -162,7 +167,16 @@ pub use decycle_impl::safegraph;
 ///   the *original* trait impl at full height through a type-erased fn
 ///   pointer held in a **thread-local** registry (keyed by a generated
 ///   per-(trait, method, instantiation) marker type plus a layout
-///   fingerprint). Every inductive frame idempotently registers the
+///   fingerprint). A key must name exactly one type, so a cyclic method
+///   instantiated with an **anonymous type** — a closure or `async` block,
+///   e.g. as an `impl Fn(..)` argument — is rejected at runtime with a
+///   panic mentioning "anonymous type", deterministically on the method's
+///   first call (rustc renders every closure in a function as
+///   `{{closure}}`, so two of them in one function would share a key and
+///   the floor would call the wrong one). Pass a named function, coerce a
+///   non-capturing closure to a function pointer (`f as fn(_) -> _`), or
+///   use `support_infinite_cycle = false`, which has no registry and
+///   accepts closures. Every inductive frame idempotently registers the
 ///   re-entry fns it and its cyclic-bound siblings need before descending,
 ///   so the floor's lookup always finds its target on the thread that needs
 ///   it. Recursion depth is then bounded only by the OS stack, like any
@@ -193,6 +207,13 @@ pub use decycle_impl::safegraph;
 ///   (`type Output; fn m(&self) -> Self::Output`), or return a concrete/boxed type;
 /// - a *wrapped* cyclic bound `Box<Stmt>: Tr` without a blanket `impl<T: Tr> Tr for Box<T>`;
 /// - a cross-module cycle, or a foreign trait implemented for a *foreign* type.
+///
+/// One restriction is enforced at **runtime** instead: in the ranked engine's unbounded mode
+/// (`support_infinite_cycle = true`, the default), a cyclic method instantiated with a closure or
+/// `async` block panics on its first call with a message containing "anonymous type" — such types
+/// cannot be encoded as unique re-entry registry keys. Pass a named function, coerce a
+/// non-capturing closure to a function pointer (`f as fn(_) -> _`), or set
+/// `support_infinite_cycle = false`. See *Recursion limits* above.
 ///
 /// An `unsafe trait` **is** supported (the generated impls are emitted as `unsafe impl`). A
 /// third-party trait may participate in the cycle when brought in with `#[decycle] use` and

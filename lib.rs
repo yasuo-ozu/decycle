@@ -14,6 +14,28 @@ pub use decycle_impl::ranked;
 /// The **structural** unroll engine's programmatic API (`#[decycle(structural)]`) — a compile-time
 /// unroll with no runtime and no `type-leak` dependency.
 pub use decycle_impl::structural;
+/// Engine-independent, code-free inspection: the module's obligation graph over type idents, with
+/// each edge labelled `Direct` or `Peeled`.
+///
+/// The analysis itself is the same whichever engine you go on to use — it lives here, and only here.
+/// What differs per engine is how a graph is *consumed*: [`ranked::process_module_with_graph`]
+/// **replaces** its participant set with the graph's nodes, whereas
+/// [`structural::process_module_with_graph`] can only **filter** with them, its model being keyed on
+/// `(type, trait)` pairs rather than on types.
+/// Engine-independent, code-free inspection: the module's obligation graph over type idents, with
+/// each edge labelled `Direct` or `Peeled`.
+///
+/// - [`analysis::analyze_module`] reads a module's own classification back out;
+/// - [`analysis::cyclic_subgraph`] restricts a graph to the nodes that lie on a cycle, so a caller
+///   can supply a whole reference relation and let decycle decide what recurses;
+/// - [`analysis::with_nodes`] adds participants discovered after the graph was built.
+///
+/// The result is what [`ranked::process_module_with_graph`] and
+/// [`structural::process_module_with_graph`] take.
+pub use decycle_impl::analysis;
+/// Re-exported so callers can name the [`safegraph::VecGraph`] that
+/// [`analysis::analyze_module`] returns without depending on `safegraph` themselves.
+pub use decycle_impl::safegraph;
 /// Attribute macro that expands a module or trait to break circular trait
 /// obligations within the annotated module. Also see module-level documentation.
 ///

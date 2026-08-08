@@ -35,7 +35,7 @@ pub(crate) use rho::*;
 /// crate, used to recognise `#[<crate>::decycle]` on inner items). For macro authors wrapping
 /// `#[decycle(structural)]`; most users should use the attribute.
 pub fn process_module(module: ItemMod, decycle: &Path) -> TokenStream {
-    match expand(module.clone(), decycle) {
+    match expand(module.clone(), None, decycle) {
         Ok(ts) => ts,
         Err(e) => {
             // Re-emit the module verbatim alongside the error so downstream code still sees the defs.
@@ -45,7 +45,42 @@ pub fn process_module(module: ItemMod, decycle: &Path) -> TokenStream {
     }
 }
 
-fn expand(mut module: ItemMod, decycle: &Path) -> syn::Result<TokenStream> {
+/// [`process_module`], but with participation restricted to the types named by `graph`.
+///
+/// `graph` is an obligation graph in the shape [`crate::analysis::analyze_module`] returns.
+///
+/// **This engine's model is finer-grained than the graph.** It works over `(type, trait)` *pairs*,
+/// because a type implementing two routed traits can be cyclic in one and acyclic in the other; the
+/// graph collapses that, keying only on the type. So the node set is applied as a **filter**, not a
+/// replacement: a pair participates when its trait is `#[decycle]`-annotated *and* its self type is a
+/// node. Passing `analyze_module(&module, decycle)` therefore reproduces [`process_module`] only when
+/// every participating type is a node, which is exactly what that function returns — so the round
+/// trip is faithful, but a hand-built graph can only ever narrow the cycle, never widen it or split
+/// it per trait.
+///
+/// The **edges are not consumed**; `Peeled` bounds are still recognised by their own syntax. See
+/// [`crate::ranked::process_module_with_graph`], which has the same caveat for the same reason.
+pub fn process_module_with_graph(
+    module: ItemMod,
+    graph: &crate::safegraph::VecGraph<Ident, crate::analysis::EdgeKind>,
+    decycle: &Path,
+) -> TokenStream {
+    use crate::safegraph::graph::Graph;
+    let allowed: HashSet<String> = graph.nodes().map(|n| n.to_string()).collect();
+    match expand(module.clone(), Some(&allowed), decycle) {
+        Ok(ts) => ts,
+        Err(e) => {
+            let err = e.to_compile_error();
+            quote! { #err #module }
+        }
+    }
+}
+
+fn expand(
+    mut module: ItemMod,
+    allowed_types: Option<&HashSet<String>>,
+    decycle: &Path,
+) -> syn::Result<TokenStream> {
     let decycle_crate = decycle
         .segments
         .first()
@@ -69,6 +104,33 @@ fn expand(mut module: ItemMod, decycle: &Path) -> syn::Result<TokenStream> {
     // Only impls of traits annotated `#[decycle]` in this module participate — collect their idents
     // and strip the `#[decycle]` attrs from the trait/use items.
     let decycle_traits = collect_decycle_traits(brace_items, &decycle_crate);
+
+    // A caller supplying a graph is generating these impls, which means a cycle member and its helper
+    // types are separate impls that each declare only their OWN leaf premises — and the generated
+    // terminator for one has to prove what a sibling's impl demands. Share the union across each
+    // trait's impls first, the same gap `ranked::sharing` closes on the other engine. Skipped without a
+    // graph: hand-written impls state their own premises, and rewriting a caller's `where`-clause
+    // uninvited is the sort of thing the graph is the opt-in for.
+    if allowed_types.is_some() {
+        for trait_name in &decycle_traits {
+            let marker = Ident::new(trait_name, Span::call_site());
+            let mut group: Vec<&mut ItemImpl> = brace_items
+                .iter_mut()
+                .filter_map(|item| match item {
+                    Item::Impl(im)
+                        if impl_trait_key(im).as_deref() == Some(trait_name.as_str()) =>
+                    {
+                        Some(im)
+                    }
+                    _ => None,
+                })
+                .collect();
+            if group.len() > 1 {
+                crate::ranked::sharing::share_side_predicates(&mut group, &marker);
+            }
+        }
+    }
+
     let items = brace_items.clone();
 
     // No `#[decycle]`-annotated trait/use → no cyclic participants. Re-emit the module unchanged (its
@@ -80,7 +142,7 @@ fn expand(mut module: ItemMod, decycle: &Path) -> syn::Result<TokenStream> {
     }
 
     let model = Model::collect(&items, nonce)?;
-    let sccs = model.cyclic_sccs(&decycle_traits);
+    let sccs = model.cyclic_sccs(&decycle_traits, allowed_types);
     // Annotated traits present but they form no cycle — the same silent no-op pass-through.
     if sccs.is_empty() {
         return Ok(module.to_token_stream());

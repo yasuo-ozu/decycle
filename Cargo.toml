@@ -22,7 +22,11 @@ decycle-impl = { path = "decycle-impl", version = "0.5.0" }
 traitdef = { path = "tests/traitdef" }
 typedef = { path = "tests/typedef" }
 alsorank_bridge = { path = "tests/alsorank_bridge" }
+graph_bridge = { path = "tests/graph_bridge" }
 trybuild = "1.0"
+# `analysis::analyze_module` takes a `syn::ItemMod`, so any caller needs `syn` anyway; the
+# reachability test in `tests/analysis_api.rs` is written the way a user would write it.
+syn = { version = "2.0", features = ["full", "parsing", "printing"] }
 
 [workspace]
 members = [

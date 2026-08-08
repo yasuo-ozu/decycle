@@ -15,7 +15,17 @@ path = "lib.rs"
 
 [dependencies]
 decycle-macro = { path = "macro", version = "0.5.0" }
-decycle-impl = { path = "decycle-impl", version = "0.5.0" }
+decycle-impl = { path = "decycle-impl", version = "0.5.0", optional = true }
+
+[features]
+default = ["std", "api"]
+# The unbounded re-entry registry is a `thread_local!` map. Without it the ranked engine still
+# runs at a fixed depth (`support_infinite_cycle = false`), and the structural engine is
+# unaffected — it emits no runtime machinery at all.
+std = []
+# The programmatic surface: both engines' entry points, the obligation-graph API, and safegraph.
+# Off, `decycle-impl` is not compiled for your target at all, which is what makes `no_std` work.
+api = ["dep:decycle-impl"]
 
 [dev-dependencies]
 traitdef = { path = "tests/traitdef" }

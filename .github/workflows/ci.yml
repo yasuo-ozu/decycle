@@ -97,3 +97,21 @@ jobs:
       - run: cargo miri test --test structural_sig
       - run: cargo miri test --test reentry_bridge
       - run: cargo miri test --test bareparam_reentry
+
+  # The `no_std` claim is only worth making if it is checked: the facade must build for a target
+  # with no std at all, with default features off. `x86_64-unknown-none` is a core-only target, so
+  # anything that reaches for `std` — or drags `decycle-impl` into the target graph — fails here.
+  no_std:
+    name: build (no_std)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p decycle --no-default-features --target x86_64-unknown-none
+      # Feature combinations must each stand on their own, not only in the default union.
+      - run: cargo build -p decycle --no-default-features
+      - run: cargo build -p decycle --no-default-features --features std
+      - run: cargo build -p decycle --no-default-features --features api

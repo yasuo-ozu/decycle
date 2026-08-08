@@ -172,17 +172,22 @@ fn main() {}
 | **Unbounded depth** | only when `support_infinite_cycle = true` | always |
 | Re-entry across **several instantiations** of a generic method | **✓** (fn-pointer re-entry) | ✗ (layout cast can't) |
 | Genuinely **growing** type argument (one wrapper per level) | ✗ — see note below | ✗ |
-| **`no_std`** | ✗ | ✗ (see note) |
+| **`no_std`** | only when `support_infinite_cycle = false` | **✓** |
 | Arg mentioning `Self`: **`impl Fn(&Self)`** (APIT) | **✓** — but see the row below | ✗ (use generics) |
 | Generic arg instantiated with an **anonymous type** (closure, `async` block, `-> impl Trait` value) | ✗ in unbounded mode — rejected at runtime; a named fn or `fn` pointer works. Not a pending fix — see the closure note below | **✓** |
 | Arg mentioning `Self`: **`fn(&Self)`** / **`&dyn Fn(&Self)`** | ✗ | **✓** |
 | **`#[track_caller]`** on a cycle method | ✗ in unbounded mode (clean compile error) / **✓** when `support_infinite_cycle = false` | **✓** |
 | Non-`#[decycle]` **supertrait** on the trait | **✓** | ✗ |
 | Third-party trait *in* the cycle | only when `#[decycle]`-annotated at its definition | **✓**  |
-> **Why structural is `✗` too.** The structural engine emits no runtime machinery — no registry,
-> no `thread_local!` — so nothing it *generates* needs `std`. The crate still is not `no_std`:
-> `decycle-impl` is a regular dependency of the facade, so it is compiled for your target
-> whichever engine you pick.
+> **`no_std`.** Turn off default features (`decycle = { version = "..", default-features = false }`).
+> That drops two things: the `std` feature, which carries the unbounded re-entry registry (a
+> `thread_local!` map), and the `api` feature, which carries the programmatic surface and is what
+> pulls `decycle-impl` into your target build. What remains is the attribute macro plus a
+> `core`-only runtime — the structural engine emits nothing else, and needs no `alloc` either.
+>
+> The ranked engine still works at a fixed depth; only `support_infinite_cycle = true` (its
+> default) needs the registry, and asking for it without `std` is a compile error naming the
+> feature rather than a broken path into crate internals.
 
 > **Note on "growing" type arguments.** Neither engine can make a *genuinely* growing recursion work —
 > one whose instantiation strictly grows every level, e.g. `A<Vec<X>>: Tr` on `impl<X> Tr for A<X>`, or a

@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "std"), no_std)]
 #![doc(html_logo_url = "https://raw.githubusercontent.com/yasuo-ozu/decycle/main/decycle.png")]
 #![doc(
     html_favicon_url = "https://raw.githubusercontent.com/yasuo-ozu/decycle/main/decycle.png"
@@ -17,9 +18,11 @@ pub use decycle_macro::__finalize;
 /// The default **ranked** engine's programmatic API — hidden "Ranked" helper traits plus a
 /// thread-local re-entry registry. For macro authors and tooling built on decycle; most users want
 /// the [`macro@decycle`] attribute. See the module for its entry points.
+#[cfg(feature = "api")]
 pub use decycle_impl::ranked;
 /// The **structural** unroll engine's programmatic API (`#[decycle(structural)]`) — a compile-time
 /// unroll that emits no runtime machinery.
+#[cfg(feature = "api")]
 pub use decycle_impl::structural;
 /// Engine-independent, code-free inspection: the module's obligation graph over type idents, with
 /// each edge labelled `Direct` or `Peeled`.
@@ -37,9 +40,11 @@ pub use decycle_impl::structural;
 ///
 /// The result is what [`ranked::process_module_with_graph`] and
 /// [`structural::process_module_with_graph`] take.
+#[cfg(feature = "api")]
 pub use decycle_impl::analysis;
 /// Re-exported so callers can name the [`safegraph::VecGraph`] that
 /// [`analysis::analyze_module`] returns without depending on `safegraph` themselves.
+#[cfg(feature = "api")]
 pub use decycle_impl::safegraph;
 /// Attribute macro that expands a module or trait to break circular trait
 /// obligations within the annotated module. Also see module-level documentation.
@@ -247,27 +252,6 @@ pub trait Repeater<const RANDOM: u64, const IX: usize, PARAM: ?Sized> {
 /// Runtime fn-pointer registry backing unbounded `support_infinite_cycle` re-entry.
 #[doc(hidden)]
 pub mod __reentry {
-    use std::any::type_name;
-    use std::cell::RefCell;
-    use std::collections::HashMap;
-
-    // The value is a `*const ()`, never a `usize`: a fn pointer laundered through an integer
-    // loses its provenance, and calling the result of `transmute::<usize, fn(..)>` is undefined
-    // behavior (miri: "pointer not dereferenceable: .. it has no provenance"). Keeping a real
-    // pointer carries provenance end to end. A raw pointer is fine here because the map is
-    // thread-local and never crosses a thread boundary.
-    thread_local! {
-        static REG: RefCell<HashMap<(&'static str, u64), *const ()>> = RefCell::new(HashMap::new());
-        /// Undo log for [`Registration`]. Every registration appends what it displaced; a guard
-        /// records only its own index into this log. Keeping the payload here rather than in the
-        /// guard is what keeps the guard 8 bytes: a deep unbounded descent holds one guard set
-        /// per live frame, and fatter guards overflow the stack well before the recursion does
-        /// (20_000 frames is an ordinary depth for this engine).
-        static UNDO: RefCell<Vec<Undo>> = const { RefCell::new(Vec::new()) };
-    }
-
-    type Undo = ((&'static str, u64), Option<*const ()>);
-
     /// FNV-1a offset basis: the seed of every generated fingerprint fold.
     pub const FP_SEED: u64 = 0xcbf29ce484222325;
 
@@ -284,153 +268,227 @@ pub mod __reentry {
         (acc ^ w).wrapping_mul(FP_PRIME)
     }
 
-    /// Puts back the entries that were *displaced* inside one registration scope.
-    ///
-    /// Registration is no longer last-writer-wins. [`scope`] returns this guard, the generated
-    /// prologue binds it for the rest of the method body, and dropping it restores whatever
-    /// occupied those slots before — including on unwind.
-    ///
-    /// This matters because keys can collide: two closures written in one function share a
-    /// `type_name` exactly, so two same-layout closures map to one slot. Without the restore, a
-    /// nested descent started from the middle of a method body overwrites the slot, and when the
-    /// outer frame reaches its floor it calls the *other* closure's fn — observably wrong
-    /// results, and a segfault when the two closures' captures differ in kind.
-    ///
-    /// A registration that *created* its slot is deliberately left in place when the guard drops.
-    /// Two documented behaviors depend on that persistence: the bare-param `impl<T: Cb> Ca for
-    /// Wrap<T>` case is "unbounded once primed" (an earlier call through the Final delegating
-    /// impl registers the floor a later call needs), and a descent that hit the fail-closed panic
-    /// below leaves its registrations behind so a subsequent good call succeeds. Only *shadowing*
-    /// is scoped; priming is not.
-    #[must_use = "displaced entries are only restored when this guard drops; binding it to `_` \
-                  drops it immediately and re-opens the wrong-fn window it exists to close"]
-    pub struct Registration {
-        /// Length of `UNDO` when this scope opened. Everything logged at or after this index
-        /// belongs to the scope and is rolled back when it closes. One 8-byte guard covers a
-        /// whole frame's registrations, which matters: a deep unbounded descent holds one per
-        /// live frame, and per-registration guards cost enough stack to cut the reachable
-        /// recursion depth by a third.
-        mark: usize,
-    }
+    /// The registry proper. Only this half needs `std`; the fingerprint folds above are
+    /// pure `const fn` and stay available either way.
+    #[cfg(feature = "std")]
+    mod imp {
+        use std::any::type_name;
+        use std::cell::RefCell;
+        use std::collections::HashMap;
 
-    impl Drop for Registration {
-        fn drop(&mut self) {
-            let mark = self.mark;
-            // Roll back every record at or after this guard's mark. Truncating to a mark rather
-            // than popping exactly one record keeps this correct no matter what order the guards
-            // are dropped in — tuple fields drop front-to-back while locals drop back-to-front,
-            // and both shapes appear in generated code.
-            loop {
-                // `try_with`: a decycled call can run from a TLS destructor, where the registry
-                // is already gone. Nothing to restore in that case.
-                let rec = match UNDO.try_with(|u| {
-                    let mut log = u.borrow_mut();
-                    if log.len() > mark {
-                        log.pop()
-                    } else {
-                        None
+        // The value is a `*const ()`, never a `usize`: a fn pointer laundered through an integer
+        // loses its provenance, and calling the result of `transmute::<usize, fn(..)>` is undefined
+        // behavior (miri: "pointer not dereferenceable: .. it has no provenance"). Keeping a real
+        // pointer carries provenance end to end. A raw pointer is fine here because the map is
+        // thread-local and never crosses a thread boundary.
+        thread_local! {
+            static REG: RefCell<HashMap<(&'static str, u64), *const ()>> = RefCell::new(HashMap::new());
+            /// Undo log for [`Registration`]. Every registration appends what it displaced; a guard
+            /// records only its own index into this log. Keeping the payload here rather than in the
+            /// guard is what keeps the guard 8 bytes: a deep unbounded descent holds one guard set
+            /// per live frame, and fatter guards overflow the stack well before the recursion does
+            /// (20_000 frames is an ordinary depth for this engine).
+            static UNDO: RefCell<Vec<Undo>> = const { RefCell::new(Vec::new()) };
+        }
+
+        type Undo = ((&'static str, u64), Option<*const ()>);
+
+
+        /// Puts back the entries that were *displaced* inside one registration scope.
+        ///
+        /// Registration is no longer last-writer-wins. [`scope`] returns this guard, the generated
+        /// prologue binds it for the rest of the method body, and dropping it restores whatever
+        /// occupied those slots before — including on unwind.
+        ///
+        /// This matters because keys can collide: two closures written in one function share a
+        /// `type_name` exactly, so two same-layout closures map to one slot. Without the restore, a
+        /// nested descent started from the middle of a method body overwrites the slot, and when the
+        /// outer frame reaches its floor it calls the *other* closure's fn — observably wrong
+        /// results, and a segfault when the two closures' captures differ in kind.
+        ///
+        /// A registration that *created* its slot is deliberately left in place when the guard drops.
+        /// Two documented behaviors depend on that persistence: the bare-param `impl<T: Cb> Ca for
+        /// Wrap<T>` case is "unbounded once primed" (an earlier call through the Final delegating
+        /// impl registers the floor a later call needs), and a descent that hit the fail-closed panic
+        /// below leaves its registrations behind so a subsequent good call succeeds. Only *shadowing*
+        /// is scoped; priming is not.
+        #[must_use = "displaced entries are only restored when this guard drops; binding it to `_` \
+                      drops it immediately and re-opens the wrong-fn window it exists to close"]
+        pub struct Registration {
+            /// Length of `UNDO` when this scope opened. Everything logged at or after this index
+            /// belongs to the scope and is rolled back when it closes. One 8-byte guard covers a
+            /// whole frame's registrations, which matters: a deep unbounded descent holds one per
+            /// live frame, and per-registration guards cost enough stack to cut the reachable
+            /// recursion depth by a third.
+            mark: usize,
+        }
+
+        impl Drop for Registration {
+            fn drop(&mut self) {
+                let mark = self.mark;
+                // Roll back every record at or after this guard's mark. Truncating to a mark rather
+                // than popping exactly one record keeps this correct no matter what order the guards
+                // are dropped in — tuple fields drop front-to-back while locals drop back-to-front,
+                // and both shapes appear in generated code.
+                loop {
+                    // `try_with`: a decycled call can run from a TLS destructor, where the registry
+                    // is already gone. Nothing to restore in that case.
+                    let rec = match UNDO.try_with(|u| {
+                        let mut log = u.borrow_mut();
+                        if log.len() > mark {
+                            log.pop()
+                        } else {
+                            None
+                        }
+                    }) {
+                        Ok(Some(rec)) => rec,
+                        _ => return,
+                    };
+                    // `None` => that registration created its slot; leave it in place (see the type
+                    // docs: priming and healing depend on it). Only displacement is undone.
+                    if let (key, Some(prev)) = rec {
+                        let _ = REG.try_with(|reg| {
+                            reg.borrow_mut().insert(key, prev);
+                        });
                     }
-                }) {
-                    Ok(Some(rec)) => rec,
-                    _ => return,
-                };
-                // `None` => that registration created its slot; leave it in place (see the type
-                // docs: priming and healing depend on it). Only displacement is undone.
-                if let (key, Some(prev)) = rec {
-                    let _ = REG.try_with(|reg| {
-                        reg.borrow_mut().insert(key, prev);
-                    });
                 }
             }
         }
+
+        /// Is this `type_name` string a **unique** name for its type?
+        ///
+        /// The registry keys on `type_name::<Mk<..>>()`, so a key is only sound when that string
+        /// identifies exactly one type. Anonymous types break that: rustc renders every closure,
+        /// `async` block, and nested closure in one function as `{{closure}}`, with no
+        /// disambiguator, so two of them in the same function produce the *same* key.
+        ///
+        /// Names WITHOUT `{{closure}}` are unique and safe: named functions (`path::named_fn`),
+        /// function pointers (`fn(usize) -> usize` — one type, hence one monomorphisation, so
+        /// sharing a slot is correct), and ordinary named types.
+        fn key_is_nameable(name: &str) -> bool {
+            !name.contains("{{closure}}")
+        }
+
+        /// Panic if this key cannot be encoded uniquely.
+        ///
+        /// This fires on the FIRST registration or lookup made by a closure-instantiated method,
+        /// deterministically — it does not wait for an actual collision, so the failure does not
+        /// depend on which other closures happen to exist or on their layouts.
+        ///
+        /// It is a runtime check because a compile-time one is not expressible on stable: the
+        /// natural spelling is a `const` assertion over `type_name::<K>()`, but `type_name` is not
+        /// yet const-stable (`const_type_name`), and no stable alternative distinguishes two
+        /// closures (`TypeId` requires `'static`; a per-monomorphisation function address is merged
+        /// by identical-code folding in release builds).
+        fn assert_key_encodable(key: &'static str) {
+            assert!(
+                key_is_nameable(key),
+                "decycle: this method was instantiated with an anonymous type (a closure or `async` \
+                 block), which cannot be encoded as a re-entry registry key: rustc names every \
+                 closure in a function `{{{{closure}}}}`, so two of them in one function collide and \
+                 the floor would call the wrong one. Pass a named function, coerce to a function \
+                 pointer (`f as fn(_) -> _`), or set `support_infinite_cycle = false`. \
+                 Offending key: {}",
+                key
+            );
+        }
+
+        /// Open a registration scope. Every [`register`] call made while the returned
+        /// [`Registration`] is alive is rolled back when it drops — including on unwind. The
+        /// generated method prologue opens one of these before its registrations and holds it for
+        /// the rest of the body, so the entries stay live for exactly the descent they serve.
+        pub fn scope() -> Registration {
+            let mark = UNDO
+                .try_with(|u| u.borrow().len())
+                .unwrap_or(usize::MAX);
+            Registration { mark }
+        }
+
+        /// Register the full-height re-entry fn for key `(K, fp)` on this thread, within the
+        /// innermost open [`scope`].
+        ///
+        /// Call this only inside a live [`scope`]: the displacement record it logs is reclaimed when
+        /// a scope closes, so registering outside one leaves a record that is never reclaimed. All
+        /// generated code opens a scope first.
+        pub fn register<K: ?Sized>(fp: u64, f: *const ()) {
+            assert_key_encodable(type_name::<K>());
+            let key = (type_name::<K>(), fp);
+            let prev = REG
+                .try_with(|reg| reg.borrow_mut().insert(key, f))
+                .ok()
+                .flatten();
+            let _ = UNDO.try_with(|u| u.borrow_mut().push((key, prev)));
+        }
+
+        /// Look up the re-entry fn for key `(K, fp)`, copied out as a `*const ()`. The value is
+        /// copied and the `RefCell` borrow released before the not-registered panic can fire.
+        pub fn lookup<K: ?Sized>(fp: u64) -> *const () {
+            assert_key_encodable(type_name::<K>());
+            let found = REG
+                .try_with(|reg| reg.borrow().get(&(type_name::<K>(), fp)).copied())
+                .ok()
+                .flatten();
+            found.expect(
+                "decycle: re-entry fn not registered before the floor was reached. This floor's \
+                 key had no same-instantiation frame run on this thread's descent first — e.g. a \
+                 generic method's first descent at cycle width > recurse_level (including \
+                 self-recursion consuming ranks before the first generic cross-edge call), or an \
+                 impl whose cyclic bound targets a bare type parameter. Increase recurse_level. \
+                 (This can also fire when the call runs from a thread-local destructor, after the \
+                 registry for this thread has already been torn down.)",
+            )
+        }
     }
 
-    /// Is this `type_name` string a **unique** name for its type?
+    /// Stand-in for the registry when the `std` feature is off.
     ///
-    /// The registry keys on `type_name::<Mk<..>>()`, so a key is only sound when that string
-    /// identifies exactly one type. Anonymous types break that: rustc renders every closure,
-    /// `async` block, and nested closure in one function as `{{closure}}`, with no
-    /// disambiguator, so two of them in the same function produce the *same* key.
+    /// The registry is a `thread_local!` map, so unbounded re-entry cannot work without `std`.
+    /// Rather than let the generated code fail with `could not find __reentry in decycle` — which
+    /// names an internal module and suggests nothing — every entry point here carries a bound that
+    /// cannot be met, so the error names the thing to do. Bounded mode
+    /// (`support_infinite_cycle = false`) emits none of these calls and is unaffected.
+    /// Never implemented. Its name is the diagnostic, and it lives here rather than inside `imp`
+    /// so the error names `decycle::__reentry::…` instead of an inner module.
     ///
-    /// Names WITHOUT `{{closure}}` are unique and safe: named functions (`path::named_fn`),
-    /// function pointers (`fn(usize) -> usize` — one type, hence one monomorphisation, so
-    /// sharing a slot is correct), and ordinary named types.
-    fn key_is_nameable(name: &str) -> bool {
-        !name.contains("{{closure}}")
+    /// The bound sits on `register`/`lookup`'s existing `K` parameter rather than on a concrete
+    /// type, so it is checked where the generated code CALLS them. A `where (): _` bound would be
+    /// a trivial bound on a concrete type and would fire here, in this crate, for every user —
+    /// including the structural ones this is meant to leave alone.
+    #[cfg(not(feature = "std"))]
+    pub trait UnboundedReentryRequiresTheDecycleStdFeature {}
+
+    #[cfg(not(feature = "std"))]
+    mod imp {
+        use super::UnboundedReentryRequiresTheDecycleStdFeature;
+
+        pub struct Registration;
+
+        /// Ungated: opening a scope is harmless, and `register` below already carries the error.
+        /// Reporting it once, at the registration, beats repeating it per frame.
+        pub fn scope() -> Registration {
+            Registration
+        }
+
+        pub fn register<K: ?Sized + UnboundedReentryRequiresTheDecycleStdFeature>(
+            _fp: u64,
+            _f: *const (),
+        ) {
+        }
+
+        pub fn lookup<K: ?Sized + UnboundedReentryRequiresTheDecycleStdFeature>(
+            _fp: u64,
+        ) -> *const () {
+            core::ptr::null()
+        }
     }
 
-    /// Panic if this key cannot be encoded uniquely.
-    ///
-    /// This fires on the FIRST registration or lookup made by a closure-instantiated method,
-    /// deterministically — it does not wait for an actual collision, so the failure does not
-    /// depend on which other closures happen to exist or on their layouts.
-    ///
-    /// It is a runtime check because a compile-time one is not expressible on stable: the
-    /// natural spelling is a `const` assertion over `type_name::<K>()`, but `type_name` is not
-    /// yet const-stable (`const_type_name`), and no stable alternative distinguishes two
-    /// closures (`TypeId` requires `'static`; a per-monomorphisation function address is merged
-    /// by identical-code folding in release builds).
-    fn assert_key_encodable(key: &'static str) {
-        assert!(
-            key_is_nameable(key),
-            "decycle: this method was instantiated with an anonymous type (a closure or `async` \
-             block), which cannot be encoded as a re-entry registry key: rustc names every \
-             closure in a function `{{{{closure}}}}`, so two of them in one function collide and \
-             the floor would call the wrong one. Pass a named function, coerce to a function \
-             pointer (`f as fn(_) -> _`), or set `support_infinite_cycle = false`. \
-             Offending key: {}",
-            key
-        );
-    }
+    pub use imp::{lookup, register, scope, Registration};
 
-    /// Open a registration scope. Every [`register`] call made while the returned
-    /// [`Registration`] is alive is rolled back when it drops — including on unwind. The
-    /// generated method prologue opens one of these before its registrations and holds it for
-    /// the rest of the body, so the entries stay live for exactly the descent they serve.
-    pub fn scope() -> Registration {
-        let mark = UNDO
-            .try_with(|u| u.borrow().len())
-            .unwrap_or(usize::MAX);
-        Registration { mark }
-    }
-
-    /// Register the full-height re-entry fn for key `(K, fp)` on this thread, within the
-    /// innermost open [`scope`].
-    ///
-    /// Call this only inside a live [`scope`]: the displacement record it logs is reclaimed when
-    /// a scope closes, so registering outside one leaves a record that is never reclaimed. All
-    /// generated code opens a scope first.
-    pub fn register<K: ?Sized>(fp: u64, f: *const ()) {
-        assert_key_encodable(type_name::<K>());
-        let key = (type_name::<K>(), fp);
-        let prev = REG
-            .try_with(|reg| reg.borrow_mut().insert(key, f))
-            .ok()
-            .flatten();
-        let _ = UNDO.try_with(|u| u.borrow_mut().push((key, prev)));
-    }
-
-    /// Look up the re-entry fn for key `(K, fp)`, copied out as a `*const ()`. The value is
-    /// copied and the `RefCell` borrow released before the not-registered panic can fire.
-    pub fn lookup<K: ?Sized>(fp: u64) -> *const () {
-        assert_key_encodable(type_name::<K>());
-        let found = REG
-            .try_with(|reg| reg.borrow().get(&(type_name::<K>(), fp)).copied())
-            .ok()
-            .flatten();
-        found.expect(
-            "decycle: re-entry fn not registered before the floor was reached. This floor's \
-             key had no same-instantiation frame run on this thread's descent first — e.g. a \
-             generic method's first descent at cycle width > recurse_level (including \
-             self-recursion consuming ranks before the first generic cross-edge call), or an \
-             impl whose cyclic bound targets a bare type parameter. Increase recurse_level. \
-             (This can also fire when the call runs from a thread-local destructor, after the \
-             registry for this thread has already been torn down.)",
-        )
-    }
 }
 
 #[doc(hidden)]
+#[cfg(feature = "api")]
 pub use decycle_impl::proc_macro_error;
 #[doc(hidden)]
+#[cfg(feature = "api")]
 pub use decycle_impl::type_leak;

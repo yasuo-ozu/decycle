@@ -1394,8 +1394,11 @@ fn emit_forwarding_assertion(sw: &StrippedWrapped, scc: &Scc, reduced: &syn::Gen
     // Named so the failing bound reads as an explanation:
     //   error[E0277]: the trait bound `Box<__DecycleElem>: Tr` is not satisfied
     //   note: required by a bound in `stripped_wrapped_bound_needs_its_container_to_forward_the_trait`
-    let needs = format_ident!("stripped_wrapped_bound_needs_its_container_to_forward_the_trait");
-    let assert = format_ident!("__decycle_check_wrapped_bound_forwards");
+    let needs = Ident::new(
+        "stripped_wrapped_bound_needs_its_container_to_forward_the_trait",
+        Span::call_site(),
+    );
+    let assert = Ident::new("__decycle_check_wrapped_bound_forwards", Span::call_site());
     let u = memberx_ident();
     let x = memberx_ident();
     quote! {

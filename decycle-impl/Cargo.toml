@@ -16,17 +16,9 @@ path = "src/lib.rs"
 [dependencies]
 proc-macro2 = "1.0"
 proc-macro-error = { version = "1.0", default-features = false }
-# type-leak 0.7 (safegraph-backed, MSRV 1.56) replaces 0.6 (gotgraph-backed, empirical
-# it depends on `safegraph` with default-features off, so it pulls no `sprs`.
 type-leak = "0.7.0"
-# Re-exported as `decycle_impl::safegraph`: `analysis::analyze_module` returns a `VecGraph`, so
-# callers must be able to name the type without depending on it themselves.
-# `default-features = false`: safegraph's default `matrix` feature pulls `sprs`, which declares
-# rustc 1.88 and would set this crate's MSRV. Nothing here uses the matrix backend.
 safegraph = { version = "0.2.0", default-features = false }
 template-quote = "0.4.0"
-# Used only by the `structural` unroll (the ranked engine uses `template-quote`).
-quote = "1.0"
 
 [dependencies.syn]
 version = "2.0"

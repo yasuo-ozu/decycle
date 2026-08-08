@@ -12,7 +12,7 @@
 //! container predicate (`Box<Stmt>: Tr`) is stripped.
 
 use proc_macro2::{Span, TokenStream};
-use quote::{format_ident, quote, ToTokens};
+use template_quote::{quote, ToTokens};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use syn::{
     parse_quote, spanned::Spanned, Attribute, GenericArgument, GenericParam, Ident, ImplItem, Item,

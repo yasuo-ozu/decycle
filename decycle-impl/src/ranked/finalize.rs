@@ -24,7 +24,7 @@ macro_rules! name {
 fn name(s: &str) -> Ident {
     static RANDOM_SUFFIX: OnceLock<String> = OnceLock::new();
 
-    let suffix = RANDOM_SUFFIX.get_or_init(|| crate::get_random().to_string());
+    let suffix = RANDOM_SUFFIX.get_or_init(|| crate::name_suffix(crate::get_random()));
     Ident::new(&format!("{}{}", s, suffix), Span::call_site())
 }
 

@@ -18,20 +18,10 @@ traits with circular dependencies that would otherwise fail to compile.
 
 ## Quick Start
 
-This crate is **not yet published in a usable state.** Use a git dependency:
-
 ```toml
 [dependencies]
-decycle = { git = "https://github.com/yasuo-ozu/decycle" }
+decycle = "0.5.0"
 ```
-
-> **Why not crates.io?** The newest release there is **0.3.0**, and it is unsound at default
-> settings: with `support_infinite_cycle = true` (the default), recursion deeper than
-> `recurse_level` can crash (SIGSEGV). It has not been yanked, so `cargo add decycle` still
-> resolves to it — prefer the git dependency until the next release. Most of what this README
-> documents (the structural engine, full-height unbounded re-entry, the `analysis` API, and the
-> re-entry soundness fixes) is not in 0.3.0 at all. If you must use it, set
-> `#[decycle(support_infinite_cycle = false)]` on every module.
 
 ## Why Decycle?
 

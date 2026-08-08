@@ -8,8 +8,7 @@ license = "MIT"
 repository = "https://github.com/yasuo-ozu/decycle"
 keywords = ["macro", "trait", "recursive", "circular", "obligation"]
 categories = ["rust-patterns", "development-tools::procedural-macro-helpers"]
-authors = ["yasuo-ozu"]
-exclude = ["docs/"]
+authors = ["Yasuo Ozu <yasuo@ozu.email>"]
 
 [lib]
 path = "lib.rs"
@@ -24,9 +23,7 @@ typedef = { path = "tests/typedef" }
 alsorank_bridge = { path = "tests/alsorank_bridge" }
 graph_bridge = { path = "tests/graph_bridge" }
 trybuild = "1.0"
-# `analysis::analyze_module` takes a `syn::ItemMod`, so any caller needs `syn` anyway; the
-# reachability test in `tests/analysis_api.rs` is written the way a user would write it.
-syn = { version = "2.0", features = ["full", "parsing", "printing"] }
+syn = "2.0"
 
 [workspace]
 members = [

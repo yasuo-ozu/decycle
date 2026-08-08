@@ -8,7 +8,7 @@ license = "MIT"
 repository = "https://github.com/yasuo-ozu/decycle"
 keywords = ["macro", "trait", "recursive", "circular", "obligation"]
 categories = ["rust-patterns", "development-tools::procedural-macro-helpers"]
-authors = ["yasuo-ozu"]
+authors = ["Yasuo Ozu <yasuo@ozu.email>"]
 
 [lib]
 proc-macro = true

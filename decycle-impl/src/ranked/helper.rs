@@ -70,7 +70,7 @@ pub fn path_names_local_ident(path: &Path, names: &std::collections::HashSet<Ide
 /// named `__arg_1_`; deterministic across compilations, like every other generated ident here.
 fn arg_ident_name(ix: usize) -> String {
     static RANDOM_SUFFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let suffix = RANDOM_SUFFIX.get_or_init(|| crate::get_random().to_string());
+    let suffix = RANDOM_SUFFIX.get_or_init(|| crate::name_suffix(crate::get_random()));
     format!("__arg_{ix}_{suffix}")
 }
 

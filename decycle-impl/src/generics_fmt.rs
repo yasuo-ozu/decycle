@@ -10,7 +10,7 @@
 //! lifetime param to the bare lifetime.
 
 use proc_macro2::TokenStream;
-use quote::quote;
+use template_quote::quote;
 use syn::{GenericParam, Generics};
 
 /// How a *type* parameter's bounds are rendered when the param appears in a declaration.

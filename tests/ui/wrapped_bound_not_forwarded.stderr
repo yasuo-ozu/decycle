@@ -5,7 +5,7 @@ error[E0277]: the trait bound `std::boxed::Box<__DecycleElem>: Tr` is not satisf
    |         ^^^^^^^^^ the trait `Tr` is not implemented for `std::boxed::Box<__DecycleElem>`
    |
    = help: the following other types implement trait `Tr`:
-             __StmtTerm_8384be7988ecad3c
+             __StmtTerm_bcdf6e40a9057a6e
              ast::Stmt
 note: required by a bound in `stripped_wrapped_bound_needs_its_container_to_forward_the_trait`
   --> tests/ui/wrapped_bound_not_forwarded.rs:20:20

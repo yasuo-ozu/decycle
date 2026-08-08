@@ -254,6 +254,19 @@ fn main() {}
 > `support_infinite_cycle = false`: bounded mode emits no registry and accepts closures unchanged.
 > It also does not apply to the structural engine (which rejects `impl Fn(&Self)` at compile time
 > for its own, unrelated reason — see the table).
+>
+> **This is a permanent restriction, not a pending fix.** Two closures of the same layout cannot be
+> told apart at run time on stable Rust, so there is no key the registry could switch to. Concretely,
+> the following are rejected under `support_infinite_cycle = true`:
+>
+> | instantiated with | accepted? |
+> |---|---|
+> | a named function (`fn add7`) | ✓ |
+> | a non-capturing closure coerced to `fn` (`(\|v\| v + 7) as fn(usize) -> usize`) | ✓ |
+> | a closure, capturing or not | ✗ |
+> | an `async` block, or an `async fn`'s returned future | ✗ |
+> | a closure nested inside another closure | ✗ |
+> | a `-> impl Fn(..)` return value | ✗ |
 
 
 ## How the algorithms work?

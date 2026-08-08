@@ -37,7 +37,7 @@ pub(crate) fn run_ident(nonce: u64) -> Ident {
 
 /// A fresh parameter ident for a normalized (destructured / `mut` / `ref`) param at index `i`.
 pub(crate) fn arg_ident(i: usize, nonce: u64) -> Ident {
-    Ident::new(&format!("__decycle_arg{}_{}", i, crate::name_suffix(nonce)), Span::call_site())
+    crate::arg_ident(i, &crate::name_suffix(nonce))
 }
 
 /// The generic placeholder type used in a forwarding assertion. It stands for "any element type that

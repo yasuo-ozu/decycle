@@ -1,4 +1,4 @@
-use proc_macro2::{Span, TokenStream};
+use proc_macro2::TokenStream;
 use proc_macro_error::*;
 use syn::punctuated::Punctuated;
 use syn::*;
@@ -66,12 +66,12 @@ pub fn path_names_local_ident(path: &Path, names: &std::collections::HashSet<Ide
 
 /// The fresh binding `reduce_pat` mints for a destructured parameter at position `ix`.
 ///
-/// Carries the crate-identity suffix so it cannot collide with a user parameter that happens to be
-/// named `__arg_1_`; deterministic across compilations, like every other generated ident here.
-fn arg_ident_name(ix: usize) -> String {
+/// Delegates to the shared minter so both engines produce the same shape; the suffix keeps it from
+/// colliding with a user parameter and is deterministic across compilations.
+fn arg_ident(ix: usize) -> Ident {
     static RANDOM_SUFFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let suffix = RANDOM_SUFFIX.get_or_init(|| crate::name_suffix(crate::get_random()));
-    format!("__arg_{ix}_{suffix}")
+    crate::arg_ident(ix, suffix)
 }
 
 /// Inserts a `Type` as a `GenericArgument::Type` at the given position
@@ -155,7 +155,7 @@ impl FnArgScheme for FnArg {
                     // pure function of the crate identity, so it stays deterministic across
                     // compilations (reproducible builds, stable trybuild snapshots).
                     **pat = Pat::Ident(PatIdent {
-                        ident: Ident::new(&arg_ident_name(ix), Span::call_site()),
+                        ident: arg_ident(ix),
                         attrs: vec![],
                         by_ref: None,
                         mutability: None,

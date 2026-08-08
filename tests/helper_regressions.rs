@@ -62,16 +62,16 @@ mod arg_name_collision {
     where
         B: Tr,
     {
-        fn g(&self, (x, y): (usize, usize), __arg_1_: usize) -> usize {
-            x + y + __arg_1_ + self.0.g((1, 2), 3)
+        fn g(&self, (x, y): (usize, usize), __decycle_arg1_: usize) -> usize {
+            x + y + __decycle_arg1_ + self.0.g((1, 2), 3)
         }
     }
     impl Tr for B
     where
         A: Tr,
     {
-        fn g(&self, (x, y): (usize, usize), __arg_1_: usize) -> usize {
-            x + y + __arg_1_
+        fn g(&self, (x, y): (usize, usize), __decycle_arg1_: usize) -> usize {
+            x + y + __decycle_arg1_
         }
     }
 }

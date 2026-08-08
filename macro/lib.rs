@@ -182,7 +182,9 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
         if module
             .content
             .as_ref()
-            .is_none_or(|(_, items)| items.is_empty())
+            // `map_or(true, …)`, not `is_none_or`: the latter is stable only since 1.82 and
+            // this crate's MSRV is 1.71.
+            .map_or(true, |(_, items)| items.is_empty())
         {
             abort!(
                 Span::call_site(),

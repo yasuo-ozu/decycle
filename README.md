@@ -188,13 +188,14 @@ fn main() {}
 | **`#[track_caller]`** on a cycle method | ✗ in unbounded mode (clean compile error) / **✓** when `support_infinite_cycle = false` | **✓** |
 | Non-`#[decycle]` **supertrait** on the trait | **✓** | ✗ |
 | Third-party trait *in* the cycle | only when `#[decycle]`-annotated at its definition | **✓**  |
-> **`no_std` and dependencies.** Neither engine works on `no_std` today, and the crate is not
-> dependency-light. `decycle-impl` is a regular dependency of the facade, so roughly 18 crates —
-> including `safegraph -> sprs -> ndarray -> matrixmultiply` — are compiled for your target.
-> `type-leak` is likewise an unconditional dependency of the proc-macro, for *both* engines; the
-> structural engine emits no runtime machinery, but that is a statement about generated code, not
-> about the dependency graph. That tree is also what sets the MSRV: `sprs` requires rustc 1.88,
-> which is why this crate declares 1.88 rather than anything lower.
+> **`no_std` and dependencies.** Neither engine works on `no_std` today: `decycle-impl` is a
+> regular dependency of the facade, so its crates are compiled for your target, and `__reentry`
+> itself uses `thread_local!`/`HashMap`. `type-leak` is likewise an unconditional dependency of
+> the proc-macro, for *both* engines; the structural engine emits no runtime machinery, but that
+> is a statement about generated code, not about the dependency graph. The heavy part of that
+> graph is gone, though: `safegraph` is taken with `default-features = false`, so its optional
+> `sprs`/`ndarray`/`matrixmultiply` matrix backend is not pulled in — which is also what keeps
+> the MSRV at 1.71.
 
 > **Note on "growing" type arguments.** Neither engine can make a *genuinely* growing recursion work —
 > one whose instantiation strictly grows every level, e.g. `A<Vec<X>>: Tr` on `impl<X> Tr for A<X>`, or a

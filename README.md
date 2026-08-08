@@ -82,8 +82,7 @@ The `#[decycle]` macro solves this by breaking the circular dependency cycle.
 This example shows how to break circular trait dependencies using `#[decycle]`:
 
 ```rust
-use decycle::decycle;
-
+#use decycle::decycle;
 #[decycle]
 mod calculator {
     #[decycle]
@@ -99,15 +98,16 @@ mod calculator {
         Term: Evaluate,
     {
         fn evaluate(&self, input: &[&'static str], index: &mut usize) -> i32 {
-            let left_val = Term.evaluate(input, index);
-            let op = input[*index];
-            *index += 1;
-            let right_val = Term.evaluate(input, index);
-            match op {
-                "+" => left_val + right_val,
-                "-" => left_val - right_val,
-                _ => left_val,
-            }
+            // same
+            # let left_val = Term.evaluate(input, index);
+            # let op = input[*index];
+            # *index += 1;
+            # let right_val = Term.evaluate(input, index);
+            # match op {
+            #     "+" => left_val + right_val,
+            #     "-" => left_val - right_val,
+            #     _ => left_val,
+            # }
         }
     }
 
@@ -116,15 +116,16 @@ mod calculator {
         Expr: Evaluate,
     {
         fn evaluate(&self, input: &[&'static str], index: &mut usize) -> i32 {
-            let token = input[*index];
-            *index += 1;
-            if token == "(" {
-                let result = Expr.evaluate(input, index);
-                *index += 1; // skip closing ')'
-                result
-            } else {
-                token.parse::<i32>().unwrap()
-            }
+            // same
+            # let token = input[*index];
+            # *index += 1;
+            # if token == "(" {
+            #     let result = Expr.evaluate(input, index);
+            #     *index += 1; // skip closing ')'
+            #     result
+            # } else {
+            #     token.parse::<i32>().unwrap()
+            # }
         }
     }
 }
@@ -143,22 +144,23 @@ You can also annotate `use` items inside the module to use traits defined out of
 the module:
 
 ```rust
-use decycle::decycle;
+#use decycle::decycle;
 
+// can be defined out of the crate
 #[decycle]
 pub trait Evaluate {
     fn evaluate(&self, input: &[&'static str], index: &mut usize) -> i32;
 }
 
 #[decycle]
-#[allow(dead_code)]
+##[allow(dead_code)]
 mod cycle {
     #[decycle]
     use super::{Evaluate};
 
     // ...
 }
-fn main() {}
+#fn main() {}
 ```
 
 ## Two algorithms
@@ -171,12 +173,10 @@ fn main() {}
 | Deep-recursion **runtime cost** | not zero-cost | **zero-cost** |
 | **Unbounded depth** | only when `support_infinite_cycle = true` | always |
 | Re-entry across **several instantiations** of a generic method | **✓** | ✗ |
-| Genuinely **growing** type argument (one wrapper per level) | ✗ | ✗ |
 | **`no_std`** | only when `support_infinite_cycle = false` | **✓** |
 | Arg mentioning `Self`: **`impl Fn(&Self)`** (APIT) | **✓** — but see the row below | ✗ (use generics) |
-| Generic arg instantiated with an **anonymous type** (closure, `async` block, `-> impl Trait` value) | ✗ in unbounded mode — rejected at runtime; a named fn or `fn` pointer works. Not a pending fix — see the closure note below | **✓** |
+| Generic arg instantiated with an **anonymous type** (closure, `async` block, `-> impl Trait` value) | ✗ in unbounded mode — see the closure note below | **✓** |
 | Arg mentioning `Self`: **`fn(&Self)`** / **`&dyn Fn(&Self)`** | ✗ | **✓** |
-| **`#[track_caller]`** on a cycle method | ✗ in unbounded mode (clean compile error) / **✓** when `support_infinite_cycle = false` | **✓** |
 | Non-`#[decycle]` **supertrait** on the trait | **✓** | ✗ |
 | Third-party trait *in* the cycle | only when `#[decycle]`-annotated at its definition | **✓**  |
 
@@ -228,14 +228,13 @@ fn main() {}
 
 <summary>Ranked traits</summary>
 
-`#[decycle]` rewrites the annotated module into a set of ranked helper traits. Each
-original trait gets a hidden "Ranked" version that carries an extra type parameter
-representing recursion depth. Implementations are duplicated with that rank parameter, and
-calls are delegated through the ranked trait for the current depth. This breaks the direct
-cycle at the type level. Past the floor it can re-enter through a type-erased fn pointer, which lets
-one cycle serve **several instantiations** of a generic method — so prefer it unless you specifically
-want zero runtime machinery. (It does not make a genuinely *growing* type argument work; nothing can —
-see the note above.)
+**The idea.** Every trait in the cycle gets a hidden "Ranked" twin carrying one extra type
+parameter, which stands for remaining recursion depth. Your impls are duplicated against that
+parameter, and calls go through the twin at the current depth. Because each rank refers only to
+the rank below it, the obligation is no longer circular — the compiler can solve it.
+
+That chain has to end somewhere; the last rank is the **floor**. What happens there is what
+`support_infinite_cycle` selects, and it is the whole difference between the two modes below.
 
 Smallest example (two mutually recursive traits):
 
@@ -308,41 +307,34 @@ mod cycle {
 fn main() {}
 ```
 
-When `support_infinite_cycle = true` (the default), the deepest rank (the "floor")
-does not stop: it re-enters the *original* trait impl at full height through a
-type-erased fn pointer held in a **thread-local** registry, keyed by the
-`type_name` of a generated per-(trait, method, instantiation) marker type plus a
-layout fingerprint of the keyed types. A key is only sound when that string names
-exactly one type, and `type_name` is not injective for anonymous types — rustc
-renders every closure and `async` block declared in one fn as `{{closure}}`, with
-no disambiguator — so a method instantiated with a closure or `async` block is
-rejected at runtime on its first call with a panic mentioning "anonymous type"
-(pass a named function or coerce to a function pointer; see the closure note
-under *Two algorithms*). Every inductive frame idempotently
-registers the re-entry fns for itself and for its cyclic-bound siblings before
-descending — on the same call stack, hence the same thread — so the floor's
-lookup finds its target on every thread independently: for any cycle width, at
-any `recurse_level >= 1`, including generic methods (each instantiation gets its
-own key). Recursion depth is then bounded only by the OS stack, like any
-recursive-descent code — which also means a genuinely non-terminating cycle
-overflows the stack instead of being cut off. The cost is a small constant
-number of lock-free thread-local map inserts per inductive frame (hoisted into
-a shared per-impl helper call for everything except the frame's own
-self-registration) and one lookup per floor crossing (every `recurse_level`
-levels of real recursion). Three floors fail closed with an
-actionable, isolated panic (it cannot corrupt or poison other cycles or
-threads): a generic method's floor reached before any frame of that
-instantiation ran on the current thread (e.g. a first descent at cycle width >
-`recurse_level`); any floor of an impl whose cyclic bound targets a bare
-type parameter (`impl<T: Cb> Ca for Wrap<T>` — its re-entry registration is not
-expressible, so such a cycle is unbounded only through its other impls); and a
-heterogeneous side-bound cycle where the registering impl's own bounds don't
-syntactically cover every bound a reachable sibling impl needs (its
-registration is skipped rather than risk naming an unprovable obligation).
+**Past the floor (`support_infinite_cycle = true`, the default).** The deepest rank does not
+stop. It re-enters the *original* trait impl at full height through a type-erased fn pointer,
+so recursion depth is bounded only by the OS stack, like any recursive-descent code. (A
+genuinely non-terminating cycle therefore overflows the stack rather than being cut off.)
 
-When it is `false`, no runtime machinery is emitted (zero-cost) and decycle
-stops at the configured `recurse_level` with an `unimplemented!` panic once the
-limit is reached.
+The pointer lives in a **thread-local** registry. Every inductive frame registers what it and
+its cyclic-bound siblings need before descending — on the same call stack, hence the same
+thread — so each thread's lookups find their own targets, independently, for any cycle width
+at any `recurse_level >= 1`. Generic methods work too: each instantiation gets its own entry.
+
+**What it costs.** A few thread-local map inserts per inductive frame, and one lookup per floor
+crossing — that is, once every `recurse_level` levels of real recursion, not once per call.
+
+**Where it stops instead.** A few shapes cannot be registered. Each fails closed with an
+actionable panic that cannot corrupt or poison other cycles or threads:
+
+- a method instantiated with a **closure** or `async` block (see the closure note under
+  *Two algorithms*);
+- a **generic method** whose floor is reached before any frame of that instantiation ran on
+  this thread — e.g. a first descent at cycle width greater than `recurse_level`;
+- an impl whose cyclic bound targets a **bare type parameter**
+  (`impl<T: Cb> Ca for Wrap<T>`), or a heterogeneous side-bound cycle whose registering impl
+  does not syntactically cover what a reachable sibling needs. Such a cycle is still unbounded
+  through its other impls.
+
+**At the floor (`support_infinite_cycle = false`).** No runtime machinery is emitted at all —
+this is the zero-cost mode. Recursion simply stops at the configured `recurse_level`, panicking
+with `unimplemented!` if it is exceeded.
 
 </details>
 
@@ -390,17 +382,19 @@ fn main() {
 }
 ```
 
-**How it works.** For each cycle-member type `Xxx` it emits a `#[repr(transparent)]`
-terminator `__XxxTerm(pub Xxx)` (with the same visibility as `Xxx`). Each trait impl is
-placed on the terminator via a *trait-def-inside-body* pattern — a private local trait
-whose method holds the **original body verbatim**, implemented for the natural type so
-`self`, `Self` and constructors resolve unchanged. The natural type's impl then delegates
-to the terminator by a same-layout `transmute_copy`. The obligation cycle is broken by
-**stripping the cyclic `where`-bounds** from the terminator/natural impls (a *bare* cyclic
-bound is kept on the local body impl, where it resolves on-sight through the natural impl
-and still pins otherwise-uninferable generics). Cross-trait cycles
-(`Expr: Eval → Expr: Size → Expr: Eval`) are recognised via a `(type, trait)`-pair
-obligation graph.
+**The idea.** Each cycle-member type `Xxx` gets a `#[repr(transparent)]` twin
+`__XxxTerm(pub Xxx)` — same layout, same visibility, but a *different type* as far as the
+trait solver is concerned. The impl moves onto the twin, and the cyclic `where`-bounds are
+stripped from it, which is what breaks the obligation. Your natural type then delegates to the
+twin through a same-layout cast.
+
+**Why your code still reads the same.** The method body is not rewritten. It is placed
+verbatim on a private local trait implemented for the *natural* type, so `self`, `Self` and
+constructors mean exactly what they did before. The one bare cyclic bound that remains lives
+there, where it resolves on sight and still pins generics that would otherwise be uninferable.
+
+Cross-trait cycles (`Expr: Eval → Expr: Size → Expr: Eval`) are found with a
+`(type, trait)`-pair obligation graph, so they work the same way.
 
 The expansion of the example above (simplified, real internal names):
 
@@ -408,9 +402,11 @@ The expansion of the example above (simplified, real internal names):
 mod ast {
     #[inline]
     unsafe fn __decycle_cast<A, B>(a: A) -> B {
-        let b = ::core::mem::transmute_copy::<A, B>(&a);
-        ::core::mem::forget(a);
-        b
+        // `a` is parked in `ManuallyDrop` and never moved again, so the bitwise copy is the
+        // only owner. (Moving `a` into a `forget` *after* the copy would retag any `Box`
+        // inside it and invalidate the value just produced.)
+        let a = ::core::mem::ManuallyDrop::new(a);
+        ::core::mem::transmute_copy::<::core::mem::ManuallyDrop<A>, B>(&a)
     }
 
     pub trait Eval { fn eval(&self) -> i64; }

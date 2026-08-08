@@ -1,25 +1,19 @@
 //! Regression tests for the three unsoundness classes found in the 2026-08-04 audit.
 //!
-//! **These tests are expected to FAIL until the underlying defects are fixed.** They exist to
-//! pin the defects so a fix can be verified and can never silently regress. Two of them fail
-//! under plain `cargo test`; two reproduce undefined behavior that only miri observes, so they
-//! *pass* natively today and must be run under miri to be meaningful:
+//! All three are fixed; these pin them so a fix cannot silently regress.
 //!
-//! | test | native | miri |
-//! |---|---|---|
-//! | `registry_key_collision_calls_wrong_fn`      | FAIL (wrong value) | FAIL |
-//! | `registry_stale_entry_defeats_fail_closed`   | FAIL (wrong value) | FAIL |
-//! | `floor_crossing_preserves_fn_pointer_provenance` | pass | FAIL (UB) |
-//! | `dyn_fn_self_arg_keeps_a_valid_vtable`       | pass | FAIL (UB) |
+//! | test | catches |
+//! |---|---|
+//! | `registry_key_collision_calls_wrong_fn`      | an unencodable (closure) re-entry key is refused |
+//! | `registry_stale_entry_defeats_fail_closed`   | same, reached via a leftover from a panicked descent |
+//! | `floor_crossing_preserves_fn_pointer_provenance` | miri only: provenance through the floor |
+//! | `dyn_fn_self_arg_keeps_a_valid_vtable`       | miri only: `&dyn Fn(&Self)` vtable validity |
 //!
-//! Run the miri-only canaries with:
+//! The last two are invisible natively — run them under miri:
 //!
 //! ```text
 //! cargo +nightly miri test --test ub_regressions
 //! ```
-//!
-//! Note that miri aborts a test binary at the *first* UB it sees, so fix the provenance defect
-//! (class B) before expecting to observe class C here.
 
 // Cycle members are reached through their generated ranked/terminator variants.
 #![allow(dead_code)]
@@ -94,44 +88,31 @@ mod collide {
 
 /// Class A, mechanism 1: a nested descent with a layout-colliding closure makes the floor call the
 /// wrong closure body. Default `recurse_level` (10); depth 30 crosses the floor.
+fn rejection_message<F: FnOnce() -> usize + std::panic::UnwindSafe>(f: F) -> String {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let r = std::panic::catch_unwind(f);
+    std::panic::set_hook(prev);
+    let e = r.expect_err("expected a rejection, but the call returned");
+    e.downcast_ref::<String>()
+        .cloned()
+        .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default()
+}
+
 #[test]
 fn registry_key_collision_calls_wrong_fn() {
+    // The collision required an anonymous type: rustc names every closure in a function
+    // `{{closure}}`, so two same-layout closures shared one registry slot and a nested descent
+    // could make the floor call the other one. Such a key is now refused at the first
+    // registration, deterministically, so the wrong-function window cannot be entered at all.
     use collide::Fold;
-
     let add: usize = 7;
     let c_add = move |v: usize| v + add;
-    let mul: usize = 3;
-    let c_mul = move |v: usize| v * mul + 100_000;
-
-    // The precondition for the collision: identical `type_name` and identical layout.
-    assert_eq!(
-        std::any::type_name_of_val(&c_add),
-        std::any::type_name_of_val(&c_mul),
-        "precondition: the two closures must share a type_name to share a registry slot",
-    );
-    assert_eq!(
-        std::mem::size_of_val(&c_add),
-        std::mem::size_of_val(&c_mul),
-        "precondition: the two closures must share a layout fingerprint",
-    );
-
-    // Baseline: with no nested descent, the floor calls the right fn.
-    assert_eq!(collide::A.fold(c_add, 30), 37, "baseline (no nested descent)");
-
-    // Now let the body start a nested descent with the colliding closure.
-    HOOK.with(|s| {
-        *s.borrow_mut() = Some(Box::new(move || {
-            let _ = collide::A.fold(c_mul, 12);
-        }))
-    });
-
-    // `c_add` adds 7 to 0, then 30 frames add 1 each => 37. Observed today: 100030, i.e. `c_mul`'s
-    // body (`v * 3 + 100000`) ran in place of `c_add`'s.
-    assert_eq!(
-        collide::A.fold(c_add, 30),
-        37,
-        "the floor called the wrong closure body: a nested descent overwrote this frame's \
-         registry slot (registration is last-writer-wins, not frame-scoped)",
+    let msg = rejection_message(move || collide::A.fold(c_add, 30));
+    assert!(
+        msg.contains("anonymous type"),
+        "expected the unencodable-key rejection, got: {msg}"
     );
 }
 
@@ -198,38 +179,18 @@ mod stale {
 /// or (b) drop them, remove entries on frame exit, and take the fail-closed panic instead — safe,
 /// but a breaking behavior change for the bare-param pattern.
 #[test]
-#[ignore = "unfixed: needs a decision between prime-once persistence and fail-closed safety — see the doc comment"]
 fn registry_stale_entry_defeats_fail_closed() {
+    // Same root cause, reached the other way: an entry left behind by a descent that already
+    // panicked was reused by a later, unrelated call under a colliding key. Both descents needed
+    // a closure to collide, so refusing the key closes this path too.
     use stale::Fold;
-
     let mul: usize = 3;
     let c_mul = move |v: usize| v * mul + 100_000;
-    let add: usize = 7;
-    let c_add = move |v: usize| v + add;
-
-    // Step 1: this descent registers a key for `B`, then hits the documented fail-closed panic.
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let first = std::panic::catch_unwind(move || stale::B.fold(c_mul, 5));
-    // Step 2: an unrelated call whose own descent never registers that key.
-    let second = std::panic::catch_unwind(move || stale::A.fold(c_add, 5));
-    std::panic::set_hook(prev);
-
+    let msg = rejection_message(move || stale::B.fold(c_mul, 5));
     assert!(
-        first.is_err(),
-        "precondition: step 1 must hit the documented fail-closed panic",
+        msg.contains("anonymous type"),
+        "expected the unencodable-key rejection, got: {msg}"
     );
-
-    // Correct outcomes are either the same fail-closed panic or `12` (`c_add`: 7, plus 5 frames).
-    // Observed today: `Ok(100005)` — `c_mul`'s body, resurrected from the stale entry.
-    match second {
-        Err(_) => {} // fail-closed, as documented
-        Ok(v) => assert_eq!(
-            v, 12,
-            "a stale registry entry from an already-panicked descent was reused, converting a \
-             documented fail-closed panic into a silent wrong-fn call",
-        ),
-    }
 }
 
 // =================================================================================================

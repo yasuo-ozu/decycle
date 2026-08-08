@@ -34,6 +34,17 @@ fn fp_of<T>() -> u64 {
     fp_fold(FP_SEED, core::mem::size_of::<T>(), core::mem::align_of::<T>())
 }
 
+/// Call a looked-up entry the way a generated floor does: transmute to the fn type and invoke.
+///
+/// Behaviour, never pointer identity. Rust does not promise a function has a stable address —
+/// identical functions may be merged and one function may have several addresses — so comparing
+/// `fn as *const ()` values is checking something the language does not guarantee (miri models
+/// this and hands out different addresses for repeated casts). What the registry must actually
+/// guarantee is that the entry calls the RIGHT function, which is what these tests assert.
+fn call(p: *const (), n: u32) -> u32 {
+    unsafe { core::mem::transmute::<*const (), fn(u32) -> u32>(p)(n) }
+}
+
 #[test]
 fn hand_key_round_trips_through_floor_lookup() {
     register::<HandMk<MemberA>>(fp_of::<MemberA>(), reentry_a as *const ());
@@ -58,23 +69,14 @@ fn registration_is_idempotent_and_per_instantiation() {
     // `register_all_members` may run on every facade entry — same key, same fn, harmless:
     register::<HandMk<MemberA>>(fp_of::<MemberA>(), reentry_a as *const ());
     register::<HandMk<MemberA>>(fp_of::<MemberA>(), reentry_a as *const ());
-    assert_eq!(
-        lookup::<HandMk<MemberA>>(fp_of::<MemberA>()),
-        reentry_a as *const ()
-    );
+    assert_eq!(call(lookup::<HandMk<MemberA>>(fp_of::<MemberA>()), 41), 42);
     // Distinct instantiations never collide even at IDENTICAL layout (fp equal): the marker's
     // type_name differs — the spike's P3/P7 cross-T guarantee.
     struct SameLayoutAsA(#[allow(dead_code)] u64);
     register::<HandMk<SameLayoutAsA>>(fp_of::<SameLayoutAsA>(), reentry_b as *const ());
     assert_eq!(fp_of::<MemberA>(), fp_of::<SameLayoutAsA>());
-    assert_eq!(
-        lookup::<HandMk<MemberA>>(fp_of::<MemberA>()),
-        reentry_a as *const ()
-    );
-    assert_eq!(
-        lookup::<HandMk<SameLayoutAsA>>(fp_of::<SameLayoutAsA>()),
-        reentry_b as *const ()
-    );
+    assert_eq!(call(lookup::<HandMk<MemberA>>(fp_of::<MemberA>()), 41), 42);
+    assert_eq!(call(lookup::<HandMk<SameLayoutAsA>>(fp_of::<SameLayoutAsA>()), 40), 42);
 }
 
 /// Registration is FRAME-SCOPED: an inner registration of the SAME key shadows the outer one
@@ -88,14 +90,14 @@ fn registration_is_frame_scoped_and_restores_on_drop() {
 
     let _outer = scope();
     register::<HandMk<Solo>>(fp, reentry_a as *const ());
-    assert_eq!(lookup::<HandMk<Solo>>(fp), reentry_a as *const ());
+    assert_eq!(call(lookup::<HandMk<Solo>>(fp), 41), 42);
     {
         let _inner = scope();
         register::<HandMk<Solo>>(fp, reentry_b as *const ());
-        assert_eq!(lookup::<HandMk<Solo>>(fp), reentry_b as *const ());
+        assert_eq!(call(lookup::<HandMk<Solo>>(fp), 40), 42);
     }
     // Inner scope closed => the outer frame's entry is back, not the inner one.
-    assert_eq!(lookup::<HandMk<Solo>>(fp), reentry_a as *const ());
+    assert_eq!(call(lookup::<HandMk<Solo>>(fp), 41), 42);
 }
 
 /// Only SHADOWING is scoped. A registration that created its slot deliberately outlives the
@@ -109,12 +111,12 @@ fn a_created_registration_outlives_its_frame() {
     {
         let _g = scope();
         register::<HandMk<Primed>>(fp, reentry_a as *const ());
-        assert_eq!(lookup::<HandMk<Primed>>(fp), reentry_a as *const ());
+        assert_eq!(call(lookup::<HandMk<Primed>>(fp), 41), 42);
     }
     // Scope closed, but nothing was displaced, so the priming entry stays.
     assert_eq!(
-        lookup::<HandMk<Primed>>(fp),
-        reentry_a as *const (),
+        call(lookup::<HandMk<Primed>>(fp), 41),
+        42,
         "a priming registration must survive its frame",
     );
 }

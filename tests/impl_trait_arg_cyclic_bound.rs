@@ -259,5 +259,14 @@ mod multi_m {
 #[test]
 fn multi_impl_trait_args_with_hrtb_past_floor() {
     use multi_m::Comb as _;
-    assert_eq!(multi_m::A.comb(|v| v + 1, |v| *v + 1, 5), 5 + 2);
+    // Closures cannot be encoded as a re-entry key (see `__reentry::assert_key_encodable`);
+    // coerce to function pointers, which are uniquely named.
+    assert_eq!(
+        multi_m::A.comb(
+            (|v| v + 1) as fn(usize) -> usize,
+            (|v: &usize| *v + 1) as fn(&usize) -> usize,
+            5
+        ),
+        5 + 2
+    );
 }

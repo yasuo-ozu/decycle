@@ -22,14 +22,18 @@ pub fn process_trait(
 ) -> TokenStream2 {
     let random_suffix = crate::get_random();
     let temporal_mac_name = alter_macro_name.cloned().unwrap_or_else(|| {
-        // `random_suffix` is deterministic (hashed from the fixed crate identity string),
-        // so two `#[decycle] trait Foo` items in one crate (different modules) would
-        // otherwise compute the exact same `#[macro_export]` name here and collide
-        // (E0428). Fold a per-item discriminant — hashed from the trait's own tokens —
-        // into THIS name only; `random_suffix` itself must stay untouched everywhere
-        // else, since it's the key the leaker's `Repeater` impls (built independently,
-        // elsewhere in this fn) are pinned to.
-        let discriminant = crate::identity_to_u64(&quote!(#trait_item).to_string());
+        // `random_suffix` is deterministic (hashed from the fixed crate identity string), and
+        // `#[macro_export]` hoists this name to the crate root, so two `#[decycle] trait Foo`
+        // items in one crate would otherwise compute the same name and collide (E0428). Fold a
+        // per-invocation discriminant into THIS name only; `random_suffix` itself must stay
+        // untouched everywhere else, since it's the key the leaker's `Repeater` impls (built
+        // independently, elsewhere in this fn) are pinned to.
+        //
+        // The discriminant used to be a hash of the trait's own TOKENS, which cannot separate the
+        // very case it exists for: two token-identical traits in different modules hash the same.
+        // It is a fresh random value per invocation instead — see `fresh_invocation_id` for why
+        // that is both safe here and preferable to a counter under incremental compilation.
+        let discriminant = crate::fresh_invocation_id();
         syn::Ident::new(
             &format!(
                 "__{}_temporal_{}_{}",

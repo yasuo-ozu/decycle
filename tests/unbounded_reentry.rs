@@ -415,8 +415,8 @@ mod fold_m {
 #[test]
 fn impl_trait_arg_multi_closure_past_floor() {
     use fold_m::Fold;
-    assert_eq!(fold_m::A.fold(|v| v + 7, 25), 25 + 7);
-    assert_eq!(fold_m::A.fold(|v| v + 1000, 25), 25 + 1000);
+    assert_eq!(fold_m::A.fold((|v| v + 7) as fn(usize) -> usize, 25), 25 + 7);
+    assert_eq!(fold_m::A.fold((|v| v + 1000) as fn(usize) -> usize, 25), 25 + 1000);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -573,41 +573,27 @@ fn elided_ref_return_past_floor() {
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-fn colliding_closure_names_distinct_layouts() {
+fn closure_instantiation_is_rejected_up_front() {
     use fold_m::Fold;
+    // Two closures in one function share `type_name` exactly, so they cannot be encoded as
+    // distinct registry keys. Distinct LAYOUTS used to keep them apart (the fingerprint folds
+    // size+align), but that is a property of the captures, not of the code: two closures with
+    // the same capture layout collide, and the floor would call the wrong one. The key is now
+    // rejected up front for any anonymous type, deterministically, rather than depending on
+    // whether a collision happens to occur.
     let small: u8 = 7;
     let c_small = move |v: usize| v + small as usize;
-    let big: [usize; 4] = [100, 200, 300, 400];
-    let c_big = move |v: usize| v + big.iter().sum::<usize>();
-    assert_eq!(
-        std::any::type_name_of_val(&c_small),
-        std::any::type_name_of_val(&c_big)
+    let got = std::panic::catch_unwind(move || fold_m::A.fold(c_small, 40));
+    let msg = got.err().map(|e| {
+        e.downcast_ref::<String>().cloned()
+            .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default()
+    });
+    let msg = msg.expect("a closure-instantiated method must be rejected, not silently keyed");
+    assert!(
+        msg.contains("anonymous type"),
+        "expected the unencodable-key rejection, got: {msg}"
     );
-    assert_ne!(std::mem::size_of_val(&c_small), std::mem::size_of_val(&c_big));
-
-    let t1 = std::thread::spawn(move || {
-        for _ in 0..2000 {
-            assert_eq!(fold_m::A.fold(c_small, 40), 40 + 7);
-        }
-    });
-    let t2 = std::thread::spawn(move || {
-        for _ in 0..2000 {
-            assert_eq!(fold_m::A.fold(c_big, 40), 40 + 1000);
-        }
-    });
-    t1.join().unwrap();
-    t2.join().unwrap();
-
-    // Same-thread interleave, both alternating and genuinely nested (c_nest drives c_big's
-    // whole descent from inside its own floor frame; 40-byte capture, distinct from both).
-    let pad: u64 = 0;
-    let c_nest = move |v: usize| v + pad as usize + fold_m::A.fold(c_big, 40);
-    assert_ne!(std::mem::size_of_val(&c_nest), std::mem::size_of_val(&c_big));
-    for _ in 0..100 {
-        assert_eq!(fold_m::A.fold(c_small, 40), 40 + 7);
-        assert_eq!(fold_m::A.fold(c_big, 40), 40 + 1000);
-        assert_eq!(fold_m::A.fold(c_nest, 40), 40 + (40 + 1000));
-    }
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -207,14 +207,16 @@ fn validate_impl_where_bounds(
                 continue;
             };
             let mut path = path.clone();
+            let was_self_qualified = path.segments.len() > 1;
             crate::helper::strip_leading_self(&mut path);
             // Single-segment match only (after self::-normalization) — a multi-segment
             // path (`some::mod::Foo`) merely sharing a last segment with a #[decycle]
             // trait is a DIFFERENT item; matching on the last segment alone was a false
             // positive. NOTE: a still-multi-segment, qualified reference to a #[decycle]
             // trait (`super::Foo`, `crate::mod::Foo`) is intentionally NOT flagged here —
-            // it's the established, working way to bind a FOREIGN (non-cyclic) type to
-            // the ORIGINAL, un-ranked trait in a side-bound (`Foreign: super::Foo`); only
+            // it's the documented way to bind a FOREIGN (non-cyclic) type to the ORIGINAL,
+            // un-ranked trait in a side-bound (`Foreign: super::Foo`; `nesting::LiftRelative`
+            // lifts the depth-fragile `super::` spelling so it survives re-emission); only
             // the bare/`self::`-qualified form participates in ranking at all, so there's
             // no reliable syntactic way to tell "meant to be ranked, mis-qualified" apart
             // from this deliberate opt-out.
@@ -259,16 +261,24 @@ fn validate_impl_where_bounds(
                         help = bounded_ty.span() => "{}", help_message
                     );
                 }
-                // A foreign or container head like `Box<Stmt>` has no ranked impl to descend
-                // through, so rustc would otherwise emit a raft of raw `Box<Stmt>: TrRanked<…>`
-                // overflow errors at the useless module span. Reject up-front with a legible
-                // message on the user's own bound instead (structural forwards such a bound
-                // through a blanket `impl<T: Tr> Tr for Box<T>`; ranked's rank chain can't).
-                if !head_ok {
+                // M2: a BARE-spelled bound on a foreign/non-participant head is a leaf premise
+                // on the ORIGINAL trait, not an edge — `remove_cyclic_bounds` keeps it, and
+                // `requalify_foreign_premises` (finalize.rs) now carries it through the
+                // `shadowing_module` rewrites un-lowered, so the impl compiles whenever the
+                // user supplies a matching impl of the original trait (and without one, rustc
+                // reports the plain `Vec<Stmt>: Tr` obligation — never a `TrRanked<…>` wall).
+                // No abort for that form anymore.
+                //
+                // The `self::`-qualified spelling is different: it is depth-fragile, so
+                // `remove_cyclic_bounds` classifies it as cyclic REGARDLESS of its target and
+                // the rewrite still rank-lowers it — for a non-lowerable head that can only
+                // produce the unprovable-`TrRanked` wall, so keep rejecting it up front with
+                // the legible message on the user's own bound.
+                if !head_ok && was_self_qualified {
                     abort!(
                         bounded_ty,
                         "decycle: this cyclic bound's target is not a type the ranked engine can rank-lower — its head is a container or non-cycle type (e.g. `Box<Stmt>`), so the ranked chain has no floor impl to descend through";
-                        help = "use `#[decycle(structural)]` (it forwards a wrapped bound via a blanket `impl<T: Tr> Tr for Box<T>`), or bound a bare cycle type instead"
+                        help = "use `#[decycle(structural)]` (it forwards a wrapped bound via a blanket `impl<T: Tr> Tr for Box<T>`), spell the trait bare to state the bound as a premise on the original trait, or bound a bare cycle type instead"
                     );
                 }
             }

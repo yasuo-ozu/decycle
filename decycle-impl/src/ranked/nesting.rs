@@ -14,8 +14,13 @@
 //!
 //! Both are fixed the same way: resolve the name *once*, at the level where the caller wrote it, bind
 //! the result to an unambiguous alias, and refer to the alias from inside the nested impls. The
-//! aliases are emitted as ordinary `use` items in the processed module, where they resolve exactly as
-//! the original spelling did; the nesting then cannot change what they mean.
+//! cycle-head aliases are emitted as ordinary `use` items in the processed module, where they resolve
+//! exactly as the original spelling did; the nesting then cannot change what they mean. The lifted
+//! relative paths instead live in a private `__DecycleRelMod_*` module and are referred to by a
+//! two-segment path — a lifted path can name a TRAIT (`Foreign: super::x::Tr`, the documented
+//! opt-out premise against the original, un-ranked trait), and a flat `use` of a trait would drop it
+//! into the method-resolution scope of every re-emitted body, turning receiver calls ambiguous
+//! (E0034) wherever a type implements both the original trait and its ranked twin.
 //!
 //! Alias names are **deterministic** (they carry the module's own ident, not a random nonce), so
 //! diagnostics that mention one are stable enough to match in a golden test.
@@ -25,8 +30,8 @@ use syn::spanned::Spanned;
 use std::collections::HashSet;
 use syn::visit_mut::VisitMut;
 use syn::{
-    GenericParam, Generics, Item, ItemImpl, Macro, Path, PathArguments, PathSegment, TraitBound,
-    TypePath,
+    ExprPath, GenericParam, Generics, Item, ItemImpl, Macro, Path, PathArguments, PathSegment,
+    QSelf, TraitBound, TypePath,
 };
 use template_quote::quote;
 
@@ -69,23 +74,69 @@ pub(crate) fn defuse_nesting(
     }
 
     // (2) Lift every `super::…` / `self::…` path to an alias resolved at this level.
+    //
+    // The aliases live in a dedicated private module, NOT as flat `use` items next to the user's
+    // code: a `use super::x::Tr as Alias;` at module level puts the ORIGINAL trait `Tr` into the
+    // method-resolution scope of every re-emitted body (the nested modules glob this module), and a
+    // receiver implementing both the ranked twin and the original then failed with E0034
+    // "multiple applicable items in scope". Behind `#rel_mod::`, an alias is nameable by path —
+    // which is all bounds and qualified calls need — while its trait never enters any scope that
+    // resolves a method call.
     let mut lifted: Vec<(Ident, Path)> = Vec::new();
+    let rel_mod = Ident::new(
+        &format!("__DecycleRelMod_{module_ident}"),
+        module_ident.span(),
+    );
     for im in adopted.iter_mut() {
         LiftRelative {
             lifted: &mut lifted,
             cyclic_traits,
             module_ident,
+            rel_mod: &rel_mod,
         }
         .visit_item_impl_mut(im);
     }
-    for (alias, path) in &lifted {
+    if !lifted.is_empty() {
+        let uses: Vec<Item> = lifted
+            .iter()
+            .map(|(alias, path)| {
+                let deeper = one_module_deeper(path);
+                syn::parse_quote! {
+                    #[allow(non_camel_case_types, unused_imports)]
+                    pub(super) use #deeper as #alias;
+                }
+            })
+            .collect();
         items.push(syn::parse_quote! {
-            #[allow(non_camel_case_types, unused_imports)]
-            use #path as #alias;
+            #[allow(non_snake_case)]
+            mod #rel_mod {
+                #(#uses)*
+            }
         });
     }
 
     items
+}
+
+/// `path`, re-spelled to resolve from one module further down (inside the alias module): the
+/// leading `self` becomes `super`, a leading `super` gains one more.
+fn one_module_deeper(path: &Path) -> Path {
+    let mut path = path.clone();
+    let root = &mut path.segments[0].ident;
+    let root_span = root.span();
+    if *root == "self" {
+        *root = Ident::new("super", root_span);
+    } else {
+        debug_assert_eq!(*root, "super");
+        path.segments.insert(
+            0,
+            PathSegment {
+                ident: Ident::new("super", root_span),
+                arguments: PathArguments::None,
+            },
+        );
+    }
+    path
 }
 
 /// Re-spell the leading segment of any non-`::`-rooted path that names a local cycle type.
@@ -302,32 +353,44 @@ impl AliasHeads<'_> {
     }
 }
 
-/// Replace a `super::…` / `self::…` rooted path with a single-segment alias, recording the original
-/// so the caller can bind it. Generic arguments stay on the alias (`super::Wrap<T>` ⇒ `Alias<T>`),
-/// since only the *path* needs resolving, not the instantiation.
+/// Replace a `super::…` / `self::…` rooted path with a `#rel_mod::#alias` path, recording the
+/// original so the caller can bind it. Generic arguments stay on the alias
+/// (`super::Wrap<T>` ⇒ `__DecycleRelMod_m::Alias<T>`), since only the *path* needs resolving, not
+/// the instantiation.
 ///
 /// Deliberately narrow — three kinds of path are left exactly as written:
-/// - **anything naming a cyclic trait.** A relative trait reference is decycle's own signal, already
-///   normalised by `strip_leading_self`; aliasing it to a one-segment name would make an
-///   ordinary premise look like a cycle edge (or vice versa).
-/// - **qualified paths** (`<B as self::Tr>::Assoc`). Their `qself.position` indexes into `segments`,
-///   so collapsing the path to a single segment corrupts the syntax tree.
-/// - **expressions.** Only types and trait bounds are visited; a body path is left to resolve
-///   normally.
+/// - **cycle edges**: a BARE reference to a routed trait, or its no-op `self::`-qualified form.
+///   That spelling is the ranked engine's own signal (already normalised by `strip_leading_self`);
+///   hiding it behind an alias would make a cycle edge look like an ordinary premise. A
+///   longer-qualified reference to the same trait (`Foreign: super::x::Tr`) is the documented
+///   opt-out that binds against the ORIGINAL, un-ranked trait — an ordinary premise, so it IS
+///   lifted. (Refusing on the last segment alone left the opt-out spelling behind, where nesting
+///   turned it into E0433 — the same last-segment confusion `path_names_local_ident` exists to
+///   prevent.)
+/// - **whole qualified paths** (`<B as self::Tr>::Assoc`). Their `qself.position` indexes into
+///   `segments`, so collapsing the path to a single segment corrupts the syntax tree. The trait
+///   sub-path before `as` is an importable item though, and is lifted on its own — a re-emitted
+///   body's `<String as super::x::Tr>::f(..)` needs exactly that.
+/// - **plain expression paths.** A body path can name things `use` cannot import (`super::x::Tr::f`
+///   ends in an associated fn), so no alias can be bound for the general case; only types, trait
+///   bounds, and qualified-path trait references are rewritten, and a plain body path is left to
+///   resolve normally.
 struct LiftRelative<'a> {
     lifted: &'a mut Vec<(Ident, Path)>,
     cyclic_traits: &'a HashSet<Ident>,
     module_ident: &'a Ident,
+    rel_mod: &'a Ident,
 }
 
 impl LiftRelative<'_> {
-    fn lift(&mut self, path: &mut Path) {
+    /// Returns whether `path` was rewritten (to `#rel_mod::#alias`).
+    fn lift(&mut self, path: &mut Path) -> bool {
         if path.leading_colon.is_some() || path.segments.len() < 2 {
-            return;
+            return false;
         }
         let root = path.segments[0].ident.to_string();
         if root != "super" && root != "self" {
-            return;
+            return false;
         }
         let mut bare = path.clone();
         let args = std::mem::replace(
@@ -358,18 +421,54 @@ impl LiftRelative<'_> {
         };
         *path = Path {
             leading_colon: None,
-            segments: std::iter::once(PathSegment {
-                ident: alias,
-                arguments: args,
-            })
+            segments: [
+                PathSegment {
+                    ident: Ident::new(&self.rel_mod.to_string(), span),
+                    arguments: PathArguments::None,
+                },
+                PathSegment {
+                    ident: alias,
+                    arguments: args,
+                },
+            ]
+            .into_iter()
             .collect(),
         };
+        true
     }
 
-    fn names_cyclic_trait(&self, path: &Path) -> bool {
-        path.segments
-            .last()
-            .is_some_and(|s| self.cyclic_traits.contains(&s.ident))
+    /// Is `path` the spelling that marks a cycle edge — the bare name of a routed trait, or its
+    /// no-op `self::`-qualified form? Only those participate in ranking (the same bare-or-`self::`
+    /// rule `peel::is_bare_cyclic_bound` applies), so only those must survive un-aliased for the
+    /// downstream rewrites to recognise them. A longer-qualified reference (`super::x::Tr`)
+    /// deliberately names the original, un-ranked trait and is lifted like any other premise.
+    fn spells_cycle_edge(&self, path: &Path) -> bool {
+        crate::helper::path_names_local_ident(path, self.cyclic_traits)
+    }
+
+    /// Lift the TRAIT sub-path of a qualified path: `<String as super::x::Tr>::f` becomes
+    /// `<String as __DecycleRelMod_m::__DecycleRelPath_N_m>::f`. The whole path cannot be
+    /// collapsed — `qself.position` indexes into `segments` — but the segments before `as` name an
+    /// importable trait, so they alone are replaced and the position adjusted.
+    fn lift_qself(&mut self, qself: &mut QSelf, path: &mut Path) {
+        if qself.position < 2 || path.leading_colon.is_some() {
+            return;
+        }
+        let mut trait_path = Path {
+            leading_colon: None,
+            segments: path.segments.iter().take(qself.position).cloned().collect(),
+        };
+        if self.spells_cycle_edge(&trait_path) {
+            return;
+        }
+        if !self.lift(&mut trait_path) {
+            // Not depth-fragile (`crate::x::Tr`, `x::Tr`) — left as written.
+            return;
+        }
+        let tail = path.segments.iter().skip(qself.position).cloned();
+        let position = trait_path.segments.len();
+        path.segments = trait_path.segments.into_iter().chain(tail).collect();
+        qself.position = position;
     }
 }
 
@@ -377,7 +476,11 @@ impl VisitMut for LiftRelative<'_> {
     fn visit_type_path_mut(&mut self, tp: &mut TypePath) {
         // Depth-first, so an inner relative argument is lifted before its enclosing path.
         syn::visit_mut::visit_type_path_mut(self, tp);
-        if tp.qself.is_some() || self.names_cyclic_trait(&tp.path) {
+        if let Some(qself) = &mut tp.qself {
+            self.lift_qself(qself, &mut tp.path);
+            return;
+        }
+        if self.spells_cycle_edge(&tp.path) {
             return;
         }
         self.lift(&mut tp.path);
@@ -385,9 +488,18 @@ impl VisitMut for LiftRelative<'_> {
 
     fn visit_trait_bound_mut(&mut self, tb: &mut TraitBound) {
         syn::visit_mut::visit_trait_bound_mut(self, tb);
-        if self.names_cyclic_trait(&tb.path) {
+        if self.spells_cycle_edge(&tb.path) {
             return;
         }
         self.lift(&mut tb.path);
+    }
+
+    // The one expression form that CAN be lifted: the trait reference inside a qualified call
+    // (`<String as super::x::Tr>::f(..)`) names an importable trait, unlike a plain body path.
+    fn visit_expr_path_mut(&mut self, ep: &mut ExprPath) {
+        syn::visit_mut::visit_expr_path_mut(self, ep);
+        if let Some(qself) = &mut ep.qself {
+            self.lift_qself(qself, &mut ep.path);
+        }
     }
 }

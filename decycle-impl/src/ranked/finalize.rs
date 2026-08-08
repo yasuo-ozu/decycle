@@ -268,6 +268,100 @@ fn cycle_self_heads(
         .collect()
 }
 
+/// M2: carry a kept foreign-target premise through the `shadowing_module` rewrites on the
+/// ORIGINAL trait.
+///
+/// `remove_cyclic_bounds` deliberately KEEPS a where-predicate whose bound names a routed trait
+/// in the bare spelling but whose TARGET is no cycle participant (`Vec<crate::other::Stmt>: Tr`
+/// — head `Vec`: not `Self`, not an impl type parameter, no ranked impl to descend through):
+/// that is an ordinary leaf premise, not an edge to contract. The inductive copy, however, is
+/// rewritten by `TraitReplacer`, which keys purely on the trait's SPELLING — it would
+/// rank-lower the premise's `Tr` to `TrRanked<Rank>` (unprovable for a foreign head, so every
+/// rank re-reports it), and even an untouched bare `Tr` would resolve to `shadowing_module`'s
+/// empty dummy shadow trait. So, for exactly the predicates whose target is NOT a participant,
+/// requalify the bare routed-trait references to `super::Tr` — the same spelling
+/// `qualify_apit_cyclic_bounds_super` uses to reach the public trait from inside
+/// `shadowing_module` — which `TraitReplacer` then leaves alone (its head segment is not in the
+/// table). Applied to the inductive copy and to the register-once fn (both live inside
+/// `shadowing_module`); the leaf and Final impls already resolve the bare spelling to the
+/// public trait (glob import / parent module), so they stay as `remove_cyclic_bounds` left them
+/// and every emitted copy states the SAME original-trait obligation.
+///
+/// Deliberately narrow, so the `Self:`/bare-param cases stay untouched:
+/// - WHERE-clause predicates only: an inline param bound (`impl<T: Tr>`) targets a bare param,
+///   always a participant.
+/// - A participant target (`Self`, a bare impl param, a cycle self head — the exact
+///   `remove_cyclic_bounds` test) skips the predicate entirely: those bounds are the cycle
+///   edges the rank rewrite must lower, even when they are really leaf premises (the impls
+///   alone cannot distinguish the two — see `remove_cyclic_bounds`'s comment).
+/// - Only a predicate carrying at least one truly BARE routed-trait bound is rewritten. The
+///   `self::`/`super::` spellings are depth-fragile — `remove_cyclic_bounds` strips them
+///   regardless of target — so they keep today's treatment (and `validate_impl_where_bounds`
+///   still rejects the `self::` form on a foreign target up front). Predicates without such a
+///   bound are untouched, so no program that compiled before this change is affected.
+/// - Within a rewritten predicate, the requalification visits the whole predicate (target
+///   included, e.g. a `dyn Tr` inside it), keeping the premise self-consistent across copies.
+fn requalify_foreign_premises(
+    generics: &mut Generics,
+    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+) {
+    let param_idents: std::collections::HashSet<Ident> = generics
+        .params
+        .iter()
+        .filter_map(|p| match p {
+            GenericParam::Type(t) => Some(t.ident.clone()),
+            _ => None,
+        })
+        .collect();
+    let self_heads = cycle_self_heads(replacing_table);
+    let Some(wc) = &mut generics.where_clause else {
+        return;
+    };
+
+    struct Requalify<'a> {
+        table: &'a HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+    }
+    impl syn::visit_mut::VisitMut for Requalify<'_> {
+        fn visit_path_mut(&mut self, path: &mut Path) {
+            if path.leading_colon.is_none()
+                && path.segments.len() == 1
+                && self.table.contains_key(&path.segments[0].ident)
+            {
+                let seg = path.segments[0].clone();
+                *path = parse_quote!(super::#seg);
+                return;
+            }
+            syn::visit_mut::visit_path_mut(self, path);
+        }
+    }
+
+    let is_bare_routed = |b: &TypeParamBound| {
+        matches!(b, TypeParamBound::Trait(TraitBound { path, .. })
+            if path.leading_colon.is_none()
+                && path.segments.len() == 1
+                && replacing_table.contains_key(&path.segments[0].ident))
+    };
+    for pred in wc.predicates.iter_mut() {
+        let WherePredicate::Type(pt) = pred else {
+            continue;
+        };
+        let target_is_participant = matches!(&pt.bounded_ty, Type::Path(TypePath { qself: None, path })
+                if path.is_ident("Self")
+                    || (path.segments.len() == 1 && param_idents.contains(&path.segments[0].ident)))
+            || crate::helper::type_head_ident(&pt.bounded_ty)
+                .is_some_and(|h| self_heads.contains(&h));
+        if target_is_participant || !pt.bounds.iter().any(is_bare_routed) {
+            continue;
+        }
+        syn::visit_mut::VisitMut::visit_where_predicate_mut(
+            &mut Requalify {
+                table: replacing_table,
+            },
+            pred,
+        );
+    }
+}
+
 /// Replaces every bare `Self` type (not `Self::Assoc` — no qualifying trait path is known at
 /// this generics-only call site, and no existing caller needs it) with `self_ty` throughout a
 /// `Generics`' param bounds and where-clause. Used when threading a preserved, `Self`-
@@ -3287,6 +3381,11 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                         // impl would be E0199 ("implementing the trait `XxxRanked` is not unsafe").
                         modified_impl.unsafety = None;
 
+                        // M2: protect a kept foreign-target premise BEFORE the rank rewrite —
+                        // `TraitReplacer` keys on the trait's spelling alone and would lower a
+                        // premise `remove_cyclic_bounds` deliberately keeps as non-cyclic.
+                        requalify_foreign_premises(&mut modified_impl.generics, &replacing_table);
+
                         // Step 1: Rewrite the impl's trait path with rank=(Rank,)
                         TraitReplacer {
                             table: trait_replacer_table.clone(),
@@ -3375,6 +3474,12 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                                 &remove_cyclic_bounds(&impl_.generics, &replacing_table, false),
                                 &impl_.self_ty,
                             );
+                            // M2: this fn lives inside `shadowing_module`, where the bare
+                            // spelling of a kept foreign-target premise would resolve to the
+                            // empty dummy shadow trait — requalify it to `super::Tr` so it
+                            // states (and the rewritten caller can prove) the same
+                            // original-trait obligation as everywhere else.
+                            requalify_foreign_premises(&mut stripped, &replacing_table);
                             // C1: declare the HRTB binder lifetimes on the FREE register-once
                             // fn. Lifetimes must precede type/const params, so prepend (in
                             // reverse to preserve declaration order). The call site (below)

@@ -1,11 +1,13 @@
-//! A cyclic bound whose target is a FOREIGN type sharing its last path segment with a local cycle
-//! head. `crate::other::Stmt` is a different item from the module's own `Stmt`, so it must not be
-//! peeled as a cycle member.
+//! A cyclic-trait bound whose target is a FOREIGN type sharing its last path segment with a local
+//! cycle head. `crate::other::Stmt` is a different item from the module's own `Stmt`, so it must
+//! not be peeled as a cycle member (peeling on the last segment alone produced a 14-error per-rank
+//! wall of `other::Stmt: TrRanked<((((..` at the attribute span).
 //!
-//! Peeling it (matching on the last path segment) produced rank-lowering obligations against the
-//! foreign type — 14 errors, a per-rank wall of `other::Stmt: TrRanked<((((..` at the attribute
-//! span. Now the target is treated as an outer type in its entirety, nothing is peeled, and the
-//! bound is reported once against what the caller actually wrote.
+//! Such a bound is now kept as an ordinary premise on the ORIGINAL trait (M2 — see
+//! `requalify_foreign_premises` in `finalize.rs`): with a matching `impl m::Tr for
+//! Vec<other::Stmt>` the program compiles and runs (`tests/ranked_foreign_premise.rs`). This
+//! snapshot pins what happens WITHOUT that impl: plain `Vec<other::Stmt>: m::Tr` E0277s against
+//! the bound the caller actually wrote — never an up-front abort, never a `TrRanked` wall.
 use decycle::decycle;
 
 pub mod other {

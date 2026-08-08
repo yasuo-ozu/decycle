@@ -1,17 +1,18 @@
-error: decycle: this cyclic bound's target is not a type the ranked engine can rank-lower — its head is a container or non-cycle type (e.g. `Box<Stmt>`), so the ranked chain has no floor impl to descend through
-
-         = help: use `#[decycle(structural)]` (it forwards a wrapped bound via a blanket `impl<T: Tr> Tr for Box<T>`), or bound a bare cycle type instead
-
-  --> tests/ui/peel_foreign_last_segment.rs:26:9
+error[E0277]: the trait bound `Vec<other::Stmt>: m::Tr` is not satisfied
+  --> tests/ui/peel_foreign_last_segment.rs:28:9
    |
-26 |         Vec<crate::other::Stmt>: Tr,
-   |         ^^^^^^^^^^^^^^^^^^^^^^^
-
-error[E0277]: the trait bound `Vec<other::Stmt>: Tr` is not satisfied
-  --> tests/ui/peel_foreign_last_segment.rs:26:9
+28 |         Vec<crate::other::Stmt>: Tr,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `m::Tr` is not implemented for `Vec<other::Stmt>`
    |
-26 |         Vec<crate::other::Stmt>: Tr,
-   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Tr` is not implemented for `Vec<other::Stmt>`
-   |
-   = help: the trait `Tr` is implemented for `m::Stmt`
+   = help: the trait `m::Tr` is implemented for `m::Stmt`
    = help: see issue #48214
+
+error[E0277]: the trait bound `Vec<other::Stmt>: m::Tr` is not satisfied
+  --> tests/ui/peel_foreign_last_segment.rs:17:1
+   |
+17 | #[decycle]
+   | ^^^^^^^^^^ the trait `m::Tr` is not implemented for `Vec<other::Stmt>`
+   |
+   = help: the trait `m::Tr` is implemented for `m::Stmt`
+   = help: see issue #48214
+   = note: this error originates in the attribute macro `decycle` (in Nightly builds, run with -Z macro-backtrace for more info)

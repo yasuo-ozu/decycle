@@ -1,7 +1,7 @@
 //! The **structural unroll** algorithm (`#[decycle(structural)]`): break infinite trait-obligation
 //! cycles by giving each cyclic type a `#[repr(transparent)]` terminator `__XxxTerm` that carries the
 //! trait impl (body via the trait-def-inside-body pattern) and layout-casting the natural type's
-//! delegating impl to it. No runtime, no type-leak — a simpler sibling of the `ranked` engine.
+//! delegating impl to it. Emits no runtime machinery — a simpler sibling of the `ranked` engine.
 //!
 //! Unlike the ranked engine it does NOT scan every impl: only impls of the traits annotated
 //! `#[decycle]` in the module participate (`collect_decycle_traits`), matching the ranked convention.
@@ -166,7 +166,7 @@ fn expand(
     // `&ManuallyDrop<A>` performs no such retag, so the returned value's provenance stays valid.
     // Defense-in-depth: `transmute_copy` reads `size_of::<__B>()` bytes from a `&__A` without any
     // compile-time size check, so a (hypothetical future) codegen bug producing a size mismatch would
-    // be silent UB. `#Guard::<A,B>::OK` is a post-monomorphization `assert!` (MSRV-1.71-safe — inline
+    // be silent UB. `#Guard::<A,B>::OK` is a post-monomorphization `assert!` (MSRV-safe — inline
     // `const{}` is 1.79) that turns any such mismatch into a compile error at zero runtime cost.
     let cast = cast_ident(nonce);
     let guard = sizeguard_ident(nonce);

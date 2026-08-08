@@ -19,7 +19,7 @@ pub use decycle_macro::__finalize;
 /// the [`macro@decycle`] attribute. See the module for its entry points.
 pub use decycle_impl::ranked;
 /// The **structural** unroll engine's programmatic API (`#[decycle(structural)]`) — a compile-time
-/// unroll with no runtime and no `type-leak` dependency.
+/// unroll that emits no runtime machinery.
 pub use decycle_impl::structural;
 /// Engine-independent, code-free inspection: the module's obligation graph over type idents, with
 /// each edge labelled `Direct` or `Peeled`.
@@ -51,7 +51,7 @@ pub use decycle_impl::safegraph;
 /// - the default **ranked** engine (`#[decycle]`) — hidden "Ranked" helper traits plus a
 ///   thread-local runtime re-entry registry;
 /// - the **structural** unroll (`#[decycle(structural)]`) — per-type `#[repr(transparent)]`
-///   terminators and layout casts, with no runtime and no `type-leak` dependency.
+///   terminators and layout casts, emitting no runtime machinery.
 ///
 /// They break the same cycles and are interchangeable for ordinary method recursion, but differ
 /// in cost and in what each can't do (structural is zero-cost and fails every unsupported shape at

@@ -187,12 +187,19 @@ fn main() {}
 | **Unbounded depth** | only when `support_infinite_cycle = true` | always |
 | Re-entry across **several instantiations** of a generic method | **✓** (fn-pointer re-entry) | ✗ (layout cast can't) |
 | Genuinely **growing** type argument (one wrapper per level) | ✗ — see note below | ✗ |
-| **`no_std`** | only when `support_infinite_cycle = false` | **✓** |
+| **`no_std`** | ✗ | ✗ (see note) |
 | Arg mentioning `Self`: **`impl Fn(&Self)`** (APIT) | **✓** with a named fn or `fn` pointer; a **closure** is rejected at runtime in unbounded mode — see the closure note below | ✗ (use generics) |
 | Arg mentioning `Self`: **`fn(&Self)`** / **`&dyn Fn(&Self)`** | ✗ | **✓** |
 | **`#[track_caller]`** on a cycle method | ✗ in unbounded mode (clean compile error) / **✓** when `support_infinite_cycle = false` | **✓** |
 | Non-`#[decycle]` **supertrait** on the trait | **✓** | ✗ |
 | Third-party trait *in* the cycle | only when `#[decycle]`-annotated at its definition | **✓**  |
+> **`no_std` and dependencies.** Neither engine works on `no_std` today, and the crate is not
+> dependency-light. `decycle-impl` is a regular dependency of the facade, so roughly 18 crates —
+> including `safegraph -> sprs -> ndarray -> matrixmultiply` — are compiled for your target.
+> `type-leak` is likewise an unconditional dependency of the proc-macro, for *both* engines; the
+> structural engine emits no runtime machinery, but that is a statement about generated code, not
+> about the dependency graph. That tree is also what sets the MSRV: `sprs` requires rustc 1.88,
+> which is why this crate declares 1.88 rather than anything lower.
 
 > **Note on "growing" type arguments.** Neither engine can make a *genuinely* growing recursion work —
 > one whose instantiation strictly grows every level, e.g. `A<Vec<X>>: Tr` on `impl<X> Tr for A<X>`, or a
@@ -381,7 +388,7 @@ limit is reached.
 <details>
 <summary> The structural unroll (`#[decycle(structural)]`) </summary>
 
-A second, self-contained algorithm with **no runtime and no `type-leak` dependency** —
+A second, self-contained algorithm that emits **no runtime machinery** —
 everything is resolved at compile time.
 
 ```rust

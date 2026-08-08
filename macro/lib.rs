@@ -182,7 +182,7 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
         if module
             .content
             .as_ref()
-            .map_or(true, |(_, items)| items.is_empty())
+            .is_none_or(|(_, items)| items.is_empty())
         {
             abort!(
                 Span::call_site(),

@@ -31,20 +31,25 @@ jobs:
         continue-on-error: true
 
   msrv:
-    name: build (1.71.0 MSRV)
+    name: build (1.88.0 MSRV)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.71.0
+      - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
-      # The declared MSRV (rust-version = 1.71) covers *building the published library*, not
-      # the test suite: the dev-dependency `trybuild` requires rustc 1.76+, so `cargo test`
-      # cannot run on the 1.71 floor. Cargo.lock is gitignored, so this resolves fresh with
-      # 1.71's cargo — the 1.71 floor is set by the latest release of the core proc-macro deps
-      # (syn 2.0, quote, unicode-ident all declare rust-version 1.71). If one of those bumps
-      # its own MSRV above 1.71 in a future release, this job will flag it and the floor here
-      # (and in the three `rust-version` fields) must move with it. `type-leak` 0.7 (safegraph,
-      # MSRV 1.56) is a non-optional dependency and sits below this floor.
+      # The declared MSRV covers *building the published library*, not the test suite: the
+      # dev-dependency `trybuild` and the suite itself are not held to it.
+      #
+      # 1.88 is measured, not aspirational. The floor is set by the dependency tree, not by
+      # anything in this crate's own source: `safegraph -> sprs 0.11.5` declares
+      # `rust-version = "1.88.0"`, and below that `ndarray -> matrixmultiply` declares 1.75.
+      # `safegraph` arrives twice over — through `decycle-impl` and independently through
+      # `type-leak 0.7` — so it binds a downstream user's toolchain too, even though the
+      # proc-macro's dependencies never enter their *target* graph.
+      #
+      # This job previously pinned 1.71.0 and could not have passed: the comment then claimed
+      # "type-leak 0.7 (safegraph, MSRV 1.56) sits below this floor", which is what safegraph
+      # declares for itself but not what its own dependencies resolve to.
       - name: cargo build (decycle + macro + impl)
         run: cargo build -p decycle -p decycle-macro -p decycle-impl
 

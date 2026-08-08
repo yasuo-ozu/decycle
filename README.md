@@ -168,10 +168,10 @@ fn main() {}
 
 | | `#[decycle]` (ranked) | `#[decycle(structural)]` |
 | --- | --- | --- |
-| Deep-recursion **runtime cost** | not zero-cost (vtable hop) | **zero-cost** |
+| Deep-recursion **runtime cost** | not zero-cost | **zero-cost** |
 | **Unbounded depth** | only when `support_infinite_cycle = true` | always |
-| Re-entry across **several instantiations** of a generic method | **✓** (fn-pointer re-entry) | ✗ (layout cast can't) |
-| Genuinely **growing** type argument (one wrapper per level) | ✗ — see note below | ✗ |
+| Re-entry across **several instantiations** of a generic method | **✓** | ✗ |
+| Genuinely **growing** type argument (one wrapper per level) | ✗ | ✗ |
 | **`no_std`** | only when `support_infinite_cycle = false` | **✓** |
 | Arg mentioning `Self`: **`impl Fn(&Self)`** (APIT) | **✓** — but see the row below | ✗ (use generics) |
 | Generic arg instantiated with an **anonymous type** (closure, `async` block, `-> impl Trait` value) | ✗ in unbounded mode — rejected at runtime; a named fn or `fn` pointer works. Not a pending fix — see the closure note below | **✓** |
@@ -179,38 +179,13 @@ fn main() {}
 | **`#[track_caller]`** on a cycle method | ✗ in unbounded mode (clean compile error) / **✓** when `support_infinite_cycle = false` | **✓** |
 | Non-`#[decycle]` **supertrait** on the trait | **✓** | ✗ |
 | Third-party trait *in* the cycle | only when `#[decycle]`-annotated at its definition | **✓**  |
-> **`no_std`.** Turn off default features (`decycle = { version = "..", default-features = false }`).
-> That drops two things: the `std` feature, which carries the unbounded re-entry registry (a
-> `thread_local!` map), and the `api` feature, which carries the programmatic surface and is what
-> pulls `decycle-impl` into your target build. What remains is the attribute macro plus a
-> `core`-only runtime — the structural engine emits nothing else, and needs no `alloc` either.
->
-> The ranked engine still works at a fixed depth; only `support_infinite_cycle = true` (its
-> default) needs the registry, and asking for it without `std` is a compile error naming the
-> feature rather than a broken path into crate internals.
 
-> **Note on "growing" type arguments.** Neither engine can make a *genuinely* growing recursion work —
-> one whose instantiation strictly grows every level, e.g. `A<Vec<X>>: Tr` on `impl<X> Tr for A<X>`, or a
-> `Dup<Dup<…>>` stream tower threaded unerased. That is not an engine limitation but a language one:
-> the instantiation family is infinite, so rustc stops it regardless — the trait solver overflows
-> (`E0275`) or the monomorphizer reports *"reached the recursion limit while instantiating"*. The ranked
-> engine rejects such a cyclic bound up front rather than diverging.
->
-> What the ranked engine *does* add over structural is re-entry across a **finite set** of
-> instantiations past the recursion floor. The way to make a growing tower finite is to **erase it at
-> the recursion boundary** — pin the stream to one fixed `&mut dyn Trait` layer — after which the cycle
-> works under *both* engines (`tests/dyn_stream_reentry.rs`).
-
-> **Note on closures (ranked engine, unbounded mode only).** The unbounded re-entry registry keys
-> each method instantiation by `type_name`, and rustc renders **every** closure and `async` block
-> in a function as `{{closure}}`, with no disambiguator — two closures in one function would share
-> a key, and the recursion floor would call the wrong one. So under
+> **Note on closures (ranked engine, unbounded mode only).** With
 > `support_infinite_cycle = true` (the default), instantiating a cyclic method with a closure or
 > `async` block — any `impl Fn(..)` or other generic argument, whether or not it mentions `Self` —
 > is **rejected at runtime** with a panic whose message contains "anonymous type". The rejection is
-> deterministic and fires on the method's first call, even when recursion never reaches the floor.
-> Named functions work as-is; a non-capturing closure works once coerced to a function pointer,
-> which is a uniquely named type:
+> deterministic and fires on the method's first call, however shallow. Named functions work as-is;
+> a non-capturing closure works once coerced to a function pointer:
 >
 > ```rust
 > use decycle::decycle;
@@ -236,16 +211,15 @@ fn main() {}
 >     use fold_m::Fold;
 >     // Rejected at runtime (panic: "... anonymous type ..."): a closure.
 >     // fold_m::A.fold(|v| v + 7, 25);
->     // Works, at any depth: a function pointer is uniquely named.
+>     // Works, at any depth.
 >     assert_eq!(fold_m::A.fold((|v| v + 7) as fn(usize) -> usize, 25), 32);
 > }
 > ```
 >
 > A closure that *captures* cannot be coerced to a `fn` pointer — pass its captures as ordinary
 > arguments instead, or use bounded mode. The restriction does **not** apply with
-> `support_infinite_cycle = false`: bounded mode emits no registry and accepts closures unchanged.
-> It also does not apply to the structural engine (which rejects `impl Fn(&Self)` at compile time
-> for its own, unrelated reason — see the table).
+> `support_infinite_cycle = false`, which accepts closures unchanged, nor to the structural engine
+> (which rejects `impl Fn(&Self)` for its own, unrelated reason — see the table).
 >
 
 ## How the algorithms work?

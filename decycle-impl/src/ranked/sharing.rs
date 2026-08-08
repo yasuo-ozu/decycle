@@ -9,6 +9,13 @@
 //! so an obligation a caller introduced by hand (or through a generated helper type) is covered too.
 //! Peeled cyclic bounds are excluded: those are the engine's to rank, and copying one onto a sibling
 //! would rank-lower it there as well.
+//!
+//! **Scope.** An impl only ever *needs* a sibling's premises when its own rank chain can reach that
+//! sibling's delegating impl — that is, when its (transitive) cyclic bounds obligate it. The caller
+//! therefore says, per impl, which other impls may contribute (`sources`), computed from the actual
+//! obligation edges. An impl of the same trait that shares no obligation path — a standalone acyclic
+//! impl, or a member of a *different*, disjoint cycle — receives nothing, so it does not silently
+//! acquire premises (`C<T>` acquiring `T: Clone`) that reject code valid without the macro.
 
 use proc_macro2::Ident;
 use std::collections::{HashMap, HashSet};
@@ -16,7 +23,7 @@ use syn::visit_mut::VisitMut;
 use syn::{ItemImpl, TypeParamBound, WherePredicate};
 use template_quote::quote;
 
-/// Apply the union to one cycle group — see the module docs.
+/// Apply the union to one trait's impls — see the module docs.
 ///
 /// A cycle member's body reaches its siblings through the *public* trait (`Vec<Expr<S>>: Unparse<A>`
 /// ⇒ `Expr<S>: Unparse<A>`), which decycle discharges through `Expr`'s delegating impl — and that
@@ -26,40 +33,69 @@ use template_quote::quote;
 /// `Unparse`/`Spanned` path uses, computed from the real predicates rather than re-derived from field
 /// types (so a `#[group]`'s `Fill` obligation is covered too).
 ///
+/// `sources[i]` lists the indices (into `impls`) of the impls whose premises `impls[i]` may inherit —
+/// the impls its rank chain can actually reach, as computed by the caller from the obligation edges.
+/// `routed_traits` is the full set of `#[decycle]`-routed trait idents: a predicate whose bound names
+/// any of them in the bare (or `self::`-qualified) spelling is a cycle edge for the engine to rank,
+/// never a premise to copy — copying one onto a sibling would rank-lower it there too, and a
+/// cross-trait edge (`X: Tr2` inside an impl of `Tr`) is stripped downstream exactly like an own-trait
+/// one (`remove_cyclic_bounds` keys on every routed trait), so both spellings are excluded alike.
+///
 /// A predicate is only injected into an impl that declares every generic parameter it mentions, so a
 /// cycle whose members carry *different* parameters stays well-formed.
-pub(crate) fn share_side_predicates(impls: &mut [&mut ItemImpl], cyclic_marker: &Ident) {
-    // Idents that are a generic parameter of *some* impl in THIS group — used below to tell a
-    // parameter apart from a concrete type name. Scoped to the group on purpose: it was previously a
-    // `thread_local!` that accumulated and was never cleared, so parameters leaked between separate
-    // `#[decycle]` expansions compiled on the same thread, making unrelated idents look param-like
-    // and silently suppressing predicate sharing.
-    let group_params: HashSet<String> = impls.iter().flat_map(|im| impl_param_idents(im)).collect();
-    let mut union: Vec<WherePredicate> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    for im in impls.iter() {
-        let Some(wc) = &im.generics.where_clause else {
-            continue;
-        };
-        for p in &wc.predicates {
-            // Skip the peeled cyclic bounds (spelled with the bare trait ident): those are decycle's
-            // to rank, and copying one onto a sibling would rank-lower it there too.
-            if is_bare_trait_pred(p, cyclic_marker) {
-                continue;
-            }
-            // `Self` is impl-relative: `Self: Debug` on `impl Tr for A` says *A* is `Debug`, so
-            // copying it onto `impl Tr for B` silently asserts something about a different type
-            // (and fails if B is not `Debug`). Only impl-independent premises can be shared.
-            if mentions_self(p) {
-                continue;
-            }
-            if seen.insert(quote!(#p).to_string()) {
-                union.push(p.clone());
+pub(crate) fn share_side_predicates_scoped(
+    impls: &mut [&mut ItemImpl],
+    routed_traits: &HashSet<Ident>,
+    sources: &[Vec<usize>],
+) {
+    debug_assert_eq!(impls.len(), sources.len());
+    // Per-impl data up front — the injection loop below holds the mutable borrow.
+    let param_sets: Vec<HashSet<String>> = impls.iter().map(|im| impl_param_idents(im)).collect();
+    let shareable: Vec<Vec<WherePredicate>> = impls
+        .iter()
+        .map(|im| {
+            im.generics
+                .where_clause
+                .iter()
+                .flat_map(|wc| wc.predicates.iter())
+                // Skip the cyclic bounds (spelled bare or `self::`-qualified, naming any routed
+                // trait): those are decycle's to rank, and copying one onto a sibling would
+                // rank-lower it there too.
+                .filter(|p| !is_bare_trait_pred(p, routed_traits))
+                // `Self` is impl-relative: `Self: Debug` on `impl Tr for A` says *A* is `Debug`, so
+                // copying it onto `impl Tr for B` silently asserts something about a different type
+                // (and fails if B is not `Debug`). Only impl-independent premises can be shared.
+                .filter(|p| !mentions_self(p))
+                .cloned()
+                .collect()
+        })
+        .collect();
+    for (i, im) in impls.iter_mut().enumerate() {
+        // The union this impl may inherit, from its sources only.
+        let mut union: Vec<WherePredicate> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for j in sources[i].iter() {
+            for p in &shareable[*j] {
+                if seen.insert(quote!(#p).to_string()) {
+                    union.push(p.clone());
+                }
             }
         }
-    }
-    for im in impls.iter_mut() {
-        let params = impl_param_idents(im);
+        if union.is_empty() {
+            continue;
+        }
+        // Idents that are a generic parameter of this impl or of one of its sources — used below to
+        // tell a parameter apart from a concrete type name. Scoped to the receiver's own slice of the
+        // group on purpose: it was previously a `thread_local!` that accumulated and was never
+        // cleared, so parameters leaked between separate `#[decycle]` expansions compiled on the same
+        // thread, making unrelated idents look param-like and silently suppressing predicate sharing.
+        let group_params: HashSet<String> = sources[i]
+            .iter()
+            .flat_map(|j| param_sets[*j].iter())
+            .chain(param_sets[i].iter())
+            .cloned()
+            .collect();
+        let params = &param_sets[i];
         let lifetimes: HashSet<String> = im
             .generics
             .params
@@ -109,17 +145,38 @@ pub(crate) fn share_side_predicates(impls: &mut [&mut ItemImpl], cyclic_marker: 
     }
 }
 
-/// The type-parameter idents an impl declares — used to decide whether a sibling's predicate can be
-/// injected into it (see [`share_side_predicates`]).
+/// [`share_side_predicates_scoped`] with the whole group as every impl's source — each member both
+/// contributes to and receives the full union.
+///
+/// Kept for the structural engine's graph path (`structural::expand`), whose group is the
+/// caller-GENERATED impls of one trait under a supplied graph: there the caller has already stated
+/// the participant set, and the generated helper impls are siblings of one cycle by construction.
+/// The ranked engine instead scopes each impl's sources by obligation reachability — see
+/// [`crate::ranked::process_module`]'s `sharing_sources`.
+pub(crate) fn share_side_predicates(impls: &mut [&mut ItemImpl], cyclic_marker: &Ident) {
+    let routed: HashSet<Ident> = core::iter::once(cyclic_marker.clone()).collect();
+    let everyone: Vec<Vec<usize>> = (0..impls.len())
+        .map(|i| (0..impls.len()).filter(|j| *j != i).collect())
+        .collect();
+    share_side_predicates_scoped(impls, &routed, &everyone);
+}
+
+/// The generic-parameter idents an impl declares — used to decide whether a sibling's predicate can be
+/// injected into it (see [`share_side_predicates_scoped`]).
 fn impl_param_idents(item_impl: &ItemImpl) -> HashSet<String> {
     item_impl
         .generics
         .params
         .iter()
-        .filter_map(|p| match p {
-            syn::GenericParam::Type(t) => Some(t.ident.to_string()),
-            syn::GenericParam::Const(c) => Some(c.ident.to_string()),
-            _ => None,
+        .map(|p| match p {
+            syn::GenericParam::Type(t) => t.ident.to_string(),
+            syn::GenericParam::Const(c) => c.ident.to_string(),
+            // Lifetimes count too. Leaving them out let a predicate naming a SIBLING's lifetime
+            // (`where &'a str: Clone`) past the "declares everything it mentions" guard and into
+            // an impl with no `'a` of its own — E0261 on code that is valid without the macro.
+            // `freshen_binder_lifetimes` does not help: it renames `for<>` binders, not free
+            // lifetimes.
+            syn::GenericParam::Lifetime(l) => l.lifetime.ident.to_string(),
         })
         .collect()
 }
@@ -130,6 +187,15 @@ fn pred_idents(pred: &WherePredicate) -> HashSet<String> {
     impl syn::visit::Visit<'_> for V {
         fn visit_ident(&mut self, i: &Ident) {
             self.0.insert(i.to_string());
+        }
+        // `'static` and `'_` are always in scope, so they must not count as something the
+        // receiving impl has to declare — otherwise, now that `impl_param_idents` reports
+        // lifetimes, an ordinary `T: 'static` co-bound would never be shared. Deliberately does
+        // not recurse: the default impl would feed the bare ident to `visit_ident`.
+        fn visit_lifetime(&mut self, lt: &syn::Lifetime) {
+            if lt.ident != "static" && lt.ident != "_" {
+                self.0.insert(lt.ident.to_string());
+            }
         }
     }
     let mut v = V(HashSet::new());
@@ -176,13 +242,22 @@ fn freshen_binder_lifetimes(mut pred: WherePredicate, taken: &HashSet<String>) -
     pred
 }
 
-fn is_bare_trait_pred(pred: &WherePredicate, trait_ident: &Ident) -> bool {
+/// Does the predicate carry a bound the engine treats as a cycle edge — a bare (or
+/// `self::`-qualified, which peel/validate normalise the same way) reference to **any** routed
+/// trait? Matching only the group's own trait missed two spellings of the same edge: `B: self::Tr`
+/// (identical to `B: Tr` everywhere else in the engine) and a cross-trait `X: Tr2`, which
+/// `remove_cyclic_bounds` strips and rank-lowers exactly like an own-trait bound.
+fn is_bare_trait_pred(pred: &WherePredicate, routed_traits: &HashSet<Ident>) -> bool {
     let WherePredicate::Type(pt) = pred else {
         return false;
     };
-    pt.bounds.iter().any(|b| {
-        matches!(b, TypeParamBound::Trait(tb)
-            if tb.path.segments.len() == 1 && &tb.path.segments[0].ident == trait_ident)
+    pt.bounds.iter().any(|b| match b {
+        TypeParamBound::Trait(tb) => {
+            let mut path = tb.path.clone();
+            crate::helper::strip_leading_self(&mut path);
+            path.segments.len() == 1 && routed_traits.contains(&path.segments[0].ident)
+        }
+        _ => false,
     })
 }
 

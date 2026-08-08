@@ -20,11 +20,14 @@
 //! Alias names are **deterministic** (they carry the module's own ident, not a random nonce), so
 //! diagnostics that mention one are stable enough to match in a golden test.
 
-use proc_macro2::Ident;
+use proc_macro2::{Group, Ident, Spacing, TokenStream, TokenTree};
 use syn::spanned::Spanned;
 use std::collections::HashSet;
 use syn::visit_mut::VisitMut;
-use syn::{Item, ItemImpl, Path, PathArguments, PathSegment, TraitBound, TypePath};
+use syn::{
+    GenericParam, Generics, Item, ItemImpl, Macro, Path, PathArguments, PathSegment, TraitBound,
+    TypePath,
+};
 use template_quote::quote;
 
 /// Rewrite `adopted` so no bare cycle-type name and no relative path survives into the nested
@@ -58,7 +61,11 @@ pub(crate) fn defuse_nesting(
         })
         .collect();
     for im in adopted.iter_mut() {
-        AliasHeads(&aliases).visit_item_impl_mut(im);
+        AliasHeads {
+            aliases: &aliases,
+            shadowed: Vec::new(),
+        }
+        .visit_item_impl_mut(im);
     }
 
     // (2) Lift every `super::…` / `self::…` path to an alias resolved at this level.
@@ -86,19 +93,212 @@ pub(crate) fn defuse_nesting(
 /// The replacement ident is stamped with the span of the ident it replaces, not `call_site` — an
 /// alias is an internal detail, and a diagnostic mentioning one should still point at the line the
 /// caller wrote rather than at the `#[decycle]` attribute.
-struct AliasHeads<'a>(&'a [(String, String)]);
+///
+/// **Scope-aware**: a generic parameter of the impl (or of a method / nested fn) that happens to
+/// share a cycle-head name SHADOWS it, so every path headed by that parameter is left alone —
+/// re-spelling it used to rewrite the PARAMETER into the STRUCT (E0207 + phantom `Copy` bounds on
+/// the struct). `shadowed` is a stack of the generic-param name sets currently in scope.
+struct AliasHeads<'a> {
+    aliases: &'a [(String, String)],
+    shadowed: Vec<HashSet<String>>,
+}
+
+impl AliasHeads<'_> {
+    fn generic_idents(generics: &Generics) -> HashSet<String> {
+        generics
+            .params
+            .iter()
+            .filter_map(|p| match p {
+                GenericParam::Type(t) => Some(t.ident.to_string()),
+                GenericParam::Const(c) => Some(c.ident.to_string()),
+                GenericParam::Lifetime(_) => None,
+            })
+            .collect()
+    }
+
+    fn is_shadowed(&self, name: &str) -> bool {
+        self.shadowed.iter().any(|scope| scope.contains(name))
+    }
+
+    fn alias_for(&self, name: &str) -> Option<&str> {
+        if self.is_shadowed(name) {
+            return None;
+        }
+        self.aliases
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, a)| a.as_str())
+    }
+}
 
 impl VisitMut for AliasHeads<'_> {
+    fn visit_item_impl_mut(&mut self, im: &mut ItemImpl) {
+        self.shadowed.push(Self::generic_idents(&im.generics));
+        syn::visit_mut::visit_item_impl_mut(self, im);
+        self.shadowed.pop();
+    }
+
+    fn visit_impl_item_fn_mut(&mut self, f: &mut syn::ImplItemFn) {
+        self.shadowed.push(Self::generic_idents(&f.sig.generics));
+        syn::visit_mut::visit_impl_item_fn_mut(self, f);
+        self.shadowed.pop();
+    }
+
+    fn visit_item_fn_mut(&mut self, f: &mut syn::ItemFn) {
+        // A nested `fn g<Stmt>()` inside a method body shadows too.
+        self.shadowed.push(Self::generic_idents(&f.sig.generics));
+        syn::visit_mut::visit_item_fn_mut(self, f);
+        self.shadowed.pop();
+    }
+
     fn visit_path_mut(&mut self, path: &mut Path) {
         if path.leading_colon.is_none() {
             if let Some(first) = path.segments.first_mut() {
                 let name = first.ident.to_string();
-                if let Some((_, alias)) = self.0.iter().find(|(n, _)| *n == name) {
+                if let Some(alias) = self.alias_for(&name) {
                     first.ident = Ident::new(alias, first.ident.span());
                 }
             }
         }
         syn::visit_mut::visit_path_mut(self, path);
+    }
+
+    /// `syn` never descends into a macro's token stream, so a cycle-head name inside
+    /// `matches!(self, Stmt::Leaf)` used to survive un-aliased and hit the double-glob
+    /// ambiguity (E0659) whenever an outer scope also defines the name. Rewriting arbitrary
+    /// macro input is NOT safe in general — `stringify!` and friends treat idents as data —
+    /// so only macros on a known allowlist (std macros whose input is ordinary
+    /// expression/pattern code) have their tokens rewritten; everything else is left exactly
+    /// as written, which is at worst the pre-existing loud ambiguity error, never a silent
+    /// change of meaning.
+    fn visit_macro_mut(&mut self, mac: &mut Macro) {
+        if macro_input_is_expression_code(&mac.path) {
+            mac.tokens = self.rewrite_macro_tokens(std::mem::take(&mut mac.tokens));
+        }
+        syn::visit_mut::visit_macro_mut(self, mac);
+    }
+}
+
+/// Std macros whose input tokens are ordinary expression / pattern code, so an ident in path
+/// position inside them refers to the item exactly like it would outside a macro. Notably
+/// ABSENT: `stringify!`, `concat_idents!`, `cfg!`, `env!`, `include!` — anything that reads
+/// idents as data. Format-family macros are safe because their format string is a `Literal`
+/// token, untouched by the ident rewrite.
+const EXPRESSION_CODE_MACROS: &[&str] = &[
+    "matches",
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "debug_assert",
+    "debug_assert_eq",
+    "debug_assert_ne",
+    "panic",
+    "unreachable",
+    "todo",
+    "unimplemented",
+    "vec",
+    "format",
+    "format_args",
+    "write",
+    "writeln",
+    "print",
+    "println",
+    "eprint",
+    "eprintln",
+    "dbg",
+];
+
+/// Is this macro path a plausible spelling of an allowlisted std macro — the bare name, or the
+/// name rooted at `std`/`core`/`alloc`? (A same-named user macro imported into scope is treated
+/// like the std one; shadowing a prelude macro name is rare and linted against, and the
+/// alternative — never rewriting — regresses the overwhelmingly common `matches!` case.)
+fn macro_input_is_expression_code(path: &Path) -> bool {
+    let Some(last) = path.segments.last() else {
+        return false;
+    };
+    if !EXPRESSION_CODE_MACROS.contains(&last.ident.to_string().as_str()) {
+        return false;
+    }
+    match path.segments.len() {
+        1 => path.leading_colon.is_none(),
+        2 => {
+            let root = path.segments[0].ident.to_string();
+            root == "std" || root == "core" || root == "alloc"
+        }
+        _ => false,
+    }
+}
+
+impl AliasHeads<'_> {
+    /// Rewrite cycle-head idents inside an (allowlisted) macro's token stream, conservatively:
+    ///
+    /// - an ident preceded by `:` (path continuation `Expr::Stmt`), `.` (field access), `$`
+    ///   (macro-rules var), or `'` (lifetime) is never touched;
+    /// - an ident followed by a *single* `:` (field-init / binding position, `Stmt: 1`) is never
+    ///   touched — but `Stmt::…` (joint first colon) is a path head and IS rewritten;
+    /// - an ident followed by `!` is a nested macro name: the name itself is never rewritten, and
+    ///   its argument group is recursed into only when that macro is allowlisted too (so a nested
+    ///   `stringify!(Stmt)` inside an `assert_eq!` stays verbatim);
+    /// - shadowing generic params suppress the rewrite exactly as outside macros.
+    fn rewrite_macro_tokens(&self, tokens: TokenStream) -> TokenStream {
+        let toks: Vec<TokenTree> = tokens.into_iter().collect();
+        let mut out: Vec<TokenTree> = Vec::with_capacity(toks.len());
+        let mut i = 0;
+        while i < toks.len() {
+            match &toks[i] {
+                TokenTree::Ident(id) => {
+                    let followed_by = toks.get(i + 1);
+                    if matches!(followed_by, Some(TokenTree::Punct(p)) if p.as_char() == '!') {
+                        // A nested macro call: `name ! <group>` (or `name !` alone — `!=` never
+                        // follows a bare ident-in-expression as one Punct pair here because
+                        // `assert!(a != b)` lexes `!=` as its own joint punct, not after an
+                        // ident... it does follow: `a != b` — so require a Group right after
+                        // to treat it as a macro call).
+                        if let Some(TokenTree::Group(g)) = toks.get(i + 2) {
+                            out.push(toks[i].clone());
+                            out.push(toks[i + 1].clone());
+                            let nested_allowlisted = EXPRESSION_CODE_MACROS
+                                .contains(&id.to_string().as_str());
+                            if nested_allowlisted {
+                                let mut ng =
+                                    Group::new(g.delimiter(), self.rewrite_macro_tokens(g.stream()));
+                                ng.set_span(g.span());
+                                out.push(TokenTree::Group(ng));
+                            } else {
+                                out.push(toks[i + 2].clone());
+                            }
+                            i += 3;
+                            continue;
+                        }
+                    }
+                    let prev_blocks = matches!(
+                        out.last(),
+                        Some(TokenTree::Punct(p))
+                            if matches!(p.as_char(), ':' | '.' | '$' | '\'')
+                    );
+                    let next_is_single_colon = matches!(
+                        followed_by,
+                        Some(TokenTree::Punct(p))
+                            if p.as_char() == ':' && p.spacing() == Spacing::Alone
+                    );
+                    let name = id.to_string();
+                    match self.alias_for(&name) {
+                        Some(alias) if !prev_blocks && !next_is_single_colon => {
+                            out.push(TokenTree::Ident(Ident::new(alias, id.span())));
+                        }
+                        _ => out.push(toks[i].clone()),
+                    }
+                }
+                TokenTree::Group(g) => {
+                    let mut ng = Group::new(g.delimiter(), self.rewrite_macro_tokens(g.stream()));
+                    ng.set_span(g.span());
+                    out.push(TokenTree::Group(ng));
+                }
+                other => out.push(other.clone()),
+            }
+            i += 1;
+        }
+        out.into_iter().collect()
     }
 }
 

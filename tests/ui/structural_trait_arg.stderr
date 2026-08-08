@@ -1,0 +1,10 @@
+error: structural is not supported for trait items
+
+         = help: structural selects the module-level engine; write it on the enclosing #[decycle(structural)] mod instead
+
+ --> tests/ui/structural_trait_arg.rs:4:1
+  |
+4 | #[decycle::decycle(structural)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `decycle::decycle` (in Nightly builds, run with -Z macro-backtrace for more info)

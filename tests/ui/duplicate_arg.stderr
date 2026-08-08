@@ -1,0 +1,5 @@
+error: duplicate argument 'recurse_level'
+ --> tests/ui/duplicate_arg.rs:4:39
+  |
+4 | #[decycle::decycle(recurse_level = 5, recurse_level = 2)]
+  |                                       ^^^^^^^^^^^^^

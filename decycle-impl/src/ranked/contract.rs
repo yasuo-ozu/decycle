@@ -172,12 +172,11 @@ fn reaches_participant(ty: &Type, participants: &HashSet<Ident>) -> bool {
     }
     impl Visit<'_> for V<'_> {
         fn visit_type_path(&mut self, tp: &TypePath) {
+            // Bare (or `self::`-qualified) idents only — a multi-segment path names a different
+            // item that merely shares a last segment. Same rule as `peel::cycle_types_within`;
+            // matching on the last segment let a foreign type stand in for a participant here too.
             if tp.qself.is_none()
-                && tp
-                    .path
-                    .segments
-                    .last()
-                    .is_some_and(|s| self.participants.contains(&s.ident))
+                && crate::helper::path_names_local_ident(&tp.path, self.participants)
             {
                 self.hit = true;
             }

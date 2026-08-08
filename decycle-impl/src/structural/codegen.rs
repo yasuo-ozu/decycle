@@ -177,25 +177,35 @@ pub(crate) fn codegen_scc(model: &Model, scc: &Scc) -> syn::Result<TokenStream> 
     Ok(out)
 }
 
-/// `#[repr(transparent)] <vis> struct __MTerm<params>(<vis> M<params>);` — the per-member terminator, a
-/// same-layout wrapper of the natural type. Its visibility (and its field's) matches `M`, so wrapping a
-/// private cycle type doesn't expose it through a `pub` interface (no `private_interfaces`).
+/// `#[repr(transparent)] <vis> struct __MTerm<params>(<vis> M<params>) <where M's own clause>;` — the
+/// per-member terminator, a same-layout wrapper of the natural type. Its visibility (and its field's)
+/// matches `M`, so wrapping a private cycle type doesn't expose it through a `pub` interface (no
+/// `private_interfaces`).
+///
+/// The wrapped type's predicates **come along, in both spellings**: inline bounds via
+/// `DeclBounds::Keep` (`enum Expr<S: Span>`) and the `where`-clause verbatim (`where S: Clone`).
+/// Without them a type whose own well-formedness needs a predicate gives a wrapper whose single field
+/// is ill-formed — `E0277 … required by a bound in Expr`, reported against the *generated* struct and
+/// therefore reading as if the caller's type were at fault. `Bare` is right for the impl generics
+/// below (the impl re-states what it needs) but never for this wrapper, which must be exactly as
+/// constrained as what it wraps.
 pub(crate) fn make_term_item(member: &Adt, nonce: u64) -> TokenStream {
     let term = term_ident(&member.ident.to_string(), nonce);
     let m_id = &member.ident;
     let vis = member.vis();
-    let decl = params_decl(&member.generics, DeclBounds::Bare);
+    let decl = params_decl(&member.generics, DeclBounds::Keep);
     let uses = params_use(&member.generics);
     let decl_angle = wrap_angle(&decl);
     let use_angle = wrap_angle(&uses);
     // Replicate the type's `#[cfg]`s so a cfg-gated cyclic type's terminator strips with it (else the
     // terminator would wrap a type rustc removed → E0412).
     let cfgs = crate::extract_cfg_attrs(member.attrs());
+    let where_clause = member.generics.where_clause.as_ref();
     quote! {
         #(#cfgs)*
         #[repr(transparent)]
         #[allow(dead_code)]
-        #vis struct #term #decl_angle ( #vis #m_id #use_angle );
+        #vis struct #term #decl_angle ( #vis #m_id #use_angle ) #where_clause ;
     }
 }
 
@@ -486,6 +496,126 @@ fn nat_method(
     }
 }
 
+/// See through `(T)` and the invisible groups a macro-expanded type can be wrapped in, so the
+/// trait-object checks below match on the real shape.
+fn strip_group(ty: &Type) -> &Type {
+    match ty {
+        Type::Group(g) => strip_group(&g.elem),
+        Type::Paren(p) => strip_group(&p.elem),
+        other => other,
+    }
+}
+
+/// Re-wrap a `&dyn Fn(..)`-shaped argument that mentions `Self` into `target`-space.
+///
+/// The type-punning cast is unsound for trait objects: `dyn Fn(&A) -> R` and `dyn Fn(&ATerm) -> R`
+/// are *different traits*, so `transmute`-ing the wide pointer leaves it carrying a vtable that
+/// names the wrong one (miri: "wrong trait in wide pointer vtable"). Both are pointer-pair sized,
+/// so `__DecycleSizeGuard` cannot see it.
+///
+/// Instead of punning, build a fresh closure whose parameters are already in `target`-space and
+/// which casts each argument back before calling the user's object. `&closure` then coerces to
+/// `&dyn Fn(..)` the ordinary way, so the vtable is produced by the compiler rather than forged.
+/// The closure is a temporary living to the end of the forwarding call, so this costs no
+/// allocation.
+///
+/// Returns `Ok(None)` when `ty` is not a trait object at all (the caller's plain cast is correct
+/// for those — a bare `fn(&Self)` pointer is ABI-compatible and stays punned). Shapes that are
+/// trait objects but cannot be rebuilt this way are rejected rather than silently punned.
+fn dyn_fn_adapter(
+    ty: &Type,
+    target: &Type,
+    id: &syn::Ident,
+    nonce: u64,
+) -> syn::Result<Option<TokenStream>> {
+    // Only `&dyn ..` is in scope here; `Box<dyn ..>`/`&mut dyn ..` fall through to the reject
+    // below via `mentions_self` on their inner object.
+    let Type::Reference(r) = ty else {
+        return match strip_group(ty) {
+            Type::TraitObject(_) => Err(syn::Error::new(
+                ty.span(),
+                "#[decycle(structural)]: a by-value or boxed trait object mentioning `Self` \
+                 cannot be forwarded soundly (its vtable names a different trait once `Self` is \
+                 substituted). Take it by shared reference (`&dyn Fn(&Self) -> _`), or use a \
+                 generic parameter instead of a trait object.",
+            )),
+            _ => Ok(None),
+        };
+    };
+    let Type::TraitObject(to) = strip_group(&r.elem) else {
+        return Ok(None);
+    };
+    if r.mutability.is_some() {
+        return Err(syn::Error::new(
+            ty.span(),
+            "#[decycle(structural)]: `&mut dyn ..` mentioning `Self` cannot be forwarded soundly \
+             (its vtable names a different trait once `Self` is substituted). Take it by shared \
+             reference (`&dyn Fn(&Self) -> _`), or use a generic parameter instead.",
+        ));
+    }
+    // Exactly one trait bound, spelled with `Fn(..)` sugar. Extra trait bounds (`+ Send`) are
+    // refused because the rebuilt closure would have to prove them itself.
+    let mut fn_bound = None;
+    for b in &to.bounds {
+        match b {
+            syn::TypeParamBound::Lifetime(_) => {}
+            syn::TypeParamBound::Trait(tb) => {
+                if fn_bound.is_some() {
+                    fn_bound = None;
+                    break;
+                }
+                fn_bound = Some(tb);
+            }
+            _ => {
+                fn_bound = None;
+                break;
+            }
+        }
+    }
+    let sugar = fn_bound.and_then(|tb| {
+        let seg = tb.path.segments.last()?;
+        match (&seg.arguments, seg.ident.to_string().as_str()) {
+            (PathArguments::Parenthesized(pa), "Fn") => Some(pa),
+            _ => None,
+        }
+    });
+    let Some(pa) = sugar else {
+        return Err(syn::Error::new(
+            ty.span(),
+            "#[decycle(structural)]: only `&dyn Fn(..)` trait objects mentioning `Self` can be \
+             forwarded. `FnMut`/`FnOnce`, additional bounds such as `+ Send`, and user traits \
+             mentioning `Self` would need a vtable for a trait that does not exist after `Self` \
+             is substituted. Use a generic parameter (`F: FnMut(&Self)`) instead.",
+        ));
+    };
+
+    let cast = cast_ident(nonce);
+    let mut params = Vec::new();
+    let mut args = Vec::new();
+    for (i, src_ty) in pa.inputs.iter().enumerate() {
+        let p = syn::Ident::new(&format!("__dcl_adapt_{i}_{nonce:x}"), Span::call_site());
+        let dst_ty = subst_self(src_ty, target);
+        // The adapter is declared in target-space and casts each argument back before handing it
+        // to the user's closure, which still expects natural-space types.
+        if mentions_self(src_ty) {
+            args.push(quote! { unsafe { #cast::<#dst_ty, #src_ty>(#p) } });
+        } else {
+            args.push(quote! { #p });
+        }
+        params.push(quote! { #p: #dst_ty });
+    }
+    let call = quote! { #id(#(#args),*) };
+    // A `Self`-mentioning return travels the other way: natural-space result out to target-space.
+    let body = match &pa.output {
+        syn::ReturnType::Type(_, rt) if mentions_self(rt) => {
+            let dst_rt = subst_self(rt, target);
+            quote! { unsafe { #cast::<#rt, #dst_rt>(#call) } }
+        }
+        _ => call,
+    };
+    Ok(Some(quote! { &move |#(#params),*| #body }))
+}
+
 /// Forward the non-receiver parameters (receiver handled separately). An argument whose type mentions
 /// `Self` (e.g. `other: &Self` in `PartialEq::eq`) is cast into `target`-space, exactly like the
 /// receiver; others pass through by ident.
@@ -505,6 +635,14 @@ fn forward_args(sig: &syn::Signature, target: &Type, nonce: u64) -> syn::Result<
             };
             let ty = &pt.ty;
             if mentions_self(ty) {
+                // A trait object may NOT be punned: `dyn Fn(&A)` and `dyn Fn(&ATerm)` are
+                // different traits, so transmuting the wide pointer keeps a vtable naming the
+                // wrong one. They are the same size, so the size guard cannot catch it. Rebuild
+                // the object by coercion instead — see `dyn_fn_adapter`.
+                if let Some(adapter) = dyn_fn_adapter(ty, target, id, nonce)? {
+                    out.push(adapter);
+                    continue;
+                }
                 let dst = subst_self(ty, target);
                 out.push(quote! { unsafe { #cast::<#ty, #dst>(#id) } });
             } else {
@@ -806,6 +944,15 @@ fn type_mentions(ty: &Type, idents: &HashSet<String>) -> bool {
     found
 }
 
+/// Does `path` mention any of `idents` — as a segment, a type argument, **or inside an
+/// associated-type binding**?
+///
+/// The binding case is not a detail: a cyclic bound of the form `Tr<Assoc = X>` puts `X` somewhere no
+/// type *argument* appears, and `X` is very often an invented impl generic (syan's `Spanned` cyclic
+/// bound always carries `Span = __Syan_Span`). Missing it made the forwarding-assertion guard above
+/// fail to fire, and the assertion was then emitted referring to a parameter that is not in scope
+/// inside its `const _` block — `E0412: cannot find type __Syan_Span`, pointing at the macro rather
+/// than at anything the caller wrote.
 fn path_mentions(path: &syn::Path, idents: &HashSet<String>) -> bool {
     let mut found = false;
     for seg in &path.segments {
@@ -814,10 +961,18 @@ fn path_mentions(path: &syn::Path, idents: &HashSet<String>) -> bool {
         }
         if let PathArguments::AngleBracketed(ab) = &seg.arguments {
             for a in &ab.args {
-                if let GenericArgument::Type(t) = a {
-                    if type_mentions(t, idents) {
-                        found = true;
-                    }
+                let mentions = match a {
+                    GenericArgument::Type(t) => type_mentions(t, idents),
+                    GenericArgument::AssocType(at) => type_mentions(&at.ty, idents),
+                    // A `Tr<Assoc: Bound>` constraint can name a param in the bound itself.
+                    GenericArgument::Constraint(c) => c.bounds.iter().any(|b| match b {
+                        syn::TypeParamBound::Trait(tb) => path_mentions(&tb.path, idents),
+                        _ => false,
+                    }),
+                    _ => false,
+                };
+                if mentions {
+                    found = true;
                 }
             }
         }

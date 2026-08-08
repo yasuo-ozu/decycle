@@ -421,13 +421,14 @@ fn emit_impl_items_leaf(
                         Some(&sig.generics),
                     );
 
-                    // The transmute names BOTH types: `usize` source (the registry hands the
-                    // fn pointer out by value) and the declared alias target — never `_`.
+                    // The transmute names BOTH types: the `*const ()` source (the registry hands
+                    // the fn pointer out by value, WITH its provenance — a `usize` here would
+                    // strip it and make this call UB) and the declared alias target — never `_`.
                     output.extend(quote! {
                         #defaultness #sig {
                             let __dcl_f = unsafe {
                                 ::core::mem::transmute::<
-                                    ::core::primitive::usize,
+                                    *const (),
                                     #fa #(if !inst.is_empty()) { <#(#inst),*> }
                                 >(#decycle::__reentry::lookup::<
                                     #mk<Self #(for a in &self_targs) {, #a} #(for i in &margs) {, #i}>
@@ -492,9 +493,20 @@ fn emit_impl_items_delegate(
                 // combo is uncallable in plain Rust anyway).
                 let margs = type_const_idents(&sig.generics);
                 let do_turbofish = !margs.is_empty() && !sig_has_impl_trait_input(&sig);
+                // This delegating body is what calls into the rank chain, so its registrations
+                // must stay live for the whole descent — hence a scope opened here rather than
+                // inside `build_bareparam_registrations`. The scope also bounds the undo log:
+                // a `register` made outside any scope would log a record nothing ever reclaims.
+                // Priming still survives, because a registration that CREATES its key is left in
+                // place when the scope closes (only displacement is rolled back).
                 let prologue = match bareparam {
                     Some((trait_, decycle)) => {
-                        build_bareparam_registrations(trait_, impl_, &sig, decycle)
+                        let regs = build_bareparam_registrations(trait_, impl_, &sig, decycle);
+                        let scope_guard = name!("__dcl_reentry_scope");
+                        quote! {
+                            let #scope_guard = #decycle::__reentry::scope();
+                            #regs
+                        }
                     }
                     None => TokenStream::new(),
                 };
@@ -2211,10 +2223,15 @@ fn emit_registration(
 ) -> TokenStream {
     let mk = reentry_marker_name(trait_ident, m_ident);
     let re = reentry_fn_name(trait_ident, m_ident);
+    // `as *const ()` (never `as usize`): laundering a fn pointer through an integer strips its
+    // provenance, and calling the transmuted result is UB.
+    //
+    // Rollback is handled by the enclosing `__reentry::scope()` guard the prologue opens, not
+    // per registration — see `Registration` in the runtime facade.
     quote! {
         #decycle::__reentry::register::<#rt_path::#mk<#target #(for a in targs) {, #a} #(for i in margs) {, #i}>>(
             #fp,
-            #rt_path::#re::<#target #(for a in targs) {, #a} #(for i in margs) {, #i}> as usize
+            #rt_path::#re::<#target #(for a in targs) {, #a} #(for i in margs) {, #i}> as *const ()
         );
     }
 }
@@ -3372,6 +3389,9 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                                 stripped.lt_token = Some(Default::default());
                                 stripped.gt_token = Some(Default::default());
                             }
+                            // No return value: these registrations are rolled back by the
+                            // `scope()` guard the CALLER (the method prologue) holds, so this
+                            // fn stays a plain `()` call and costs the descent no stack.
                             register_once_item = quote! {
                                 #[doc(hidden)]
                                 #[allow(non_snake_case, unused, dead_code)]
@@ -3411,8 +3431,17 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                                         rule1_ok,
                                         &decycle_path,
                                     );
+                                    // Open a registration scope FIRST and hold it for the rest
+                                    // of the body: everything registered below is rolled back
+                                    // when this frame exits (including on unwind), so a nested
+                                    // descent started from the user's own statements cannot
+                                    // leave this frame's floor pointing at another closure's
+                                    // fn. Binding to a named nonce ident rather than `_`
+                                    // matters — `let _ = ..` would drop it right here.
+                                    let scope_guard = name!("__dcl_reentry_scope");
                                     *block = parse_quote! {
                                         {
+                                            let #scope_guard = #decycle_path::__reentry::scope();
                                             #rule1_regs
                                             #register_once_fn
                                             #(if !call_targs.is_empty()) { ::<#(#call_targs),*> }
@@ -3610,7 +3639,7 @@ mod tests {
         let expected_hand = quote! {
             #decycle_path::__reentry::register::<#sm::#rm::#mk<Self>>(
                 #fp,
-                #sm::#rm::#re::<Self> as usize
+                #sm::#rm::#re::<Self> as *const ()
             );
         };
         assert_eq!(squish(&hand.to_string()), squish(&expected_hand.to_string()));

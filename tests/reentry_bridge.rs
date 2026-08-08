@@ -4,13 +4,14 @@
 //! FNV fold constants are locked.
 
 // This test hand-simulates the reentry registry, whose values ARE function addresses stored as
-// `usize` (exactly what the macro emits: `Re::<..> as usize`). The `fn as usize` casts are the
-// mechanism under test, not an accident.
-// `unknown_lints` keeps this compiling on toolchains whose clippy predates `function_casts_as_integer`.
-#![allow(unknown_lints)]
-#![allow(function_casts_as_integer)]
+// `*const ()` (exactly what the macro emits: `Re::<..> as *const ()`). Storing them as `usize`
+// instead would strip provenance and make the floor's transmuted call UB, so the pointer cast
+// is the mechanism under test, not an accident.
+//
+// `register` records what it displaced into the innermost open `scope()`; closing that scope
+// restores the displaced entries. The generated prologue opens one scope per frame.
 
-use decycle::__reentry::{fp_fold, fp_fold_word, lookup, register, FP_SEED};
+use decycle::__reentry::{fp_fold, fp_fold_word, lookup, register, scope, FP_SEED};
 
 /// A marker ZST — the same shape `emit_reentry_items` mints
 /// (`PhantomData<(*const Target, …)>`). The key is `type_name::<Mk<..>>()` STRING content +
@@ -35,14 +36,18 @@ fn fp_of<T>() -> u64 {
 
 #[test]
 fn hand_key_round_trips_through_floor_lookup() {
-    register::<HandMk<MemberA>>(fp_of::<MemberA>(), reentry_a as usize);
-    register::<HandMk<MemberB>>(fp_of::<MemberB>(), reentry_b as usize);
+    register::<HandMk<MemberA>>(fp_of::<MemberA>(), reentry_a as *const ());
+    register::<HandMk<MemberB>>(fp_of::<MemberB>(), reentry_b as *const ());
     // The floor's exact call shape: lookup::<Mk<Target>>(fp), transmuted and called.
     let fa = unsafe {
-        core::mem::transmute::<usize, fn(u32) -> u32>(lookup::<HandMk<MemberA>>(fp_of::<MemberA>()))
+        core::mem::transmute::<*const (), fn(u32) -> u32>(lookup::<HandMk<MemberA>>(
+            fp_of::<MemberA>(),
+        ))
     };
     let fb = unsafe {
-        core::mem::transmute::<usize, fn(u32) -> u32>(lookup::<HandMk<MemberB>>(fp_of::<MemberB>()))
+        core::mem::transmute::<*const (), fn(u32) -> u32>(lookup::<HandMk<MemberB>>(
+            fp_of::<MemberB>(),
+        ))
     };
     assert_eq!(fa(41), 42);
     assert_eq!(fb(40), 42);
@@ -51,18 +56,66 @@ fn hand_key_round_trips_through_floor_lookup() {
 #[test]
 fn registration_is_idempotent_and_per_instantiation() {
     // `register_all_members` may run on every facade entry — same key, same fn, harmless:
-    register::<HandMk<MemberA>>(fp_of::<MemberA>(), reentry_a as usize);
-    register::<HandMk<MemberA>>(fp_of::<MemberA>(), reentry_a as usize);
-    assert_eq!(lookup::<HandMk<MemberA>>(fp_of::<MemberA>()), reentry_a as usize);
+    register::<HandMk<MemberA>>(fp_of::<MemberA>(), reentry_a as *const ());
+    register::<HandMk<MemberA>>(fp_of::<MemberA>(), reentry_a as *const ());
+    assert_eq!(
+        lookup::<HandMk<MemberA>>(fp_of::<MemberA>()),
+        reentry_a as *const ()
+    );
     // Distinct instantiations never collide even at IDENTICAL layout (fp equal): the marker's
     // type_name differs — the spike's P3/P7 cross-T guarantee.
     struct SameLayoutAsA(#[allow(dead_code)] u64);
-    register::<HandMk<SameLayoutAsA>>(fp_of::<SameLayoutAsA>(), reentry_b as usize);
+    register::<HandMk<SameLayoutAsA>>(fp_of::<SameLayoutAsA>(), reentry_b as *const ());
     assert_eq!(fp_of::<MemberA>(), fp_of::<SameLayoutAsA>());
-    assert_eq!(lookup::<HandMk<MemberA>>(fp_of::<MemberA>()), reentry_a as usize);
+    assert_eq!(
+        lookup::<HandMk<MemberA>>(fp_of::<MemberA>()),
+        reentry_a as *const ()
+    );
     assert_eq!(
         lookup::<HandMk<SameLayoutAsA>>(fp_of::<SameLayoutAsA>()),
-        reentry_b as usize
+        reentry_b as *const ()
+    );
+}
+
+/// Registration is FRAME-SCOPED: an inner registration of the SAME key shadows the outer one
+/// only while its guard lives, and the outer value is restored when the inner guard drops. This
+/// is what stops a nested descent (a callback in the middle of a method body) from making the
+/// floor call the wrong fn, and what stops a panicked descent from leaving a stale entry.
+#[test]
+fn registration_is_frame_scoped_and_restores_on_drop() {
+    struct Solo(#[allow(dead_code)] u64);
+    let fp = fp_of::<Solo>();
+
+    let _outer = scope();
+    register::<HandMk<Solo>>(fp, reentry_a as *const ());
+    assert_eq!(lookup::<HandMk<Solo>>(fp), reentry_a as *const ());
+    {
+        let _inner = scope();
+        register::<HandMk<Solo>>(fp, reentry_b as *const ());
+        assert_eq!(lookup::<HandMk<Solo>>(fp), reentry_b as *const ());
+    }
+    // Inner scope closed => the outer frame's entry is back, not the inner one.
+    assert_eq!(lookup::<HandMk<Solo>>(fp), reentry_a as *const ());
+}
+
+/// Only SHADOWING is scoped. A registration that created its slot deliberately outlives the
+/// frame, because two documented behaviors depend on it: the bare-param case is "unbounded once
+/// primed" (`tests/bareparam_reentry.rs`), and a descent that hit the fail-closed panic leaves
+/// its registrations behind so a later good call succeeds (`tests/limitation.rs`).
+#[test]
+fn a_created_registration_outlives_its_frame() {
+    struct Primed(#[allow(dead_code)] u32);
+    let fp = fp_of::<Primed>();
+    {
+        let _g = scope();
+        register::<HandMk<Primed>>(fp, reentry_a as *const ());
+        assert_eq!(lookup::<HandMk<Primed>>(fp), reentry_a as *const ());
+    }
+    // Scope closed, but nothing was displaced, so the priming entry stays.
+    assert_eq!(
+        lookup::<HandMk<Primed>>(fp),
+        reentry_a as *const (),
+        "a priming registration must survive its frame",
     );
 }
 

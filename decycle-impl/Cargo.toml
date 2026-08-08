@@ -22,4 +22,8 @@ template-quote = "0.4.0"
 
 [dependencies.syn]
 version = "2.0"
-features = ["full", "derive", "printing", "extra-traits", "visit", "visit-mut"]
+# Only what the two engines actually use. `default-features = false` matters: syn's defaults
+# include `derive`, which nothing here needs (no `DeriveInput`/`Data`), so leaving them on would
+# keep building it. `extra-traits` (Debug/Eq/Hash on AST nodes) is likewise unused.
+default-features = false
+features = ["clone-impls", "full", "parsing", "printing", "visit", "visit-mut"]

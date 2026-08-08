@@ -23,7 +23,10 @@ type-leak = "0.7.0"
 
 [dependencies.syn]
 version = "2.0"
-features = ["full", "derive", "printing", "extra-traits", "visit", "visit-mut"]
+# This crate only parses the attribute arguments and the annotated item and re-emits them; it
+# walks nothing, so no `visit`/`visit-mut`, and defines no derive, so no `derive`.
+default-features = false
+features = ["clone-impls", "full", "parsing", "printing", "proc-macro"]
 
 [dev-dependencies]
 trybuild = "1.0"

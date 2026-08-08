@@ -214,8 +214,9 @@ fn validate_impl_where_bounds(
             // trait is a DIFFERENT item; matching on the last segment alone was a false
             // positive. NOTE: a still-multi-segment, qualified reference to a #[decycle]
             // trait (`super::Foo`, `crate::mod::Foo`) is intentionally NOT flagged here —
-            // it's the established, working way to bind a FOREIGN (non-cyclic) type to
-            // the ORIGINAL, un-ranked trait in a side-bound (`Foreign: super::Foo`); only
+            // it's the documented way to bind a FOREIGN (non-cyclic) type to the ORIGINAL,
+            // un-ranked trait in a side-bound (`Foreign: super::Foo`; `nesting::LiftRelative`
+            // lifts the depth-fragile `super::` spelling so it survives re-emission); only
             // the bare/`self::`-qualified form participates in ranking at all, so there's
             // no reliable syntactic way to tell "meant to be ranked, mis-qualified" apart
             // from this deliberate opt-out.

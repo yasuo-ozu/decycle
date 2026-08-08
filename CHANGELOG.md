@@ -5,10 +5,9 @@ Notable changes, following [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
-> **Release status (2026-08).** The latest release published to crates.io is **0.3.0**;
-> no release has been yanked. Everything in this section — and the 0.4.0-numbered
-> section below, which was **never published** — first ships with the next release
-> (the workspace is currently versioned 0.5.0).
+> **Release status (2026-08).** 0.5.0 is on crates.io and is what `cargo add decycle`
+> resolves to; no release has been yanked. Everything in this section ships with 0.5.1
+> (the version the workspace now carries).
 
 ### Fixed — soundness (2026-08-04 audit)
 
@@ -163,19 +162,17 @@ they are not a claim that the engine as a whole is proven sound.
 
 ## [0.4.0] — never published
 
-> This version number was staged in-tree but **never released**: crates.io stops at
-> 0.3.0 and no `v0.4.0` git tag exists. The changes below remain unreleased and will
-> first ship with the next published version, together with the Unreleased section
-> above.
+> This version number was staged in-tree but **never released**: no `v0.4.0` git tag
+> exists and crates.io went straight from 0.3.0 to 0.5.0. The changes below shipped as
+> part of 0.5.0.
 
 ### Advisory
 
-**Every published release (≤ 0.3.0) is unsound at default settings**: with
+**Every release ≤ 0.3.0 is unsound at default settings**: with
 `support_infinite_cycle = true` (the default), any recursion deeper than
 `recurse_level` jumps through an incorrectly-transmuted pointer and crashes
-(SIGSEGV). As of 2026-08 **none of these releases has been yanked** — 0.3.0 is the
-latest version on crates.io and is what a plain `cargo add decycle` resolves to.
-On any release ≤ 0.3.0, set `support_infinite_cycle = false`.
+(SIGSEGV). None of them has been yanked, so if you pin one, set
+`support_infinite_cycle = false`. 0.5.0 and later do not have this defect.
 
 ### Changed — unbounded shim replaced
 

@@ -4,13 +4,6 @@
     html_favicon_url = "https://raw.githubusercontent.com/yasuo-ozu/decycle/main/decycle.png"
 )]
 #![doc = include_str!("README.md")]
-// The README's doctests spell out `fn main() {}` deliberately, so this lint is a false positive
-// there: several examples use `#[decycle] use super::Trait;` inside a module, and `super::` must
-// resolve to the doctest crate root — under rustdoc's implicit `fn main` wrapping those items
-// would become fn-local and the paths would not resolve. Visible mains (instead of hidden
-// `# fn main() {}` lines) also keep the README rendering as valid Rust on GitHub and crates.io,
-// where rustdoc's `#`-hiding does not apply.
-#![allow(clippy::needless_doctest_main)]
 
 #[doc(hidden)]
 pub use decycle_macro::__finalize;

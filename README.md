@@ -20,7 +20,7 @@ traits with circular dependencies that would otherwise fail to compile.
 
 ```toml
 [dependencies]
-decycle = "0.5.0"
+decycle = "0.5.1"
 ```
 
 ## Why Decycle?
@@ -82,7 +82,7 @@ The `#[decycle]` macro solves this by breaking the circular dependency cycle.
 This example shows how to break circular trait dependencies using `#[decycle]`:
 
 ```rust
-#use decycle::decycle;
+# use decycle::decycle;
 #[decycle]
 mod calculator {
     #[decycle]
@@ -144,7 +144,7 @@ You can also annotate `use` items inside the module to use traits defined out of
 the module:
 
 ```rust
-#use decycle::decycle;
+# use decycle::decycle;
 
 // can be defined out of the crate
 #[decycle]
@@ -160,7 +160,7 @@ mod cycle {
 
     // ...
 }
-#fn main() {}
+# fn main() {}
 ```
 
 ## Two algorithms
@@ -239,7 +239,7 @@ That chain has to end somewhere; the last rank is the **floor**. What happens th
 Smallest example (two mutually recursive traits):
 
 ```rust
-use decycle::decycle;
+# use decycle::decycle;
 
 #[decycle]
 trait A { fn a(&self) -> ::core::primitive::usize; }
@@ -257,7 +257,7 @@ mod cycle {
     impl A for Left where Right: B { fn a(&self) -> usize { self.0 + 1 } }
     impl B for Right where Left: A { fn b(&self) -> usize { self.0 + 1 } }
 }
-fn main() {}
+# fn main() {}
 ```
 
 Expected expansion (simplified, with stable names):
@@ -304,7 +304,7 @@ mod cycle {
         fn b(&self) -> usize { unimplemented!("decycle: cycle limit reached") }
     }
 }
-fn main() {}
+# fn main() {}
 ```
 
 **Past the floor (`support_infinite_cycle = true`, the default).** The deepest rank does not
@@ -346,7 +346,7 @@ A second, self-contained algorithm that emits **no runtime machinery** —
 everything is resolved at compile time.
 
 ```rust
-use decycle::decycle;
+# use decycle::decycle;
 
 #[decycle(structural)]
 mod ast {

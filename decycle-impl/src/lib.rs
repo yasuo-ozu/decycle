@@ -3,18 +3,23 @@ use std::collections::HashMap;
 use syn::visit_mut::VisitMut;
 use syn::*;
 
-// ===== Existing algorithm: the `type-leak` ranked engine (finalize ping-pong) =====
-mod ranked;
-// Re-exports keeping the historical public paths (`decycle_impl::process_module`,
-// `decycle_impl::finalize`, …) and the crate-internal `crate::finalize` / `crate::helper` stable.
+// ===== Ranked engine (default) =====
+pub mod ranked;
+// Root re-exports kept for `decycle-macro` and the internal `crate::finalize` / `crate::helper`
+// paths; the user-facing docs live on `ranked` (surfaced as `decycle::ranked`).
+#[doc(hidden)]
 pub use ranked::finalize;
 pub(crate) use ranked::helper;
-pub use ranked::process_module::process_module;
-pub use ranked::process_trait::process_trait;
+#[doc(hidden)]
+pub use ranked::process_module;
+#[doc(hidden)]
+pub use ranked::process_trait;
 
-// ===== Structural unroll: per-member `#[repr(transparent)]` terminators (`#[decycle(structural)]`) =====
-mod structural;
-pub use structural::process_module_structural;
+// ===== Structural unroll (`#[decycle(structural)]`) =====
+pub mod structural;
+// Aliased root re-export kept for `decycle-macro` (the public name is `structural::process_module`).
+#[doc(hidden)]
+pub use structural::process_module as process_module_structural;
 
 // Rendering `syn::Generics` to token form, shared by both engines.
 mod generics_fmt;

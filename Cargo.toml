@@ -1,6 +1,6 @@
 [package]
 name = "decycle"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.71"
 description = "Solve circular trait obligation"
@@ -15,8 +15,8 @@ exclude = ["docs/"]
 path = "lib.rs"
 
 [dependencies]
-decycle-macro = { path = "macro", version = "0.4.0" }
-decycle-impl = { path = "decycle-impl", version = "0.4.0" }
+decycle-macro = { path = "macro", version = "0.5.0" }
+decycle-impl = { path = "decycle-impl", version = "0.5.0" }
 
 [dev-dependencies]
 traitdef = { path = "tests/traitdef" }
@@ -25,5 +25,11 @@ alsorank_bridge = { path = "tests/alsorank_bridge" }
 trybuild = "1.0"
 
 [workspace]
-members = ["decycle-impl", "macro", "tests/traitdef", "tests/typedef", "tests/alsorank_bridge"]
+members = [
+  "decycle-impl",
+  "macro",
+  "tests/traitdef",
+  "tests/typedef",
+  "tests/alsorank_bridge",
+]
 resolver = "2"

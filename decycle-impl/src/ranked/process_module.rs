@@ -223,13 +223,35 @@ fn validate_impl_where_bounds(
             }
             let last_segment = &path.segments[0];
             if all_traits.contains(&last_segment.ident) {
+                // A bare cyclic bound `X: Tr` is rank-lowered to `X: TrRanked<Rank>`, which resolves
+                // only if `X`'s head type has a ranked impl in this module — `Self`/an impl type-param
+                // (already skipped above) or a cycle self type (`Right`, `Wrap<&A>`). Computed FIRST
+                // because it gates BOTH aborts below: a rank-lowerable target is fully handled by the
+                // ranked pipeline even when the bound carries associated-type constraints
+                // (`TraitReplacer::try_replace_path` moves the segment's `PathArguments` wholesale onto
+                // the ranked path and splices `Rank` positionally, so a binding like `Span = X` survives
+                // rank-lowering intact — `Stmt<S>: TrRanked<Rank, Span = X>` — and the ranked twin trait
+                // declares the associated type verbatim via `process_trait_item_for_ranked`).
+                //
+                // PRECONDITION on the caller (documented, not enforced): an impl generic that is
+                // INVENTED (appears in no field/self type) must be grounded by at least one
+                // binding-carrying bound on a NON-cycle-member target that survives
+                // `remove_cyclic_bounds` — the rank floor necessarily drops cycle premises, so a param
+                // pinned only via cycle-member bindings has nothing constraining it at rank `()`
+                // (the resulting E0207 there is not fixable by decycle). Callers achieve this by
+                // putting such leaf bounds on a supertrait alias whose own ident is not a decycle
+                // trait, so they pass through the cyclic-bound sweep untouched.
+                let head_ok =
+                    type_head_ident(bounded_ty).is_some_and(|h| cycle_self_heads.contains(&h));
                 // F6: the earlier wording ("...on non-local type") described what the check
                 // rejects, but the check doesn't actually key on locality — a bound on a
                 // module-LOCAL struct/enum (anything other than `Self` or one of this impl's
                 // own type parameters) is rejected exactly the same way. State what's
-                // ACCEPTED instead, which is unambiguous either way. (Checked before the wrapped-head
-                // rule below so a bound with assoc constraints gets the more specific message.)
-                if has_assoc_constraints(&path) {
+                // ACCEPTED instead, which is unambiguous either way. Only reached when the target
+                // is NOT rank-lowerable (see `head_ok` above — a lowerable target carries its
+                // bindings through the rewrite fine); checked before the un-lowerable-head abort
+                // below so a bound with assoc constraints gets the more specific message.
+                if has_assoc_constraints(&path) && !head_ok {
                     let help_message = local_types_help_message(&impl_type_params);
                     abort!(
                         path,
@@ -237,15 +259,11 @@ fn validate_impl_where_bounds(
                         help = bounded_ty.span() => "{}", help_message
                     );
                 }
-                // A bare cyclic bound `X: Tr` is rank-lowered to `X: TrRanked<Rank>`, which resolves
-                // only if `X`'s head type has a ranked impl in this module — `Self`/an impl type-param
-                // (already skipped above) or a cycle self type (`Right`, `Wrap<&A>`). A foreign or
-                // container head like `Box<Stmt>` has none, so rustc would otherwise emit a raft of raw
-                // `Box<Stmt>: TrRanked<…>` overflow errors at the useless module span. Reject up-front
-                // with a legible message on the user's own bound instead (structural forwards such a
-                // bound through a blanket `impl<T: Tr> Tr for Box<T>`; ranked's rank chain can't).
-                let head_ok =
-                    type_head_ident(bounded_ty).is_some_and(|h| cycle_self_heads.contains(&h));
+                // A foreign or container head like `Box<Stmt>` has no ranked impl to descend
+                // through, so rustc would otherwise emit a raft of raw `Box<Stmt>: TrRanked<…>`
+                // overflow errors at the useless module span. Reject up-front with a legible
+                // message on the user's own bound instead (structural forwards such a bound
+                // through a blanket `impl<T: Tr> Tr for Box<T>`; ranked's rank chain can't).
                 if !head_ok {
                     abort!(
                         bounded_ty,
@@ -258,6 +276,12 @@ fn validate_impl_where_bounds(
     }
 }
 
+/// Apply the ranked `#[decycle]` transformation to `module`, programmatically.
+///
+/// `decycle` is the path to the decycle crate (its leading segment names the crate, used to
+/// recognise `#[<crate>::decycle]` on inner items). `recurse_level` sets the compile-time expansion
+/// depth; `support_infinite_cycle` toggles the runtime re-entry registry (unbounded depth) versus a
+/// fixed-depth floor. For macro authors wrapping `#[decycle]`; most users should use the attribute.
 pub fn process_module(
     mut module: ItemMod,
     decycle: &Path,

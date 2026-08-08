@@ -1,22 +1,38 @@
-#![doc(html_logo_url = "https://raw.githubusercontent.com/yasuo-ozu/decycle/main/assets/logo.svg")]
-#![doc(html_favicon_url = "https://raw.githubusercontent.com/yasuo-ozu/decycle/main/assets/logo.svg")]
+#![doc(html_logo_url = "https://raw.githubusercontent.com/yasuo-ozu/decycle/main/decycle.png")]
+#![doc(
+    html_favicon_url = "https://raw.githubusercontent.com/yasuo-ozu/decycle/main/decycle.png"
+)]
 #![doc = include_str!("README.md")]
 
 #[doc(hidden)]
 pub use decycle_macro::__finalize;
 
-/// Low-level helper for macro crates that want to wrap `#[decycle]` on modules.
-///
-/// This re-export exists for bridging: a macro crate can provide its own attribute/derive
-/// macros, while still delegating `#[decycle]`-style module processing to decycle.
-/// For example, a library might generate trait impls via a custom macro, but still
-/// want the enclosing module to be processed by decycle to break trait cycles.
-pub use decycle_impl::process_module;
-/// Bridging entry for the **structural unroll** algorithm (`#[decycle(structural)]`) — the
-/// per-member `#[repr(transparent)]` terminator approach, with no runtime and no type-leak.
-pub use decycle_impl::process_module_structural;
+/// The default **ranked** engine's programmatic API — hidden "Ranked" helper traits plus a
+/// thread-local re-entry registry. For macro authors and tooling built on decycle; most users want
+/// the [`macro@decycle`] attribute. See the module for its entry points.
+pub use decycle_impl::ranked;
+/// The **structural** unroll engine's programmatic API (`#[decycle(structural)]`) — a compile-time
+/// unroll with no runtime and no `type-leak` dependency.
+pub use decycle_impl::structural;
 /// Attribute macro that expands a module or trait to break circular trait
 /// obligations within the annotated module. Also see module-level documentation.
+///
+/// # Two engines
+///
+/// On a module, `#[decycle]` selects one of two independent cycle-breaking strategies:
+///
+/// - the default **ranked** engine (`#[decycle]`) — hidden "Ranked" helper traits plus a
+///   thread-local runtime re-entry registry;
+/// - the **structural** unroll (`#[decycle(structural)]`) — per-type `#[repr(transparent)]`
+///   terminators and layout casts, with no runtime and no `type-leak` dependency.
+///
+/// They break the same cycles and are interchangeable for ordinary method recursion, but differ
+/// in cost and in what each can't do (structural is zero-cost and fails every unsupported shape at
+/// compile time; ranked can re-enter across several instantiations of a generic method, but a residual
+/// set of shapes fails closed at runtime). See the crate README's *Two algorithms* section for the full
+/// per-engine matrix. Both engines require the whole cycle in one *inline* `#[decycle]` module over
+/// traits **you** annotate — either `#[decycle]` on the trait definition, or a `#[decycle] use` of a
+/// trait defined elsewhere.
 ///
 /// ```rust
 /// # use decycle::decycle;
@@ -65,10 +81,15 @@ pub use decycle_impl::process_module_structural;
 /// ## Attribute Arguments
 ///
 /// - **Module**:
-///   - `#[decycle::decycle(recurse_level = N, support_infinite_cycle = true|false, decycle = path)]`
-///   - `recurse_level`: expansion depth (default 10, must be at least 1)
-///   - `support_infinite_cycle`: enables/disable infinite cycle handling (default true)
+///   - `#[decycle::decycle(structural, recurse_level = N, support_infinite_cycle = true|false, decycle = path)]`
+///   - `structural`: select the structural unroll instead of the ranked engine (see *Two engines*
+///     above); incompatible with `recurse_level` / `support_infinite_cycle`
+///   - `recurse_level`: expansion depth (default 10, must be at least 1); ranked engine only
+///   - `support_infinite_cycle`: enable/disable infinite-cycle handling (default true); ranked engine only
 ///   - `decycle`: override the path used to refer to this crate
+///
+///   An empty `#[decycle]` module is rejected by both engines. A module with no `#[decycle]`-annotated
+///   cycle is rejected by the ranked engine and treated as a silent no-op by the structural engine.
 /// - **Trait** (defined out of `#[decycle]` module):
 ///   - `#[decycle::decycle(marker = path, decycle = path)]`
 ///   - `marker`: marker type used for internal references. Required when the
@@ -142,6 +163,22 @@ pub use decycle_impl::process_module_structural;
 ///   (zero-cost) and instead stops with an `unimplemented!` panic once
 ///   `recurse_level` is reached.
 ///
+/// ## Unsupported shapes
+/// Both engines reject these up-front, with an actionable error on the offending item:
+///
+/// - `async fn` — return a boxed future (`-> Pin<Box<dyn Future<Output = ..>>>`) instead;
+/// - return-position `impl Trait` — declare an associated type and return it
+///   (`type Output; fn m(&self) -> Self::Output`), or return a concrete/boxed type;
+/// - a *wrapped* cyclic bound `Box<Stmt>: Tr` without a blanket `impl<T: Tr> Tr for Box<T>`;
+/// - a cross-module cycle, or a foreign trait implemented for a *foreign* type.
+///
+/// An `unsafe trait` **is** supported (the generated impls are emitted as `unsafe impl`). A
+/// third-party trait may participate in the cycle when brought in with `#[decycle] use` and
+/// implemented for your own types. For the complete per-engine matrix — multi-instantiation re-entry,
+/// `#[track_caller]`, `no_std`, higher-order `Self`-mentioning arguments
+/// (`fn(&Self)` / `dyn` / `impl Fn(&Self)`), and more — see the crate README's *Two algorithms*
+/// section.
+///
 /// ## Example with markers
 /// Use `marker` when the trait contains non-absolute paths (e.g. `super::Type`,
 /// `crate::Type`, or local aliases) so decycle can intern those references.
@@ -157,50 +194,6 @@ pub use decycle_impl::process_module_structural;
 /// ```
 pub use decycle_macro::decycle;
 
-/// Low-level helper for macro crates that want to wrap `#[decycle]` on traits.
-///
-/// This is useful when another macro crate defines or derives traits, and those traits
-/// should also be valid targets for `#[decycle]`. The wrapper macro can call into this
-/// function to apply decycle's transformation while keeping its own macro API.
-///
-pub use decycle_impl::process_trait;
-
-/// Programmatic entry point for the `#[decycle]` transformation.
-///
-/// A wrapper macro crate constructs [`finalize::FinalizeArgs`]
-/// directly and calls [`finalize::finalize`], bypassing the token-carrier ping-pong entirely
-/// (and its `crate_version` assertion, which only guards the `Parse` carrier path). This
-/// surface is **semver-committed**: `FinalizeArgs`' fields and `finalize`'s signature are part
-/// of the public API.
-///
-/// (The macro ping-pong protocol used by `#[decycle]` itself also delegates here, `Parse`ing
-/// `FinalizeArgs` from the specific token shape the generated carrier macros feed back into
-/// `__finalize`; that path is unaffected by un-hiding this module.)
-pub use decycle_impl::finalize;
-
-/// D1 bridge (impl-spec §C.4): convenience root re-export of
-/// [`decycle_impl::finalize::ranked_trait_name`] — the exact ident mangling `finalize` uses for
-/// a `#[decycle]` trait's synthesized ranked counterpart. A programmatic caller needs this
-/// to spell a rank-PRESERVING wrapper impl BEFORE calling `finalize`,
-/// since such a wrapper must be emitted outside `finalize`'s own output (see
-/// [`finalize::AlsoRank`]'s docs on the rank-preserving wrapper constraint, and
-/// [`finalize::ranked_trait_path`] for the full path form). This surface is
-/// **semver-committed** alongside `finalize`/`FinalizeArgs`.
-pub use decycle_impl::finalize::ranked_trait_name;
-
-/// D1 bridge: convenience root re-export of [`decycle_impl::finalize::ranked_trait_path`] — the
-/// full path to a trait's ranked counterpart as seen from the scope a rank-preserving wrapper
-/// must be emitted into (a sibling of `finalize`'s own `shadowing_module`). See
-/// [`ranked_trait_name`] and [`finalize::ranked_trait_path`] for details and a usage example.
-pub use decycle_impl::finalize::ranked_trait_path;
-
-/// D1 bridge (E3 replan §1.2): rank encoding + registration emitters, re-exported like
-/// [`ranked_trait_name`]/[`ranked_trait_path`]. **Semver-committed.**
-pub use decycle_impl::finalize::{
-    emit_registration, fingerprint_expr, floor_rank, initial_rank, is_syntactically_unsized,
-    method_is_generic, rank_succ, reentry_alias_name, reentry_fn_name, reentry_marker_name,
-};
-
 /// Internal helper used by generated code to track staged type expansion.
 #[doc(hidden)]
 pub trait Repeater<const RANDOM: u64, const IX: usize, PARAM: ?Sized> {
@@ -209,37 +202,7 @@ pub trait Repeater<const RANDOM: u64, const IX: usize, PARAM: ?Sized> {
 }
 
 /// Runtime fn-pointer registry backing unbounded `support_infinite_cycle` re-entry.
-///
-/// The generated rank floor, instead of erroring, re-enters the original trait impl at full
-/// height through a type-erased fn pointer stored here. Keys are `type_name::<K>()` *string
-/// content* of generated per-(trait, method, instantiation) marker ZSTs — robust against
-/// linker identical-code-folding and `-Zshare-generics` (string identity, not address
-/// identity) — paired with a layout fingerprint (`type_name` is non-injective: e.g. two
-/// closures declared in one fn share a `{{closure}}` name, and the fold over each key type's
-/// size/align only keeps *different-layout* instantiations on distinct keys). The fingerprint
-/// does NOT separate two **same-layout** closures — different bodies, or even different
-/// signatures, fold identically and share one key — so key uniqueness is *not* what makes the
-/// transmute-call sound. Soundness rests on two other properties: (1) **register-before-descend
-/// at every rank** — each inductive frame re-registers its own re-entry fn immediately before
-/// descending, so the floor of any real descent reads the entry its own descent wrote last,
-/// i.e. its own instantiation's fn; and (2) **fail-closed lookup** — a miss panics (see
-/// `lookup`) rather than transmute-calling a colliding entry. The map is **thread-local**:
-/// every registration a floor depends on is emitted on the same call stack
-/// (register-before-descend), hence the same thread — so a thread-local map preserves the
-/// coverage guarantee while making cross-thread interleaving physically unable to
-/// cross-contaminate keys, and there is no lock to poison and no contention. Registration is an
-/// idempotent insert governed by that ordering: overwrite by an unrelated instantiation
-/// *between* descents is harmless because the next descent re-registers before its own floor.
-///
-/// **Semver-committed bridge surface (D1, E3 replan §1.2).** `FP_SEED`, `fp_fold`,
-/// `fp_fold_word`, `register`, and `lookup` — together with the key construction
-/// `(type_name::<Mk<Target, targs…, margs…>>(), fp)`, where `Mk` is the per-(trait × method)
-/// marker [`decycle_impl::finalize::reentry_marker_name`] names and `fp` is
-/// [`decycle_impl::finalize::fingerprint_expr`]'s fold — are a stable library API: a
-/// programmatic `finalize` caller hand-emits registrations that a
-/// `finalize`-emitted floor must find. Any change to the key construction, the fold
-/// constants, or these signatures is a breaking change to such callers, `__` prefix
-/// notwithstanding.
+#[doc(hidden)]
 pub mod __reentry {
     use std::any::type_name;
     use std::cell::RefCell;

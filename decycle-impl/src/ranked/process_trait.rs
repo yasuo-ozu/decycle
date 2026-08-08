@@ -7,6 +7,12 @@ use syn::*;
 use template_quote::quote;
 use type_leak::Leaker;
 
+/// Apply `#[decycle]` to a trait definition, programmatically — for macro crates that define or
+/// derive traits which should also be valid `#[decycle]` targets.
+///
+/// `marker_path` supplies the interning marker required when the trait contains non-absolute type
+/// paths; `alter_macro_name` renames the generated carrier macro; `leaker_config` controls the
+/// allowed-path set for interning.
 pub fn process_trait(
     trait_item: &ItemTrait,
     decycle_path: &Path,

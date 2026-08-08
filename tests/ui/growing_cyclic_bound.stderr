@@ -1,0 +1,26 @@
+error: decycle: the cyclic where-bounds reachable from this impl never close — after 1000 distinct obligations the walk is still growing (currently proving `A < Vec < Vec < Vec < Vec < Vec < Vec < Vec < Vec < Vec < Ve…: Tr<…>`); a bound's type argument grows along a cycle edge (a non-regular bound such as `A<Vec<X>>: Tr` on `impl<X> Tr for A<X>`), which no engine can break — rustc itself cannot monomorphize it
+
+         = help: make every cycle edge re-state the same instantiation (only the impl's own type parameters, unchanged, in the bound's arguments), or erase the growing argument behind one fixed type (e.g. a `&mut dyn …` stream) at the recursion boundary
+
+  --> tests/ui/growing_cyclic_bound.rs:20:23
+   |
+20 |     impl<X> Tr<X> for A<X>
+   |                       ^^^^
+
+error[E0275]: overflow evaluating the requirement `A<Vec<Vec<Vec<Vec<Vec<Vec<...>>>>>>>: Tr<...>`
+  --> tests/ui/growing_cyclic_bound.rs:22:20
+   |
+22 |         A<Vec<X>>: Tr<Vec<X>>,
+   |                    ^^^^^^^^^^
+   |
+   = help: consider increasing the recursion limit by adding a `#![recursion_limit = "256"]` attribute to your crate (`$CRATE`)
+note: required for `A<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<X>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>` to implement `Tr<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<Vec<X>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>`
+  --> tests/ui/growing_cyclic_bound.rs:20:13
+   |
+20 |     impl<X> Tr<X> for A<X>
+   |             ^^^^^     ^^^^
+21 |     where
+22 |         A<Vec<X>>: Tr<Vec<X>>,
+   |                    ---------- unsatisfied trait bound introduced here
+   = note: 126 redundant requirements hidden
+   = note: required for `A<Vec<X>>` to implement `Tr<Vec<X>>`

@@ -68,8 +68,8 @@ impl Model {
     ) -> Graph {
         let participates = |im: &crate::structural::collect::ImplBlock| {
             allowed.contains(&im.trait_key)
-                // `map_or(true, …)`, not `is_none_or`: the latter is stable only since 1.82 and this
-                // crate's MSRV is 1.71.
+                // `map_or(true, …)`, not `is_none_or`: the latter is stable only since 1.82
+                // and this crate's MSRV is 1.71.
                 && allowed_types.map_or(true, |t| t.contains(&im.self_ident.to_string()))
         };
         let mut adj: BTreeMap<Pair, BTreeSet<Pair>> = BTreeMap::new();

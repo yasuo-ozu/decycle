@@ -53,8 +53,8 @@ pub(crate) fn contract_from_graph(
         let Some(own) = own_routed_trait(im, all_traits) else {
             continue;
         };
-        // `map_or(true, …)` rather than `is_none_or`: the latter is stable only since 1.82 and
-        // this crate's MSRV is 1.71.
+        // `map_or(true, …)`, not `is_none_or`: the latter is stable only since 1.82 and this
+        // crate's MSRV is 1.71.
         if type_head_ident(&im.self_ty).map_or(true, |h| !participants.contains(&h)) {
             continue;
         }

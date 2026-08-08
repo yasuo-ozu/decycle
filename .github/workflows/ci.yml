@@ -37,14 +37,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.71.0
       - uses: Swatinem/rust-cache@v2
-      # The declared MSRV (rust-version = 1.71) covers *building the published library*, not
-      # the test suite: the dev-dependency `trybuild` requires rustc 1.76+, so `cargo test`
-      # cannot run on the 1.71 floor. Cargo.lock is gitignored, so this resolves fresh with
-      # 1.71's cargo — the 1.71 floor is set by the latest release of the core proc-macro deps
-      # (syn 2.0, quote, unicode-ident all declare rust-version 1.71). If one of those bumps
-      # its own MSRV above 1.71 in a future release, this job will flag it and the floor here
-      # (and in the three `rust-version` fields) must move with it. `type-leak` 0.7 (safegraph,
-      # MSRV 1.56) is a non-optional dependency and sits below this floor.
+      # The declared MSRV covers *building the published library*, not the test suite: the
+      # dev-dependency `trybuild` needs a newer rustc, so `cargo test` cannot run on this floor.
+      #
+      # 1.71 is measured, and it is only reachable because `safegraph` is taken with
+      # `default-features = false`. Its default `matrix` feature pulls `sprs`, which declares
+      # rustc 1.88 and dragged the whole crate's floor up with it; nothing here needs the matrix
+      # backend. `type-leak` already depends on `safegraph` with default features off, so that
+      # second path never contributed. Cargo.lock is gitignored, so this job resolves fresh.
       - name: cargo build (decycle + macro + impl)
         run: cargo build -p decycle -p decycle-macro -p decycle-impl
 

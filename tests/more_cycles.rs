@@ -1,321 +1,410 @@
-#![allow(dead_code, private_interfaces)]
+//! A diverse set of cross-trait cycles — generic traits (`-> Self`, `&Self`, destructured params,
+//! `Self::` ctor), `&dyn`-trait returns, trait lifetime generics (`&'a self`), const generics on the
+//! self type, and boxed-future (async) returns. Every module runs under BOTH algorithms.
+#![allow(dead_code)]
+// `unsafe_trait_loops` declares a synthetic `unsafe trait` with no real invariant to document.
+#![allow(clippy::missing_safety_doc)]
+mod common;
 
-#[decycle::decycle]
-mod generic_loops {
-    #[decycle]
-    trait GenA<T> {
-        fn lift(value: T) -> Self;
-        fn pair(&self, other: &Self, pair: (usize, usize)) -> usize;
-    }
-
-    #[decycle]
-    trait GenB<T> {
-        fn scale(self, factor: usize) -> usize;
-        fn describe(&self) -> &'static str;
-    }
-
-    #[derive(Clone)]
-    struct Boxed<T> {
-        value: T,
-        next: Option<Box<Boxed<T>>>,
-    }
-
-    impl<T: Clone> GenA<T> for Boxed<T>
-    where
-        Boxed<T>: GenB<T>,
-    {
-        fn lift(value: T) -> Self {
-            Self { value, next: None }
+// ---- generic traits: `-> Self`, `&Self` arg, destructured param, `Self::` ctor ----
+dual_mod! {
+    generic_loops {
+        #[decycle]
+        pub trait GenA<T> {
+            fn lift(value: T) -> Self;
+            fn pair(&self, other: &Self, pair: (usize, usize)) -> usize;
         }
-
-        fn pair(&self, other: &Self, (x, y): (usize, usize)) -> usize {
-            let _ = other.describe();
-            x + y + if self.next.is_some() { 1 } else { 0 }
+        #[decycle]
+        pub trait GenB<T> {
+            fn scale(self, factor: usize) -> usize;
+            fn describe(&self) -> &'static str;
         }
-    }
-
-    impl<T: Clone> GenB<T> for Boxed<T>
-    where
-        Boxed<T>: GenA<T>,
-    {
-        fn scale(self, factor: usize) -> usize {
-            let _ = Self::lift(self.value.clone());
-            factor
+        #[derive(Clone)]
+        pub struct Boxed<T> {
+            pub value: T,
+            pub next: Option<Box<Boxed<T>>>,
         }
-
-        fn describe(&self) -> &'static str {
-            "boxed"
+        impl<T: Clone> GenA<T> for Boxed<T>
+        where
+            Boxed<T>: GenB<T>,
+        {
+            fn lift(value: T) -> Self {
+                Self { value, next: None }
+            }
+            fn pair(&self, other: &Self, (x, y): (usize, usize)) -> usize {
+                let _ = other.describe();
+                x + y + if self.next.is_some() { 1 } else { 0 }
+            }
         }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn test_generic_loop() {
-            let a = Boxed::lift(1u32);
-            let b = Boxed::lift(2u32);
-            assert_eq!(a.pair(&b, (2, 3)), 5);
-            assert_eq!(b.clone().scale(4), 4);
+        impl<T: Clone> GenB<T> for Boxed<T>
+        where
+            Boxed<T>: GenA<T>,
+        {
+            fn scale(self, factor: usize) -> usize {
+                let _ = Self::lift(self.value.clone());
+                factor
+            }
+            fn describe(&self) -> &'static str {
+                "boxed"
+            }
         }
     }
 }
 
-#[decycle::decycle]
-mod trait_object_loops {
-    trait Helper {
-        fn value(&self) -> i32;
-    }
+#[test]
+fn test_generic_loop() {
+    on_both!(generic_loops, {
+        let a: Boxed<u32> = Boxed::lift(1);
+        let b: Boxed<u32> = Boxed::lift(2);
+        assert_eq!(a.pair(&b, (2, 3)), 5);
+        assert_eq!(b.clone().scale(4), 4);
+        assert_eq!(b.describe(), "boxed");
+    });
+}
 
-    #[decycle]
-    trait ObjA {
-        fn helper(&self) -> &dyn Helper;
-        fn eval(&self, seed: i32) -> i32;
-    }
-
-    #[decycle]
-    trait ObjB {
-        fn helper(&self) -> &dyn Helper;
-        fn eval(&self, seed: i32) -> i32;
-    }
-
-    struct Left {
-        value: i32,
-    }
-
-    struct Right {
-        value: i32,
-    }
-
-    impl Helper for Left {
-        fn value(&self) -> i32 {
-            self.value
+// ---- `&dyn`-trait return; obligation cycle with non-recursive bodies ----
+dual_mod! {
+    trait_object_loops {
+        pub trait Helper {
+            fn value(&self) -> i32;
         }
-    }
-
-    impl Helper for Right {
-        fn value(&self) -> i32 {
-            self.value
+        #[decycle]
+        pub trait ObjA {
+            fn helper(&self) -> &dyn Helper;
+            fn eval(&self, seed: i32) -> i32;
         }
-    }
-
-    impl ObjA for Left
-    where
-        Right: ObjB,
-    {
-        fn helper(&self) -> &dyn Helper {
-            static RIGHT: Right = Right { value: 5 };
-            &RIGHT
+        #[decycle]
+        pub trait ObjB {
+            fn helper(&self) -> &dyn Helper;
+            fn eval(&self, seed: i32) -> i32;
         }
-
-        fn eval(&self, seed: i32) -> i32 {
-            self.value + seed
+        pub struct Left {
+            pub value: i32,
         }
-    }
-
-    impl ObjB for Right
-    where
-        Left: ObjA,
-    {
-        fn helper(&self) -> &dyn Helper {
-            static LEFT: Left = Left { value: 3 };
-            &LEFT
+        pub struct Right {
+            pub value: i32,
         }
-
-        fn eval(&self, seed: i32) -> i32 {
-            self.value + seed
+        impl Helper for Left {
+            fn value(&self) -> i32 {
+                self.value
+            }
         }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn test_trait_object_loop() {
-            let left = Left { value: 1 };
-            assert!(left.eval(2) > 0);
-            assert_eq!(ObjA::helper(&left).value(), 5);
+        impl Helper for Right {
+            fn value(&self) -> i32 {
+                self.value
+            }
+        }
+        impl ObjA for Left
+        where
+            Right: ObjB,
+        {
+            fn helper(&self) -> &dyn Helper {
+                static RIGHT: Right = Right { value: 5 };
+                &RIGHT
+            }
+            fn eval(&self, seed: i32) -> i32 {
+                self.value + seed
+            }
+        }
+        impl ObjB for Right
+        where
+            Left: ObjA,
+        {
+            fn helper(&self) -> &dyn Helper {
+                static LEFT: Left = Left { value: 3 };
+                &LEFT
+            }
+            fn eval(&self, seed: i32) -> i32 {
+                self.value + seed
+            }
         }
     }
 }
 
-#[decycle::decycle]
-mod lifetime_loops {
-    #[decycle]
-    trait BorrowA<'a> {
-        fn link(&'a self, other: &'a Self) -> &'a str;
-    }
+#[test]
+fn test_trait_object_loop() {
+    on_both!(trait_object_loops, {
+        let left = Left { value: 1 };
+        assert!(left.eval(2) > 0);
+        assert_eq!(ObjA::helper(&left).value(), 5);
+    });
+}
 
-    #[decycle]
-    trait BorrowB<'a> {
-        fn link(&'a self, other: &'a Self) -> &'a str;
-    }
-
-    struct Holder<'a> {
-        label: &'a str,
-        peer: Option<Box<Holder<'a>>>,
-    }
-
-    impl<'a> BorrowA<'a> for Holder<'a>
-    where
-        Holder<'a>: BorrowB<'a>,
-    {
-        fn link(&'a self, other: &'a Self) -> &'a str {
-            let _ = other.peer.as_ref();
-            self.label
+// ---- trait lifetime generic; `&'a self` receiver + `&'a Self` arg ----
+dual_mod! {
+    lifetime_loops {
+        #[decycle]
+        pub trait BorrowA<'a> {
+            fn link(&'a self, other: &'a Self) -> &'a str;
         }
-    }
-
-    impl<'a> BorrowB<'a> for Holder<'a>
-    where
-        Holder<'a>: BorrowA<'a>,
-    {
-        fn link(&'a self, other: &'a Self) -> &'a str {
-            let _ = other.peer.as_ref();
-            self.label
+        #[decycle]
+        pub trait BorrowB<'a> {
+            fn link(&'a self, other: &'a Self) -> &'a str;
         }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn test_lifetime_loop() {
-            let holder = Holder {
-                label: "alpha",
-                peer: None,
-            };
-            let other = Holder {
-                label: "beta",
-                peer: None,
-            };
-            assert_eq!(BorrowA::link(&holder, &other), "alpha");
+        pub struct Holder<'a> {
+            pub label: &'a str,
+            pub peer: Option<Box<Holder<'a>>>,
+        }
+        impl<'a> BorrowA<'a> for Holder<'a>
+        where
+            Holder<'a>: BorrowB<'a>,
+        {
+            fn link(&'a self, other: &'a Self) -> &'a str {
+                let _ = other.peer.as_ref();
+                self.label
+            }
+        }
+        impl<'a> BorrowB<'a> for Holder<'a>
+        where
+            Holder<'a>: BorrowA<'a>,
+        {
+            fn link(&'a self, other: &'a Self) -> &'a str {
+                let _ = other.peer.as_ref();
+                self.label
+            }
         }
     }
 }
 
-#[decycle::decycle]
-mod const_generic_loops {
-    #[decycle]
-    trait ConstA {
-        fn count(&self) -> usize;
-    }
+#[test]
+fn test_lifetime_loop() {
+    on_both!(lifetime_loops, {
+        let holder = Holder {
+            label: "alpha",
+            peer: None,
+        };
+        let other = Holder {
+            label: "beta",
+            peer: None,
+        };
+        assert_eq!(BorrowA::link(&holder, &other), "alpha");
+    });
+}
 
-    #[decycle]
-    trait ConstB {
-        fn count(&self) -> usize;
-    }
-
-    struct ArrayHolder<const N: usize> {
-        data: [u8; N],
-    }
-
-    impl ConstA for ArrayHolder<4>
-    where
-        ArrayHolder<4>: ConstB,
-    {
-        fn count(&self) -> usize {
-            self.data.len()
+// ---- const generic on the self type ----
+dual_mod! {
+    const_generic_loops {
+        #[decycle]
+        pub trait ConstA {
+            fn count(&self) -> usize;
         }
-    }
-
-    impl ConstB for ArrayHolder<4>
-    where
-        ArrayHolder<4>: ConstA,
-    {
-        fn count(&self) -> usize {
-            self.data.len()
+        #[decycle]
+        pub trait ConstB {
+            fn count(&self) -> usize;
         }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn test_const_generics_loop() {
-            let holder = ArrayHolder::<4> { data: [0, 1, 2, 3] };
-            assert_eq!(ConstA::count(&holder), 4);
+        pub struct ArrayHolder<const N: usize> {
+            pub data: [u8; N],
+        }
+        impl ConstA for ArrayHolder<4>
+        where
+            ArrayHolder<4>: ConstB,
+        {
+            fn count(&self) -> usize {
+                self.data.len()
+            }
+        }
+        impl ConstB for ArrayHolder<4>
+        where
+            ArrayHolder<4>: ConstA,
+        {
+            fn count(&self) -> usize {
+                self.data.len()
+            }
         }
     }
 }
 
-#[decycle::decycle]
-mod async_like_loops {
-    use core::future::Future;
-    use core::pin::Pin;
+#[test]
+fn test_const_generics_loop() {
+    on_both!(const_generic_loops, {
+        let holder = ArrayHolder::<4> { data: [0, 1, 2, 3] };
+        assert_eq!(ConstA::count(&holder), 4);
+    });
+}
 
-    #[decycle]
-    trait AsyncishA {
-        fn run<'a>(&'a self, input: i32) -> Pin<Box<dyn Future<Output = i32> + 'a>>;
-    }
-
-    #[decycle]
-    trait AsyncishB {
-        fn run<'a>(&'a self, input: i32) -> Pin<Box<dyn Future<Output = i32> + 'a>>;
-    }
-
-    struct WorkerA {
-        value: i32,
-    }
-
-    struct WorkerB {
-        value: i32,
-    }
-
-    impl AsyncishA for WorkerA
-    where
-        WorkerB: AsyncishB,
-    {
-        fn run<'a>(&'a self, input: i32) -> Pin<Box<dyn Future<Output = i32> + 'a>> {
-            Box::pin(async move { self.value + input })
-        }
-    }
-
-    impl AsyncishB for WorkerB
-    where
-        WorkerA: AsyncishA,
-    {
-        fn run<'a>(&'a self, input: i32) -> Pin<Box<dyn Future<Output = i32> + 'a>> {
-            Box::pin(async move { self.value + input })
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
+// ---- method lifetime generic + boxed-future (async) return ----
+dual_mod! {
+    async_like_loops {
         use core::future::Future;
         use core::pin::Pin;
-        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-
-        fn block_on<F: Future>(mut fut: F) -> F::Output {
-            fn noop_clone(_: *const ()) -> RawWaker {
-                RawWaker::new(core::ptr::null(), &VTABLE)
+        #[decycle]
+        pub trait AsyncishA {
+            fn run<'a>(&'a self, input: i32) -> Pin<Box<dyn Future<Output = i32> + 'a>>;
+        }
+        #[decycle]
+        pub trait AsyncishB {
+            fn run<'a>(&'a self, input: i32) -> Pin<Box<dyn Future<Output = i32> + 'a>>;
+        }
+        pub struct WorkerA {
+            pub value: i32,
+        }
+        pub struct WorkerB {
+            pub value: i32,
+        }
+        impl AsyncishA for WorkerA
+        where
+            WorkerB: AsyncishB,
+        {
+            fn run<'a>(&'a self, input: i32) -> Pin<Box<dyn Future<Output = i32> + 'a>> {
+                Box::pin(async move { self.value + input })
             }
-            fn noop(_: *const ()) {}
-            static VTABLE: RawWakerVTable = RawWakerVTable::new(noop_clone, noop, noop, noop);
+        }
+        impl AsyncishB for WorkerB
+        where
+            WorkerA: AsyncishA,
+        {
+            fn run<'a>(&'a self, input: i32) -> Pin<Box<dyn Future<Output = i32> + 'a>> {
+                Box::pin(async move { self.value + input })
+            }
+        }
+    }
+}
 
-            let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
-            let mut cx = Context::from_waker(&waker);
-            let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
-            loop {
-                if let Poll::Ready(val) = fut.as_mut().poll(&mut cx) {
-                    return val;
+fn block_on<F: core::future::Future>(mut fut: F) -> F::Output {
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    fn noop_clone(_: *const ()) -> RawWaker {
+        RawWaker::new(core::ptr::null(), &VTABLE)
+    }
+    fn noop(_: *const ()) {}
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(noop_clone, noop, noop, noop);
+    let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = unsafe { core::pin::Pin::new_unchecked(&mut fut) };
+    loop {
+        if let Poll::Ready(val) = fut.as_mut().poll(&mut cx) {
+            return val;
+        }
+    }
+}
+
+#[test]
+fn test_async_like_loop() {
+    on_both!(async_like_loops, {
+        let a = WorkerA { value: 2 };
+        let b = WorkerB { value: 3 };
+        assert_eq!(block_on(a.run(4)), 6);
+        assert_eq!(block_on(b.run(5)), 8);
+    });
+}
+
+// ---- MULTIPLE participating traits with a cross-TRAIT cyclic edge on a single type ----
+// (Migrated from the former single-ADT `multi_trait_one_type_cross_edge.rs`: `Eval` reaches `Size`
+// and back on the same type. Two independent such types here so the module is not single-ADT; the
+// structural side exercises the `(type, trait)`-pair obligation graph.)
+dual_mod! {
+    cross_trait_loops {
+        #[decycle]
+        pub trait Eval {
+            fn eval(&self, n: usize) -> usize;
+        }
+        #[decycle]
+        pub trait Size {
+            fn size(&self, n: usize) -> usize;
+        }
+        pub struct Expr;
+        pub struct Stmt;
+        impl Eval for Expr where Expr: Size {
+            fn eval(&self, n: usize) -> usize {
+                if n == 0 { 0 } else { self.size(n - 1) + 1 } // cross-trait hop Eval -> Size
+            }
+        }
+        impl Size for Expr where Expr: Eval {
+            fn size(&self, n: usize) -> usize {
+                if n == 0 { 0 } else { self.eval(n - 1) + 1 } // cross-trait hop back Size -> Eval
+            }
+        }
+        impl Eval for Stmt where Stmt: Size {
+            fn eval(&self, n: usize) -> usize {
+                if n == 0 { 0 } else { self.size(n - 1) + 1 }
+            }
+        }
+        impl Size for Stmt where Stmt: Eval {
+            fn size(&self, n: usize) -> usize {
+                if n == 0 { 0 } else { self.eval(n - 1) + 1 }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_cross_trait_cycle_on_one_type() {
+    on_both!(cross_trait_loops, {
+        // Alternates Eval/Size on every hop, well past any fixed depth.
+        assert_eq!(Expr.eval(2000), 2000);
+        assert_eq!(Expr.size(2001), 2001);
+        assert_eq!(Stmt.eval(2000), 2000);
+    });
+}
+
+// ---- self-cycle spelled `where Self: Tr` (both engines resolve `Self` to the ADT) ----
+dual_mod! {
+    self_bound_loops {
+        #[decycle]
+        pub trait Sb {
+            fn sb(&self, d: usize) -> usize;
+        }
+        pub enum T {
+            Leaf(usize),
+            Rec(Box<T>),
+        }
+        impl Sb for T
+        where
+            Self: Sb, // the cyclic bound written with `Self`, not `T`
+        {
+            fn sb(&self, d: usize) -> usize {
+                match self {
+                    T::Leaf(n) => *n,
+                    T::Rec(b) => 1 + b.sb(d),
                 }
             }
         }
+    }
+}
 
-        #[test]
-        fn test_async_like_loop() {
-            let a = WorkerA { value: 2 };
-            let b = WorkerB { value: 3 };
-            let a_val = block_on(a.run(4));
-            let b_val = block_on(b.run(5));
-            assert_eq!(a_val, 6);
-            assert_eq!(b_val, 8);
+#[test]
+fn test_self_bound_cycle() {
+    on_both!(self_bound_loops, {
+        let t = T::Rec(Box::new(T::Rec(Box::new(T::Leaf(5)))));
+        assert_eq!(t.sb(0), 7); // 1 + 1 + 5
+    });
+}
+
+// ---- `unsafe trait`: both engines emit `unsafe impl` for the generated impls (ranked keeps it on
+// the delegating Final impl / drops it on the safe ranked-helper impls; structural mirrors it onto
+// the terminator + natural impls). The trait is unsafe to IMPLEMENT; its methods stay safe to CALL. ----
+dual_mod! {
+    unsafe_trait_loops {
+        #[decycle]
+        pub unsafe trait Danger {
+            fn danger(&self, n: usize) -> usize;
+        }
+        pub struct A;
+        pub struct B;
+        unsafe impl Danger for A
+        where
+            B: Danger,
+        {
+            fn danger(&self, n: usize) -> usize {
+                if n == 0 { 0 } else { B.danger(n - 1) + 1 }
+            }
+        }
+        unsafe impl Danger for B
+        where
+            A: Danger,
+        {
+            fn danger(&self, n: usize) -> usize {
+                if n == 0 { 0 } else { A.danger(n - 1) + 1 }
+            }
         }
     }
 }
+
+#[test]
+fn test_unsafe_trait_cycle() {
+    on_both!(unsafe_trait_loops, {
+        // `danger` is a safe method of an unsafe trait — calling it needs no `unsafe` block.
+        assert_eq!(A.danger(2000), 2000);
+        assert_eq!(B.danger(1500), 1500);
+    });
+}
+

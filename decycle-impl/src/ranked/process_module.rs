@@ -129,6 +129,15 @@ fn is_local_impl_bound_target(ty: &Type, impl_type_params: &HashSet<Ident>) -> b
     ident == "Self" || impl_type_params.contains(ident)
 }
 
+/// The head (outermost path) ident of a type: `Box` for `Box<Stmt>`, `B` for `B<T>`, `Stmt` for
+/// `Stmt`. `None` for a non-path type (`&Stmt`, `(A, B)`) or a `<T as Tr>::X` qself.
+fn type_head_ident(ty: &Type) -> Option<Ident> {
+    match ty {
+        Type::Path(TypePath { qself: None, path }) => path.segments.last().map(|s| s.ident.clone()),
+        _ => None,
+    }
+}
+
 fn has_assoc_constraints(path: &Path) -> bool {
     let Some(last_segment) = path.segments.last() else {
         return false;
@@ -164,7 +173,11 @@ fn local_types_help_message(impl_type_params: &HashSet<Ident>) -> String {
     format!("use `Self` or one of this `impl`'s own type parameters, such as {types}")
 }
 
-fn validate_impl_where_bounds(item_impl: &ItemImpl, all_traits: &HashSet<Ident>) {
+fn validate_impl_where_bounds(
+    item_impl: &ItemImpl,
+    all_traits: &HashSet<Ident>,
+    cycle_self_heads: &HashSet<Ident>,
+) {
     let impl_type_params: HashSet<Ident> = item_impl
         .generics
         .params
@@ -209,18 +222,37 @@ fn validate_impl_where_bounds(item_impl: &ItemImpl, all_traits: &HashSet<Ident>)
                 continue;
             }
             let last_segment = &path.segments[0];
-            if all_traits.contains(&last_segment.ident) && has_assoc_constraints(&path) {
+            if all_traits.contains(&last_segment.ident) {
                 // F6: the earlier wording ("...on non-local type") described what the check
                 // rejects, but the check doesn't actually key on locality — a bound on a
                 // module-LOCAL struct/enum (anything other than `Self` or one of this impl's
                 // own type parameters) is rejected exactly the same way. State what's
-                // ACCEPTED instead, which is unambiguous either way.
-                let help_message = local_types_help_message(&impl_type_params);
-                abort!(
-                    path,
-                    "associated-type constraints in #[decycle] impl where-clauses are only supported on `Self` or the impl's own type parameters";
-                    help = bounded_ty.span() => "{}", help_message
-                );
+                // ACCEPTED instead, which is unambiguous either way. (Checked before the wrapped-head
+                // rule below so a bound with assoc constraints gets the more specific message.)
+                if has_assoc_constraints(&path) {
+                    let help_message = local_types_help_message(&impl_type_params);
+                    abort!(
+                        path,
+                        "associated-type constraints in #[decycle] impl where-clauses are only supported on `Self` or the impl's own type parameters";
+                        help = bounded_ty.span() => "{}", help_message
+                    );
+                }
+                // A bare cyclic bound `X: Tr` is rank-lowered to `X: TrRanked<Rank>`, which resolves
+                // only if `X`'s head type has a ranked impl in this module — `Self`/an impl type-param
+                // (already skipped above) or a cycle self type (`Right`, `Wrap<&A>`). A foreign or
+                // container head like `Box<Stmt>` has none, so rustc would otherwise emit a raft of raw
+                // `Box<Stmt>: TrRanked<…>` overflow errors at the useless module span. Reject up-front
+                // with a legible message on the user's own bound instead (structural forwards such a
+                // bound through a blanket `impl<T: Tr> Tr for Box<T>`; ranked's rank chain can't).
+                let head_ok =
+                    type_head_ident(bounded_ty).is_some_and(|h| cycle_self_heads.contains(&h));
+                if !head_ok {
+                    abort!(
+                        bounded_ty,
+                        "decycle: this cyclic bound's target is not a type the ranked engine can rank-lower — its head is a container or non-cycle type (e.g. `Box<Stmt>`), so the ranked chain has no floor impl to descend through";
+                        help = "use `#[decycle(structural)]` (it forwards a wrapped bound via a blanket `impl<T: Tr> Tr for Box<T>`), or bound a bare cycle type instead"
+                    );
+                }
             }
         }
     }
@@ -289,19 +321,92 @@ pub fn process_module(
     }
     check_no_deep_super_paths(contents);
     if traits.is_empty() && working_list.is_empty() {
-        abort!(
-            Span::call_site(),
-            "cannot detect traits nor `use` statement annotated with #[decycle]"
-        )
+        abort!(Span::call_site(), crate::NO_DECYCLE_TRAITS_MSG)
+    }
+    // Return-position `impl Trait` (RPITIT) in a #[decycle] trait method is an ACTUAL limitation of
+    // the ranked re-entry engine: full-height re-entry needs a nameable fn-pointer return, but
+    // Return-position `impl Trait` (RPITIT) in a `#[decycle]` trait method is unsupported by BOTH
+    // engines and rejected up-front, in every mode, with an actionable message rather than a raw
+    // solver error: the ranked re-entry fn-pointer type `fn(..) -> impl Trait` is not nameable
+    // (E0562), and the structural layout cast can't reinterpret an opaque return type. An associated
+    // type is the portable escape hatch — it names the return type, so both engines can carry it.
+    for t in &traits {
+        for item in &t.items {
+            if let TraitItem::Fn(tf) = item {
+                if crate::finalize::sig_has_impl_trait_output(&tf.sig) {
+                    abort!(
+                        &tf.sig.output,
+                        "decycle: return-position `impl Trait` in method `{}` of #[decycle] trait `{}` is not supported", tf.sig.ident, t.ident;
+                        help = "declare an associated type on the trait and return it instead (e.g. `type Output; fn m(&self) -> Self::Output`)"
+                    );
+                }
+            }
+        }
+    }
+    // `async fn` in a `#[decycle]` trait method is unsupported by the ranked engine (its return is an
+    // opaque `impl Future`, which the rank rewrite can't thread through — the raw symptom is a
+    // confusing `E0308` blaming the attribute). Reject it up-front, in BOTH modes, with an actionable
+    // message. (The structural engine rejects it too — there it was outright unsound.)
+    for item in contents.iter() {
+        if let Item::Impl(im) = item {
+            for it in &im.items {
+                if let ImplItem::Fn(f) = it {
+                    if let Some(a) = &f.sig.asyncness {
+                        abort!(
+                            a,
+                            "decycle: `async fn` in method `{}` of a #[decycle] cycle is not supported — its `impl Future` return can't be threaded through the rank rewrite", f.sig.ident;
+                            help = "return a boxed future (`-> Pin<Box<dyn Future<Output = ..>>>`) instead"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // `#[track_caller]` on a method in an UNBOUNDED cycle is a limitation of the ranked re-entry
+    // engine: full-height re-entry dispatches through a transmuted fn pointer, which cannot carry the
+    // implicit caller-location argument, so `Location::caller()` reports the wrong site once recursion
+    // passes the floor. It IS correct for shallow calls, but that can't be told apart at compile time,
+    // and a silently-wrong location is worse than a clear rejection.
+    if support_infinite_cycle {
+        for item in contents.iter() {
+            if let Item::Impl(im) = item {
+                for it in &im.items {
+                    if let ImplItem::Fn(f) = it {
+                        if let Some(a) = f.attrs.iter().find(|a| a.path().is_ident("track_caller")) {
+                            abort!(
+                                a,
+                                "decycle: `#[track_caller]` on method `{}` in an unbounded #[decycle] cycle is not supported — the re-entry fn-pointer indirection loses the caller location past the recursion floor", f.sig.ident;
+                                help = "use `#[decycle(structural)]`, or set `support_infinite_cycle = false`"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
     let all_traits: HashSet<Ident> = working_list
         .iter()
         .filter_map(|path| path.segments.last().map(|seg| seg.ident.clone()))
         .chain(traits.iter().map(|ItemTrait { ident, .. }| ident.clone()))
         .collect();
+    // Head idents of the types that IMPLEMENT a cyclic trait here — the only heads a bare cyclic
+    // where-bound may target (besides `Self` / an impl type-param). A bound whose head is a foreign
+    // container (`Box<Stmt>: Tr`) has no ranked impl to descend through, so it's flagged below.
+    let cycle_self_heads: HashSet<Ident> = contents
+        .iter()
+        .filter_map(|item| {
+            let Item::Impl(im) = item else { return None };
+            let (_, trait_path, _) = im.trait_.as_ref()?;
+            let mut tp = trait_path.clone();
+            crate::helper::strip_leading_self(&mut tp);
+            (tp.segments.len() == 1 && all_traits.contains(&tp.segments[0].ident))
+                .then(|| type_head_ident(&im.self_ty))
+                .flatten()
+        })
+        .collect();
     for item in contents.iter() {
         if let Item::Impl(item_impl) = item {
-            validate_impl_where_bounds(item_impl, &all_traits);
+            validate_impl_where_bounds(item_impl, &all_traits, &cycle_self_heads);
         }
     }
     let (raw_contents, contents): (Vec<_>, Vec<_>) = contents

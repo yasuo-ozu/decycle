@@ -1,7 +1,8 @@
-//! D4: a `support_infinite_cycle` (default-on) cycle method returning `impl Trait` can't get
-//! an unbounded re-entry fn-pointer alias (`fn(...) -> impl Trait` is E0562, "impl Trait only
-//! allowed in function and inherent method return types") — that raw solver error used to leak
-//! straight out of decycle's generated code. Now a clean, actionable `abort!` instead.
+//! Return-position `impl Trait` (RPITIT) in a `#[decycle]` (ranked) trait method is a HARD ERROR:
+//! the ranked re-entry fn-pointer type `fn(..) -> impl Trait` is not nameable (E0562), so decycle
+//! rejects it up-front rather than leaking a raw solver error. The help points at an associated type.
+//! (Default `support_infinite_cycle`; the bounded-mode counterpart is rejected identically — see
+//! `ranked_impl_trait_return_bounded.rs`.)
 use decycle::decycle;
 
 #[decycle]

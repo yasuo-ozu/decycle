@@ -1,8 +1,7 @@
 //! C3 acceptance test: atom↔span `A: Spanned<Span = Self::Sp>`
-//! (`docs/decycle-integration/impl-decycle-ranking-and-span.md`, C3 section, in
-//! `/home/yasuo/ghq/github.com/yasuo-ozu/syan2`).
+//! (`docs/decycle-integration/impl-decycle-ranking-and-span.md`, C3 section).
 //!
-//! syan's real `#[recurse]` surfaces the span type through a `Self`-projected associated type
+//! A wrapper macro's real `#[recurse]`-style attribute surfaces the span type through a `Self`-projected associated type
 //! (`Self::__SpanParam`) in a METHOD bound, so the span type is never a free type param on the
 //! re-entry surface (which only declares `DclSelf` + the trait/method tycons — a bare `S` would
 //! be E0433-unnameable there). Before this fix, `emit_reentry_items`'s `m_where` copied the
@@ -15,7 +14,7 @@
 //! and asserts it compiles and runs UNBOUNDED past `recurse_level`.
 //!
 //! Per the doc's C3.2 caveat: keeping the span bound in the method WHERE-CLAUSE (rather than
-//! inline on the generic parameter) is syan's actual, recommended invariant — a type alias
+//! inline on the generic parameter) is a wrapper macro's actual, recommended invariant — a type alias
 //! `where`-clause is weakly enforced on stable Rust, and the fn-pointer alias body here names no
 //! projection at all (`alias_needs_bound` is false), so C3.1 (the `m_where` `SelfSubst`) alone
 //! closes this case; C3.2 (the alias where-clause's method-generic-projection extension) is
@@ -29,7 +28,7 @@
 
 use decycle::decycle;
 
-/// A tiny, self-contained stand-in for syan's `Spanned` leaf trait. Deliberately NOT
+/// A tiny, self-contained stand-in for a `Spanned` leaf trait. Deliberately NOT
 /// `#[decycle]`-listed: it must remain an ordinary, unranked leaf bound.
 pub trait Spanned {
     type Span;

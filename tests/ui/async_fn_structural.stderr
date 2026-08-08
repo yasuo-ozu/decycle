@@ -1,0 +1,33 @@
+error: #[decycle(structural)]: `async fn` is not supported — the returned future is an opaque type the layout cast cannot reinterpret. Return a boxed future (`-> Pin<Box<dyn Future<Output = ..>>>`) instead.
+  --> tests/ui/async_fn_structural.rs:17:9
+   |
+17 |         async fn ev(&self, depth: u64) -> u64 {
+   |         ^^^^^
+
+error: cannot find attribute `decycle` in this scope
+ --> tests/ui/async_fn_structural.rs:8:7
+  |
+8 |     #[decycle]
+  |       ^^^^^^^
+  |
+  = note: `decycle` is in scope, but it is a crate, not an attribute
+help: consider importing one of these attribute macros
+  |
+8 +     use crate::decycle;
+  |
+8 +     use decycle::decycle;
+  |
+8 +     use decycle_macro::decycle;
+  |
+
+error[E0275]: overflow evaluating the requirement `A: Ev`
+  --> tests/ui/async_fn_structural.rs:17:9
+   |
+17 |         async fn ev(&self, depth: u64) -> u64 {
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+note: required by a bound in `<A as Ev>`
+  --> tests/ui/async_fn_structural.rs:15:12
+   |
+15 |         A: Ev,
+   |            ^^ required by this bound in `<A as Ev>`

@@ -1,7 +1,7 @@
 //! Test-only bridge for the C2 (`also_rank`) acceptance test.
 //!
 //! Constructs `decycle_impl::finalize::FinalizeArgs` PROGRAMMATICALLY with a non-empty
-//! `also_rank`, exactly the way a real wrapper macro crate (e.g. syan's `#[recurse]`) would:
+//! `also_rank`, exactly the way a real wrapper macro crate would:
 //! bypassing the `#[decycle]` attribute/carrier entirely (the real integration is
 //! programmatic — see decycle's D1). Everything the demo needs is hardcoded here (the
 //! macro takes no input) because the whole point is exercising `also_rank`'s wiring
@@ -27,7 +27,7 @@ pub fn also_rank_projection_demo(_input: TokenStream) -> TokenStream {
     };
 
     // The cross-edge obligation is a PROJECTION `<G as EmptyGroup>::Fill<B>` (`Fill<B> =
-    // Group<B>`) — the exact shape C2 targets (mirrors syan's `<G as EmptyGroup>::Fill<Slot>`,
+    // Group<B>`) — the exact shape C2 targets (mirrors a wrapper macro's `<G as EmptyGroup>::Fill<Slot>`,
     // `Fill<Slot> = Group<Slot,O,C>`). `also_rank.normalize` below rewrites it to the concrete
     // `Group<B>` BEFORE ranking; without that rewrite `reachable_side_bounds_ok` can't match
     // any impl against the literal projection type and the cross-edge registration is skipped

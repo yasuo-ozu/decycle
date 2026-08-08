@@ -43,15 +43,10 @@ jobs:
       # 1.71's cargo — the 1.71 floor is set by the latest release of the core proc-macro deps
       # (syn 2.0, quote, unicode-ident all declare rust-version 1.71). If one of those bumps
       # its own MSRV above 1.71 in a future release, this job will flag it and the floor here
-      # (and in the three `rust-version` fields) must move with it.
-      #
-      # Build both feature configurations: the default (type-leak, backed by safegraph) and
-      # the `default-features = false` finalize-only bridge that downstream wrappers (e.g.
-      # syan's `#[recurse]`) depend on — the latter is the whole reason the floor is this low.
-      - name: cargo build (default features — decycle + macro + impl)
+      # (and in the three `rust-version` fields) must move with it. `type-leak` 0.7 (safegraph,
+      # MSRV 1.56) is a non-optional dependency and sits below this floor.
+      - name: cargo build (decycle + macro + impl)
         run: cargo build -p decycle -p decycle-macro -p decycle-impl
-      - name: cargo build (decycle-impl, no default features)
-        run: cargo build -p decycle-impl --no-default-features
 
   clippy:
     name: clippy (stable)

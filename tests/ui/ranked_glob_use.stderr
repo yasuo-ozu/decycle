@@ -1,0 +1,29 @@
+error: glob is not supported in #[decycle] use
+  --> tests/ui/ranked_glob_use.rs:14:21
+   |
+14 |     use crate::ext::*;
+   |                     ^
+
+error: cannot find attribute `decycle` in this scope
+  --> tests/ui/ranked_glob_use.rs:13:7
+   |
+13 |     #[decycle]
+   |       ^^^^^^^
+   |
+   = note: `decycle` is in scope, but it is a crate, not an attribute
+help: consider importing one of these attribute macros
+   |
+13 +     use crate::decycle;
+   |
+13 +     use decycle::decycle;
+   |
+13 +     use decycle_macro::decycle;
+   |
+
+warning: unused import: `crate::ext::*`
+  --> tests/ui/ranked_glob_use.rs:14:9
+   |
+14 |     use crate::ext::*;
+   |         ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` on by default

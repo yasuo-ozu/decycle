@@ -23,7 +23,12 @@ typedef = { path = "tests/typedef" }
 alsorank_bridge = { path = "tests/alsorank_bridge" }
 graph_bridge = { path = "tests/graph_bridge" }
 trybuild = "1.0"
-syn = "2.0"
+[dev-dependencies.syn]
+version = "2.0"
+# `analysis::analyze_module` takes a `syn::ItemMod`, so the reachability test builds one; that is
+# all the suite needs from syn.
+default-features = false
+features = ["clone-impls", "full", "parsing", "printing"]
 
 [workspace]
 members = [

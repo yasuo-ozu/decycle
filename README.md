@@ -179,14 +179,10 @@ fn main() {}
 | **`#[track_caller]`** on a cycle method | ✗ in unbounded mode (clean compile error) / **✓** when `support_infinite_cycle = false` | **✓** |
 | Non-`#[decycle]` **supertrait** on the trait | **✓** | ✗ |
 | Third-party trait *in* the cycle | only when `#[decycle]`-annotated at its definition | **✓**  |
-> **`no_std` and dependencies.** Neither engine works on `no_std` today: `decycle-impl` is a
-> regular dependency of the facade, so its crates are compiled for your target, and `__reentry`
-> itself uses `thread_local!`/`HashMap`. `type-leak` is likewise an unconditional dependency of
-> the proc-macro, for *both* engines; the structural engine emits no runtime machinery, but that
-> is a statement about generated code, not about the dependency graph. The heavy part of that
-> graph is gone, though: `safegraph` is taken with `default-features = false`, so its optional
-> `sprs`/`ndarray`/`matrixmultiply` matrix backend is not pulled in — which is also what keeps
-> the MSRV at 1.71.
+> **Why structural is `✗` too.** The structural engine emits no runtime machinery — no registry,
+> no `thread_local!` — so nothing it *generates* needs `std`. The crate still is not `no_std`:
+> `decycle-impl` is a regular dependency of the facade, so it is compiled for your target
+> whichever engine you pick.
 
 > **Note on "growing" type arguments.** Neither engine can make a *genuinely* growing recursion work —
 > one whose instantiation strictly grows every level, e.g. `A<Vec<X>>: Tr` on `impl<X> Tr for A<X>`, or a

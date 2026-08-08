@@ -88,32 +88,79 @@ mod collide {
 
 /// Class A, mechanism 1: a nested descent with a layout-colliding closure makes the floor call the
 /// wrong closure body. Default `recurse_level` (10); depth 30 crosses the floor.
-fn rejection_message<F: FnOnce() -> usize + std::panic::UnwindSafe>(f: F) -> String {
+/// Run a descent that could dispatch to the WRONG closure, and accept only the two outcomes that
+/// are correct.
+///
+/// This is deliberately policy-agnostic, so it keeps its meaning if the current policy changes:
+///
+///   * decycle REFUSES the input up front (today's behaviour — the key contains an anonymous type
+///     and cannot be encoded uniquely), or
+///   * decycle runs it and produces `expected`.
+///
+/// It fails on the third outcome — running it and returning something else — which is exactly the
+/// silent wrong-closure dispatch. If the `{{closure}}` rejection is ever relaxed, these tests stop
+/// exercising the rejection branch and start exercising the correctness branch, with no edit
+/// needed; that is the point.
+///
+/// `expected` is chosen so the wrong answer names its culprit: each closure computes a value only
+/// it can produce, so a mismatch says which one actually ran.
+#[track_caller]
+fn assert_no_wrong_closure_dispatch<F>(what: &str, run: F, expected: usize, wrong: &str)
+where
+    F: FnOnce() -> usize + std::panic::UnwindSafe,
+{
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    let r = std::panic::catch_unwind(f);
+    let outcome = std::panic::catch_unwind(run);
     std::panic::set_hook(prev);
-    let e = r.expect_err("expected a rejection, but the call returned");
-    e.downcast_ref::<String>()
-        .cloned()
-        .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
-        .unwrap_or_default()
+
+    match outcome {
+        Err(e) => {
+            let msg = e
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            assert!(
+                msg.contains("anonymous type") || msg.contains("re-entry fn not registered"),
+                "{what}: expected either the unencodable-key rejection or the documented \
+                 fail-closed panic, got: {msg}"
+            );
+        }
+        Ok(v) => assert_eq!(
+            v, expected,
+            "{what}: the floor dispatched to the WRONG closure — got {v}, which is {wrong}. \
+             The re-entry key failed to separate two closures that share a `type_name` and a \
+             layout."
+        ),
+    }
 }
 
 #[test]
 fn registry_key_collision_calls_wrong_fn() {
-    // The collision required an anonymous type: rustc names every closure in a function
-    // `{{closure}}`, so two same-layout closures shared one registry slot and a nested descent
-    // could make the floor call the other one. Such a key is now refused at the first
-    // registration, deterministically, so the wrong-function window cannot be entered at all.
     use collide::Fold;
+    // `c_add` and `c_mul` share a `type_name` and a layout, so they map to one registry slot.
+    // The body's callback starts a nested descent with `c_mul` in the middle of `c_add`'s, which
+    // is what used to leave the floor pointing at the wrong one.
+    //
+    // c_add: f(0) = 7, then 30 frames add 1  => 37
+    // c_mul: f(0) = 100_000, then 30 frames  => 100_030
     let add: usize = 7;
     let c_add = move |v: usize| v + add;
-    let msg = rejection_message(move || collide::A.fold(c_add, 30));
-    assert!(
-        msg.contains("anonymous type"),
-        "expected the unencodable-key rejection, got: {msg}"
+    let mul: usize = 3;
+    let c_mul = move |v: usize| v * mul + 100_000;
+    HOOK.with(|s| {
+        *s.borrow_mut() = Some(Box::new(move || {
+            let _ = collide::A.fold(c_mul, 12);
+        }))
+    });
+    assert_no_wrong_closure_dispatch(
+        "nested descent with a layout-colliding closure",
+        move || collide::A.fold(c_add, 30),
+        37,
+        "`c_mul`'s body (v * 3 + 100_000) running on `c_add`'s environment",
     );
+    HOOK.with(|s| *s.borrow_mut() = None);
 }
 
 #[decycle(recurse_level = 1)]
@@ -180,16 +227,28 @@ mod stale {
 /// but a breaking behavior change for the bare-param pattern.
 #[test]
 fn registry_stale_entry_defeats_fail_closed() {
-    // Same root cause, reached the other way: an entry left behind by a descent that already
-    // panicked was reused by a later, unrelated call under a colliding key. Both descents needed
-    // a closure to collide, so refusing the key closes this path too.
     use stale::Fold;
+    // Same collision reached the other way: `c_mul`'s descent registers the shared slot and then
+    // hits the documented fail-closed panic, leaving its entry behind. A later, unrelated call
+    // with `c_add` must not pick it up.
+    //
+    // c_add: f(0) = 7, then 5 frames add 1 => 12
+    // c_mul: f(0) = 100_000, then 5 frames => 100_005
     let mul: usize = 3;
     let c_mul = move |v: usize| v * mul + 100_000;
-    let msg = rejection_message(move || stale::B.fold(c_mul, 5));
-    assert!(
-        msg.contains("anonymous type"),
-        "expected the unencodable-key rejection, got: {msg}"
+    let add: usize = 7;
+    let c_add = move |v: usize| v + add;
+
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let _ = std::panic::catch_unwind(move || stale::B.fold(c_mul, 5));
+    std::panic::set_hook(prev);
+
+    assert_no_wrong_closure_dispatch(
+        "later call after a panicked descent left its registration behind",
+        move || stale::A.fold(c_add, 5),
+        12,
+        "`c_mul`'s body (v * 3 + 100_000), resurrected from the stale entry",
     );
 }
 

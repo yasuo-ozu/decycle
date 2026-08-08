@@ -69,3 +69,31 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --no-deps
+
+  # Miri catches what the ordinary suite cannot: the crate's generated code transmutes fn
+  # pointers (ranked floor) and type-puns values (structural casts), and three separate UB
+  # classes once coexisted with a fully green `cargo test`. Without this job they can silently
+  # come back.
+  #
+  # The target list is curated for runtime, not arbitrary. Miri is ~100x slower, so the whole
+  # suite is not viable: `unbounded_reentry` exceeds 10 minutes even skipping its 20_000-frame
+  # test, `span_tying_reentry` takes ~9 minutes and `structural` ~5. Those are excluded because
+  # `ub_regressions` already covers the same two mechanisms — a ranked floor crossing and a
+  # structural `&dyn Fn(&Self)` cast — in about 30 seconds. If you add a test that exercises
+  # `unsafe` in a NEW way, add its target here.
+  miri:
+    name: miri (nightly)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      # `ub_regressions` pins the three classes from the 2026-08-04 audit; two of them are
+      # invisible to a native run and only fail here.
+      - run: cargo miri test --test ub_regressions
+      - run: cargo miri test --test structural_soundness_regressions
+      - run: cargo miri test --test structural_sig
+      - run: cargo miri test --test reentry_bridge
+      - run: cargo miri test --test bareparam_reentry

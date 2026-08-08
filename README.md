@@ -183,7 +183,8 @@ fn main() {}
 | Re-entry across **several instantiations** of a generic method | **✓** (fn-pointer re-entry) | ✗ (layout cast can't) |
 | Genuinely **growing** type argument (one wrapper per level) | ✗ — see note below | ✗ |
 | **`no_std`** | ✗ | ✗ (see note) |
-| Arg mentioning `Self`: **`impl Fn(&Self)`** (APIT) | **✓** with a named fn or `fn` pointer; a **closure** is rejected at runtime in unbounded mode — see the closure note below | ✗ (use generics) |
+| Arg mentioning `Self`: **`impl Fn(&Self)`** (APIT) | **✓** — but see the row below | ✗ (use generics) |
+| Generic arg instantiated with an **anonymous type** (closure, `async` block, `-> impl Trait` value) | ✗ in unbounded mode — rejected at runtime; a named fn or `fn` pointer works. Not a pending fix — see the closure note below | **✓** |
 | Arg mentioning `Self`: **`fn(&Self)`** / **`&dyn Fn(&Self)`** | ✗ | **✓** |
 | **`#[track_caller]`** on a cycle method | ✗ in unbounded mode (clean compile error) / **✓** when `support_infinite_cycle = false` | **✓** |
 | Non-`#[decycle]` **supertrait** on the trait | **✓** | ✗ |
@@ -255,19 +256,6 @@ fn main() {}
 > It also does not apply to the structural engine (which rejects `impl Fn(&Self)` at compile time
 > for its own, unrelated reason — see the table).
 >
-> **This is a permanent restriction, not a pending fix.** Two closures of the same layout cannot be
-> told apart at run time on stable Rust, so there is no key the registry could switch to. Concretely,
-> the following are rejected under `support_infinite_cycle = true`:
->
-> | instantiated with | accepted? |
-> |---|---|
-> | a named function (`fn add7`) | ✓ |
-> | a non-capturing closure coerced to `fn` (`(\|v\| v + 7) as fn(usize) -> usize`) | ✓ |
-> | a closure, capturing or not | ✗ |
-> | an `async` block, or an `async fn`'s returned future | ✗ |
-> | a closure nested inside another closure | ✗ |
-> | a `-> impl Fn(..)` return value | ✗ |
-
 
 ## How the algorithms work?
 

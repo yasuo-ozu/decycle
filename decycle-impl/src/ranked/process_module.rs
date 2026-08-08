@@ -4,6 +4,7 @@ use proc_macro_error::*;
 use std::collections::HashSet;
 use syn::spanned::Spanned;
 use syn::*;
+use crate::helper::type_head_ident;
 use template_quote::quote;
 
 /// A `super::super::…`-rooted path (2+ leading `super` segments) written by the user
@@ -127,15 +128,6 @@ pub(crate) fn is_local_impl_bound_target(ty: &Type, impl_type_params: &HashSet<I
     }
     let ident = &path.segments[0].ident;
     ident == "Self" || impl_type_params.contains(ident)
-}
-
-/// The head (outermost path) ident of a type: `Box` for `Box<Stmt>`, `B` for `B<T>`, `Stmt` for
-/// `Stmt`. `None` for a non-path type (`&Stmt`, `(A, B)`) or a `<T as Tr>::X` qself.
-fn type_head_ident(ty: &Type) -> Option<Ident> {
-    match ty {
-        Type::Path(TypePath { qself: None, path }) => path.segments.last().map(|s| s.ident.clone()),
-        _ => None,
-    }
 }
 
 fn has_assoc_constraints(path: &Path) -> bool {

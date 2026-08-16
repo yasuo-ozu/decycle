@@ -2183,8 +2183,26 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize, _decycle: &Path) -> T
             .filter(|(_, k)| **k)
             .filter_map(|(p, _)| match p {
                 GenericParam::Type(t) if !t.bounds.is_empty() => {
+                    // Drop a user-written `?Sized`. The param is DECLARED with
+                    // `DeclBounds::Unsized` below, which already emits
+                    // `T: ?::core::marker::Sized`; repeating the relaxation here is a *second*
+                    // relaxed bound on the same param, which rustc rejects with E0203
+                    // ("duplicate relaxed `Sized` bounds"). Nothing is lost — the declaration
+                    // makes exactly the same statement. If the relaxation was the param's only
+                    // bound, the predicate disappears entirely.
+                    let bounds: Punctuated<TypeParamBound, Token![+]> = t
+                        .bounds
+                        .iter()
+                        .filter(|b| {
+                            !matches!(b, TypeParamBound::Trait(tb)
+                                if matches!(tb.modifier, TraitBoundModifier::Maybe(_)))
+                        })
+                        .cloned()
+                        .collect();
+                    if bounds.is_empty() {
+                        return None;
+                    }
                     let ident = &t.ident;
-                    let bounds = &t.bounds;
                     Some(parse_quote!(#ident: #bounds))
                 }
                 _ => None,

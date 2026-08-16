@@ -3,17 +3,40 @@
 Notable changes, following [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.5.2] — 2026-08-16
 
-> **Release status (2026-08-15).** **0.5.1** is the newest release on crates.io and is what
-> `cargo add decycle` resolves to; no release has been yanked, and there is no 0.4.x.
+> **Release status.** This section spans several releases, because the workspace version is
+> bumped when a release is cut rather than per change. 0.5.0 and 0.5.1 were published from it
+> (0.5.1 on 2026-08-08, from commit `a085766`); no release has been yanked, and there is no 0.4.x.
 >
-> Entries in this section are **not all released yet.** 0.5.1 was published on 2026-08-08 from
-> commit `a085766`; anything committed after that is in this section but *not* in 0.5.1 — namely
-> the doubled `?Sized` relaxation fix, the `__DecycleBody` where-predicate restatement, and the
-> value-level instantiation-growth rejection. The workspace version is bumped when a release is
-> cut, so `version` matching a version already on crates.io means the tree is ahead of the last
-> publish rather than that these changes shipped.
+> **New in 0.5.2:** the *Fixed — correctness (2026-08-15 audit)* entries below, plus three changes
+> that were committed after the 0.5.1 publish and so never shipped — the doubled `?Sized`
+> relaxation fix, the `__DecycleBody` where-predicate restatement, and the value-level
+> instantiation-growth rejection.
+>
+> **This is a patch-numbered release that contains behavior breaks.** Under Cargo's rules a
+> `0.5.1 → 0.5.2` bump is treated as compatible, so `cargo update` will pull it into existing
+> builds; several inputs that previously compiled are now rejected. They are listed under
+> *Breaking in 0.5.2* below.
+
+### Breaking in 0.5.2
+
+Each of these previously compiled and now does not. All are narrow, and each error names the fix.
+
+- **A `#[decycle]` trait may no longer declare a defaulted generic parameter** (`trait Ca<T = u8>`).
+  Only the *omitted-argument* spelling was actually broken; declaring a default and writing the
+  argument at every use site worked. The rejection is therefore broader than the defect, and was
+  chosen because the marker and fn-pointer alias place trait generics and method generics in one
+  parameter list, where a carried-through default is not expressible (`generic parameters with a
+  default must be trailing`). Spell the parameter at every use site instead.
+- **`marker` is now genuinely required** on a standalone `#[decycle]` trait naming a relative type
+  path, as the documentation always claimed. It was previously accepted and silently ignored,
+  because the interning pass never ran.
+- **Arguments on a `#[decycle(...)]` attached to an item *inside* a `#[decycle]` module are now
+  rejected** rather than discarded. Engine options belong on the enclosing `mod`; writing
+  `#[decycle(structural)]` on an inner trait previously selected the ranked engine in silence.
+- **Structural: a method generic whose bound mentions `Self`** (`F: Fn(&Self)`) is rejected. It
+  could never compile; use `fn(&Self)`, `&dyn Fn(&Self)`, or the ranked engine.
 
 ### Fixed — correctness (2026-08-15 audit)
 

@@ -281,6 +281,7 @@ fn make_impls(model: &Model, scc: &Scc, im: &ImplBlock) -> syn::Result<TokenStre
                 f,
                 &natural,
                 &local,
+                &reduced,
                 &assoc_items,
                 &trait_path,
                 model.nonce,
@@ -342,6 +343,7 @@ fn rec_method(
     f: &syn::ImplItemFn,
     natural: &Type,
     reduced: &syn::Generics,
+    outer: &syn::Generics,
     assoc_items: &[&ImplItem],
     trait_path: &syn::Path,
     nonce: u64,
@@ -434,6 +436,7 @@ fn rec_method(
 
     let (impl_g, _, where_g) = reduced.split_for_impl();
     let trait_g = wrap_angle(&params_decl(reduced, DeclBounds::Bare)); // `<Span, Token>` for the trait decl
+    let trait_where = body_trait_where(outer);
     let use_g = wrap_angle(&params_use(reduced)); // `<Span, Token>` at the impl/call
 
     // associated-item decls (for the local trait) and defs (for the local impl), so a `Self::Assoc`
@@ -469,7 +472,7 @@ fn rec_method(
     let outer_attrs: Vec<&Attribute> = attrs.iter().filter(|a| !crate::is_symbol_attr(a)).collect();
     Ok(quote! {
         #inline #(#outer_attrs)* #vis #outer_sig {
-            trait #body_tr #trait_g : Sized {
+            trait #body_tr #trait_g : Sized #trait_where {
                 #(#assoc_decls)*
                 #run_sig ;
             }
@@ -483,6 +486,47 @@ fn rec_method(
             #dispatch
         }
     })
+}
+
+/// The `where`-clause the body-holding local trait's **declaration** needs.
+///
+/// The declaration's generic params are rendered [`Bare`](DeclBounds::Bare) — every bound dropped —
+/// because a param bound may itself be the cyclic one, and re-stating it at the declaration would put
+/// the cycle straight back. But dropping *everything* is too much: `__run`'s signature is copied from
+/// the user's method, so if it projects through a param (`-> ParseError<<Atom as Spanned>::Span>`) the
+/// declaration is ill-formed on its own (E0277 `Atom: Spanned` is not satisfied) even though every impl
+/// and the single call site can prove it.
+///
+/// So re-state the predicates of the **reduced** generics — the ones already on the enclosing
+/// terminator impl, which is where the only call to `__run` sits, so each is provable there by
+/// construction. They are cycle-free by definition (`reduce_generics` dropped the cyclic bounds), and
+/// the body impl is driven by `local`, which keeps a superset of them, so it satisfies the declaration.
+///
+/// Predicates whose *bounds* mention `Self` are skipped: `Self` means the terminator inside the
+/// enclosing impl but the natural type at the declaration, so re-stating one would change what it
+/// asserts. (`reduce_generics` already substituted `Self` out of every *bounded type*.)
+fn body_trait_where(outer: &syn::Generics) -> TokenStream {
+    let preds: Vec<&WherePredicate> = outer
+        .where_clause
+        .iter()
+        .flat_map(|w| &w.predicates)
+        .filter(|p| match p {
+            WherePredicate::Type(pt) => !pt.bounds.iter().any(|b| match b {
+                syn::TypeParamBound::Trait(tb) => tb
+                    .path
+                    .segments
+                    .iter()
+                    .any(|s| s.ident == "Self" || args_mention_self(&s.arguments)),
+                _ => false,
+            }),
+            _ => true,
+        })
+        .collect();
+    if preds.is_empty() {
+        quote!()
+    } else {
+        quote!(where #(#preds),*)
+    }
 }
 
 /// The trait-declaration form of an associated impl item: `type Out = i64;` → `type Out;`,

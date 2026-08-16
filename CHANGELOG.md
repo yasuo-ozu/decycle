@@ -79,6 +79,17 @@ they are not a claim that the engine as a whole is proven sound.
 
 ### Fixed — correctness and diagnostics
 
+- **Structural: a method signature may project through a param bound.** The local
+  `__DecycleBody` trait's declaration renders its generic params with every bound stripped
+  (a bound may itself be the cyclic one, and re-stating it would put the cycle back). But
+  `__run`'s signature is copied verbatim from the user's method, so a return or argument
+  type of the form `<A as HasOut>::Out` made the declaration ill-formed on its own —
+  `E0277: the trait bound A: HasOut is not satisfied` — even though every generated impl and
+  the single call site could prove it. The declaration now re-states the **reduced** impl's
+  where-predicates: cycle-free by construction, and provable at the call site, which sits
+  inside the terminator impl carrying exactly them. Predicates whose *bounds* mention `Self`
+  are skipped, since `Self` denotes the terminator there but the natural type at the
+  declaration. Pinned by `tests/structural_body_trait_where.rs`.
 - Premise sharing is scoped to the impls a rank chain can actually reach: an acyclic impl
   of a cycle's trait no longer silently inherits the cycle's side-bounds, and a predicate
   naming a sibling impl's lifetime is no longer injected into an impl without that

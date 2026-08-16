@@ -2418,11 +2418,32 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize, _decycle: &Path) -> T
             .filter(|p| !matches!(p, GenericParam::Lifetime(_)))
             .cloned()
             .collect();
-        let alias_method_bounds: Vec<WherePredicate> = m_tycon_alias
+        // The alias declares BOTH the trait's type params (`alias_tycon`) and the method's
+        // (`m_tycon_alias`) with `DeclBounds::Unsized` — every bound stripped. That is fine while the
+        // signature merely NAMES those params, but not when a bound PROJECTS through one. A
+        // method-generic bound such as `L: ErrorLogger<ParseError<SpanOf<Atom>>>` is well-formed only
+        // under `Atom: Spanned`, and `Atom` is the TRAIT's param, so re-stating only the method's
+        // bounds leaves the alias ill-formed on its own (E0277) even though every impl and call site
+        // can prove it. Chain both sets.
+        //
+        // The ranked twin of `structural::codegen::body_trait_where`: a generated declaration that
+        // copies a user signature must carry the premises that signature projects through. Restating
+        // a method-level `where Atom: Spanned` on the trait does NOT help — those are dropped here
+        // too — so this is the only place it can be fixed.
+        let alias_method_bounds: Vec<WherePredicate> = alias_tycon
             .iter()
-            .zip(mmask.iter())
-            .filter(|(_, k)| **k)
-            .filter_map(|(p, _)| match p {
+            .copied()
+            .cloned()
+            .chain(
+                m_tycon_alias
+                    .iter()
+                    .zip(mmask.iter())
+                    .filter(|(_, k)| **k)
+                    .map(|(p, _)| p.clone()),
+            )
+            // `alias_tycon` と `m_tycon_alias` は重なりうるので、同じ述語を二度書かない。
+            // rustc は重複を受け入れるが、生成物を読む人には無駄なノイズになる。
+            .filter_map(|p| match &p {
                 GenericParam::Type(t) if !t.bounds.is_empty() => {
                     // Drop a user-written `?Sized`. The param is DECLARED with
                     // `DeclBounds::Unsized` below, which already emits
@@ -2448,7 +2469,12 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize, _decycle: &Path) -> T
                 }
                 _ => None,
             })
-            .collect();
+            .fold(Vec::new(), |mut acc: Vec<WherePredicate>, w| {
+                if !acc.iter().any(|x| quote!(#x).to_string() == quote!(#w).to_string()) {
+                    acc.push(w);
+                }
+                acc
+            });
         let orig_margs = type_const_idents(&orig_sig.generics);
         let do_turbofish = !orig_margs.is_empty() && !sig_has_impl_trait_input(orig_sig);
 

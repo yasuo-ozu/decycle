@@ -1,0 +1,47 @@
+error: decycle: this recursive call reborrows `parse`'s own by-value generic parameter, so each level instantiates it one `&mut` deeper (`parse::<S>` → `parse::<&mut S>` → `parse::<&mut &mut S>` → …). The obligation cycle is breakable; this instantiation cycle is not — the growth is in the monomorphisation, and no engine can close it (rustc reports it as "reached the recursion limit while instantiating", or as an E0275 against whatever blanket impl `&mut _` needs).
+
+       Take the parameter by reference instead, so the recursive call reborrows to the SAME type and `S` is a fixed point:
+
+           fn parse<S: ..>(arg: &mut S, ..)      // signature
+
+           parse(&mut *arg, ..)                  // recursive call
+
+       If the by-value signature is part of a public API, keep it as a provided entry point that delegates once to the by-reference method. Erasing the parameter behind one fixed type (`&mut dyn Trait`) also closes it, at the cost of virtual dispatch.
+
+       This was reached through a local derived from the parameter. If that local's type does NOT in fact involve the parameter, give it an explicit type annotation (`let x: ConcreteType = ..`) and this check will accept it.
+  --> tests/ui/value_generic_growth_apit.rs:75:36
+   |
+75 |             <Stmt as Parse>::parse(&mut s, depth - 1)
+   |                                    ^
+
+error[E0275]: overflow evaluating the requirement `m::Expr: m::Parse`
+  --> tests/ui/value_generic_growth_apit.rs:68:9
+   |
+68 |         Stmt: Parse,
+   |         ^^^^^^^^^^^
+   |
+note: required for `m::Stmt` to implement `m::Parse`
+  --> tests/ui/value_generic_growth_apit.rs:79:10
+   |
+79 |     impl Parse for Stmt
+   |          ^^^^^     ^^^^
+80 |     where
+81 |         Expr: Parse,
+   |               ----- unsatisfied trait bound introduced here
+   = help: see issue #48214
+
+error[E0275]: overflow evaluating the requirement `m::Stmt: m::Parse`
+  --> tests/ui/value_generic_growth_apit.rs:81:9
+   |
+81 |         Expr: Parse,
+   |         ^^^^^^^^^^^
+   |
+note: required for `m::Expr` to implement `m::Parse`
+  --> tests/ui/value_generic_growth_apit.rs:66:10
+   |
+66 |     impl Parse for Expr
+   |          ^^^^^     ^^^^
+67 |     where
+68 |         Stmt: Parse,
+   |               ----- unsatisfied trait bound introduced here
+   = help: see issue #48214

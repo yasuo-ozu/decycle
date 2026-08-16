@@ -6,10 +6,12 @@
 //! Unlike the ranked engine it does NOT scan every impl: only impls of the traits annotated
 //! `#[decycle]` in the module participate (`collect_decycle_traits`), matching the ranked convention.
 //!
-//! Scope: trait methods with no growing type arguments (the `Dup`/stream-tower case needs the ranked
-//! engine). Handles associated fns + every `self`-receiver shape, method generics, APIT, associated
-//! items, multiple traits per cycle, and multiroot SCCs; emits a forwarding assertion when a wrapped
-//! container predicate (`Box<Stmt>: Tr`) is stripped.
+//! Scope: trait methods with no growing type arguments. A method whose generic argument grows per
+//! level (the `Dup`/stream-tower case) is not a scope limit of *this* engine — no engine can break it,
+//! since the growth is in the monomorphisation rather than the obligation — and `crate::growth` now
+//! rejects it up-front for both. Handles associated fns + every `self`-receiver shape, method generics,
+//! APIT, associated items, multiple traits per cycle, and multiroot SCCs; emits a forwarding assertion
+//! when a wrapped container predicate (`Box<Stmt>: Tr`) is stripped.
 
 use proc_macro2::{Span, TokenStream};
 use template_quote::{quote, ToTokens};
@@ -86,6 +88,11 @@ fn expand(
         .first()
         .map(|s| s.ident.clone())
         .ok_or_else(|| syn::Error::new(decycle.span(), "empty decycle path"))?;
+
+    // Before anything else: reject value-level instantiation growth (a cyclic method reborrowing its
+    // own by-value generic parameter). Neither engine can break it, and left alone it surfaces as a
+    // monomorphisation limit naming generated internals. See `crate::growth`.
+    crate::growth::check_value_generic_growth(&module, decycle)?;
 
     // Per-expansion hygiene nonce, derived from the (pre-mutation) module tokens. Every generated
     // identifier carries it so nothing the engine emits can collide with a user identifier.

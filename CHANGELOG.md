@@ -77,6 +77,43 @@ they are not a claim that the engine as a whole is proven sound.
   `process_module_with_graph`, `process_trait`, `finalize::finalize`) and
   `decycle::structural` (`process_module`, `process_module_with_graph`).
 
+### Added — reject value-level instantiation growth
+
+A cyclic trait method that takes a generic parameter **by value** and **reborrows it** at the recursive
+call now gets a clean, actionable error instead of a diagnostic naming generated internals:
+
+```rust
+#[decycle] pub trait Eval { fn eval<S: Src>(src: S, depth: u32) -> u32; }
+impl Eval for A where B: Eval {
+    fn eval<S: Src>(mut src: S, depth: u32) -> u32 {
+        <B as Eval>::eval(&mut src, depth - 1)   // ← eval::<S> → eval::<&mut S> → …
+    }
+}
+```
+
+The *obligation* cycle is breakable and both engines break it; the **instantiation** cycle is not — the
+growth is in the monomorphisation, one `&mut` layer per level. This is the value-level twin of the
+non-regular where-bound already rejected in `ranked::finalize`, and like that one it cannot reject a
+working program: rustc itself reports the class as `reached the recursion limit while instantiating`
+(no error code, span only on the call), as an `E0275` against whatever blanket impl `&mut _` happens to
+need — pointing at that innocent blanket — or, when only some call sites reborrow, as an ICE
+(`failed to resolve instance for …`). None of the three names decycle, the growing parameter, or the
+fix.
+
+The check is engine-independent (both entry points run it), syntactic, and deliberately narrow, since a
+false positive would reject a working program. It fires only when the impl's self type is a cycle
+member, the method has a by-value method-level generic (including argument-position `impl Trait`), the
+body calls a method of the *same name*, and the argument at that position is `&`/`&mut` rooted at a
+binding derived from that parameter. So `eval(src, ..)` (moved on unchanged), `eval(&mut local_buf, ..)`
+(a fixed type) and `eval_by_ref(&mut src, ..)` (callee takes `&mut S`) all still compile.
+
+Taint follows `let` chains through method calls, because `let s = src.into_src();` is the real-world
+spelling. A local with an **explicit type annotation naming no method generic** is treated as fixed, so
+the one false positive the heuristic can produce is fixable in one line — and the diagnostic says so.
+
+Pinned by `tests/ui/value_generic_growth_{ranked,structural,apit}.rs` and
+`tests/ui/pass/value_generic_no_growth.rs`.
+
 ### Fixed — correctness and diagnostics
 
 - **Structural: a method signature may project through a param bound.** The local

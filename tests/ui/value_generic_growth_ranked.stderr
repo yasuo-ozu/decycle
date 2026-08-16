@@ -1,0 +1,45 @@
+error: decycle: this recursive call reborrows `eval`'s own by-value generic parameter, so each level instantiates it one `&mut` deeper (`eval::<S>` → `eval::<&mut S>` → `eval::<&mut &mut S>` → …). The obligation cycle is breakable; this instantiation cycle is not — the growth is in the monomorphisation, and no engine can close it (rustc reports it as "reached the recursion limit while instantiating", or as an E0275 against whatever blanket impl `&mut _` needs).
+
+       Take the parameter by reference instead, so the recursive call reborrows to the SAME type and `S` is a fixed point:
+
+           fn eval<S: ..>(arg: &mut S, ..)      // signature
+
+           eval(&mut *arg, ..)                  // recursive call
+
+       If the by-value signature is part of a public API, keep it as a provided entry point that delegates once to the by-reference method. Erasing the parameter behind one fixed type (`&mut dyn Trait`) also closes it, at the cost of virtual dispatch.
+  --> tests/ui/value_generic_growth_ranked.rs:47:31
+   |
+47 |             <B as Eval>::eval(&mut src, depth - 1)
+   |                               ^
+
+error[E0275]: overflow evaluating the requirement `A: Eval`
+  --> tests/ui/value_generic_growth_ranked.rs:41:9
+   |
+41 |         B: Eval,
+   |         ^^^^^^^
+   |
+note: required for `B` to implement `Eval`
+  --> tests/ui/value_generic_growth_ranked.rs:51:10
+   |
+51 |     impl Eval for B
+   |          ^^^^     ^
+52 |     where
+53 |         A: Eval,
+   |            ---- unsatisfied trait bound introduced here
+   = help: see issue #48214
+
+error[E0275]: overflow evaluating the requirement `B: Eval`
+  --> tests/ui/value_generic_growth_ranked.rs:53:9
+   |
+53 |         A: Eval,
+   |         ^^^^^^^
+   |
+note: required for `A` to implement `Eval`
+  --> tests/ui/value_generic_growth_ranked.rs:39:10
+   |
+39 |     impl Eval for A
+   |          ^^^^     ^
+40 |     where
+41 |         B: Eval,
+   |            ---- unsatisfied trait bound introduced here
+   = help: see issue #48214

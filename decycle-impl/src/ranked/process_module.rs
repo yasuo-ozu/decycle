@@ -470,6 +470,14 @@ fn process_module_inner(
     recurse_level: usize,
     support_infinite_cycle: bool,
 ) -> TokenStream {
+    // Value-level instantiation growth (a cyclic method reborrowing its own by-value generic
+    // parameter) — neither engine can break it, and left alone it surfaces as a monomorphisation limit
+    // naming generated internals. See `crate::growth`.
+    //
+    // Checked HERE, before the fold below strips the `#[decycle]` markers the obligation graph keys
+    // on, but REPORTED after `set_dummy` installs the stripped module — otherwise the abort cascades
+    // into a spurious "cannot find attribute `decycle`" from the unstripped fallback.
+    let growth = crate::growth::check_value_generic_growth(&module, decycle);
     let contents = &mut module
         .content
         .as_mut()
@@ -516,6 +524,9 @@ fn process_module_inner(
             }
         },
     );
+    if let Err(e) = growth {
+        abort!(e.span(), "{}", e);
+    }
     for item in contents.iter() {
         match item {
             Item::Mod(item_mod) => {

@@ -26,6 +26,7 @@ pub use structural::process_module as process_module_structural;
 
 // Rendering `syn::Generics` to token form, shared by both engines.
 mod generics_fmt;
+mod growth;
 
 /// Emitted by both engines when a `#[decycle]` module contains no trait (nor `#[decycle] use`)
 /// annotated with `#[decycle]` — nothing marks a cycle participant, so there is nothing to break.

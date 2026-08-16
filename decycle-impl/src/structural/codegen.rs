@@ -274,25 +274,37 @@ fn make_impls(model: &Model, scc: &Scc, im: &ImplBlock) -> syn::Result<TokenStre
         }
     }
 
-    // Pass 2: methods.
+    // Pass 2: methods. Each signature is first canonicalized against the trait's own DECLARATION
+    // (when the trait is declared in this module): an impl may legally spell a `Self` position with
+    // the concrete self type (`fn merge(&self, other: &A)` for `fn merge(&self, other: &Self)`), but
+    // the generated impls are of the same trait for a DIFFERENT self type, so such a position has to
+    // read `Self` again or the terminator impl mismatches the trait it implements (E0053, whose
+    // "help" names the generated `__ATerm`).
+    let cx = ImplCx {
+        natural: &natural,
+        term_ty: &term_ty,
+        local: &local,
+        reduced: &reduced,
+        assoc_items: &assoc_items,
+        trait_path: &trait_path,
+        nonce: model.nonce,
+    };
     for it in &im.item.items {
         if let ImplItem::Fn(f) = it {
-            term_methods.extend(rec_method(
-                f,
-                &natural,
-                &local,
-                &reduced,
-                &assoc_items,
-                &trait_path,
-                model.nonce,
-            )?);
-            nat_methods.extend(nat_method(
-                f,
-                &term_ty,
-                &trait_path,
-                &assoc_items,
-                model.nonce,
-            )?);
+            let decl_sig = model.trait_method_sig(&im.trait_key, &f.sig.ident);
+            let f = match decl_sig {
+                Some(d) => canonicalize_method_sig(f, d, &im.item.self_ty),
+                None => {
+                    // No declaration to consult: reject a signature that spells the natural self
+                    // type outright, rather than letting E0053 surface a generated name.
+                    if !model.has_trait_decl(&im.trait_key) {
+                        check_concrete_self_spelling(f, m_ident, &trait_path)?;
+                    }
+                    f.clone()
+                }
+            };
+            term_methods.extend(rec_method(&f, decl_sig, &cx)?);
+            nat_methods.extend(nat_method(&f, &cx)?);
         }
     }
 
@@ -313,6 +325,339 @@ fn make_impls(model: &Model, scc: &Scc, im: &ImplBlock) -> syn::Result<TokenStre
             #nat_methods
         }
     })
+}
+
+/// Everything about the enclosing impl block that emitting one of its methods needs. Grouped rather
+/// than threaded as loose parameters — the two emitters below take the same seven values.
+struct ImplCx<'a> {
+    /// The natural (user) self type, `M<args>`.
+    natural: &'a Type,
+    /// The terminator self type, `__MTerm<args>` — same layout, different type.
+    term_ty: &'a Type,
+    /// Generics driving each method's local `__DecycleBody` trait + impl: only *wrapped* cyclic
+    /// predicates dropped, so a bare cyclic bound still pins the body's generics.
+    local: &'a syn::Generics,
+    /// Generics driving the terminator and natural impls: every cyclic predicate dropped.
+    reduced: &'a syn::Generics,
+    /// The impl's associated items (types and consts).
+    assoc_items: &'a [&'a ImplItem],
+    /// The trait being implemented, as written.
+    trait_path: &'a syn::Path,
+    nonce: u64,
+}
+
+/// Re-spell the impl signature's `Self` positions, using the trait's DECLARATION as the authority.
+///
+/// `impl Vis for A { fn merge(&self, other: &A) }` is legal Rust for `fn merge(&self, other: &Self)`
+/// — inside the impl the two spellings *are* the same type. They stop being interchangeable the
+/// moment the same method is emitted on the terminator: there `Self` is `__ATerm`, the trait demands
+/// `&__ATerm`, and the copied `&A` mismatches it (E0053, plus an E0308 at the dispatch, with rustc
+/// helpfully suggesting the user write the generated `__ATerm_<nonce>` themselves). Rewriting each
+/// position the DECLARATION spells `Self` back to `Self` makes the impl carry the same information
+/// the trait does, which is what every later step (the cast decision in `forward_args`, the `__run`
+/// decl, the terminator impl) reads.
+///
+/// The declaration has to drive this: `A` is rewritten only where the decl says `Self`, so a trait
+/// that genuinely declares a concrete `&A` parameter (e.g. `Tr<A>` instantiated at `A`) keeps it.
+fn canonicalize_method_sig(
+    f: &syn::ImplItemFn,
+    decl: &syn::Signature,
+    self_ty: &Type,
+) -> syn::ImplItemFn {
+    let mut out = f.clone();
+    // Receiver: only an explicitly typed one (`self: Box<A>`) carries a type worth rewriting; syn
+    // synthesises `&Self` for a plain `&self`, and only renders the type when `colon_token` is set.
+    if let (Some(syn::FnArg::Receiver(r)), Some(syn::FnArg::Receiver(dr))) =
+        (out.sig.inputs.first_mut(), decl.inputs.first())
+    {
+        if r.colon_token.is_some() {
+            r.ty = Box::new(canon_self(&r.ty, &dr.ty, self_ty));
+        }
+    }
+    // Typed parameters, matched by position against the declaration's own typed parameters.
+    let decl_typed: Vec<&syn::PatType> = decl
+        .inputs
+        .iter()
+        .filter_map(|a| match a {
+            syn::FnArg::Typed(pt) => Some(pt),
+            _ => None,
+        })
+        .collect();
+    let mut ix = 0usize;
+    for input in out.sig.inputs.iter_mut() {
+        if let syn::FnArg::Typed(pt) = input {
+            if let Some(d) = decl_typed.get(ix) {
+                pt.ty = Box::new(canon_self(&pt.ty, &d.ty, self_ty));
+            }
+            ix += 1;
+        }
+    }
+    if let (ReturnType::Type(_, t), ReturnType::Type(_, d)) = (&mut out.sig.output, &decl.output) {
+        *t = Box::new(canon_self(t, d, self_ty));
+    }
+    out
+}
+
+/// Walk an impl type and its declared counterpart in parallel, replacing the impl's spelling with
+/// `Self` exactly where the declaration says `Self` **and** the impl spells this impl's self type.
+/// Any other shape is returned untouched.
+fn canon_self(impl_ty: &Type, decl_ty: &Type, self_ty: &Type) -> Type {
+    // Keep the impl side's parens/groups (a macro-expanded type arrives group-wrapped) and descend.
+    match impl_ty {
+        Type::Paren(p) => {
+            let mut p = p.clone();
+            p.elem = Box::new(canon_self(&p.elem, decl_ty, self_ty));
+            return Type::Paren(p);
+        }
+        Type::Group(g) => {
+            let mut g = g.clone();
+            g.elem = Box::new(canon_self(&g.elem, decl_ty, self_ty));
+            return Type::Group(g);
+        }
+        _ => {}
+    }
+    let decl = strip_group(decl_ty);
+    if is_plain_self(decl) {
+        return if same_spelling(impl_ty, self_ty) {
+            parse_quote!(Self)
+        } else {
+            impl_ty.clone()
+        };
+    }
+    match (impl_ty, decl) {
+        (Type::Reference(i), Type::Reference(d)) => {
+            let mut i = i.clone();
+            i.elem = Box::new(canon_self(&i.elem, &d.elem, self_ty));
+            Type::Reference(i)
+        }
+        (Type::Ptr(i), Type::Ptr(d)) => {
+            let mut i = i.clone();
+            i.elem = Box::new(canon_self(&i.elem, &d.elem, self_ty));
+            Type::Ptr(i)
+        }
+        (Type::Slice(i), Type::Slice(d)) => {
+            let mut i = i.clone();
+            i.elem = Box::new(canon_self(&i.elem, &d.elem, self_ty));
+            Type::Slice(i)
+        }
+        (Type::Array(i), Type::Array(d)) => {
+            let mut i = i.clone();
+            i.elem = Box::new(canon_self(&i.elem, &d.elem, self_ty));
+            Type::Array(i)
+        }
+        (Type::Tuple(i), Type::Tuple(d)) if i.elems.len() == d.elems.len() => {
+            let mut i = i.clone();
+            for (e, de) in i.elems.iter_mut().zip(d.elems.iter()) {
+                *e = canon_self(e, de, self_ty);
+            }
+            Type::Tuple(i)
+        }
+        (Type::Path(i), Type::Path(d))
+            if i.qself.is_none()
+                && d.qself.is_none()
+                && i.path.segments.len() == d.path.segments.len() =>
+        {
+            let mut i = i.clone();
+            for (seg, dseg) in i.path.segments.iter_mut().zip(d.path.segments.iter()) {
+                seg.arguments = canon_self_args(&seg.arguments, &dseg.arguments, self_ty);
+            }
+            Type::Path(i)
+        }
+        (Type::BareFn(i), Type::BareFn(d)) if i.inputs.len() == d.inputs.len() => {
+            let mut i = i.clone();
+            for (a, da) in i.inputs.iter_mut().zip(d.inputs.iter()) {
+                a.ty = canon_self(&a.ty, &da.ty, self_ty);
+            }
+            if let (syn::ReturnType::Type(_, t), syn::ReturnType::Type(_, dt)) =
+                (&mut i.output, &d.output)
+            {
+                *t = Box::new(canon_self(t, dt, self_ty));
+            }
+            Type::BareFn(i)
+        }
+        (Type::TraitObject(i), Type::TraitObject(d)) => {
+            let mut i = i.clone();
+            canon_self_bounds(&mut i.bounds, &d.bounds, self_ty);
+            Type::TraitObject(i)
+        }
+        (Type::ImplTrait(i), Type::ImplTrait(d)) => {
+            let mut i = i.clone();
+            canon_self_bounds(&mut i.bounds, &d.bounds, self_ty);
+            Type::ImplTrait(i)
+        }
+        _ => impl_ty.clone(),
+    }
+}
+
+/// [`canon_self`] through a path segment's arguments — both `<..>` and `Fn(..)`-sugar forms.
+fn canon_self_args(
+    impl_args: &PathArguments,
+    decl_args: &PathArguments,
+    self_ty: &Type,
+) -> PathArguments {
+    match (impl_args, decl_args) {
+        (PathArguments::AngleBracketed(i), PathArguments::AngleBracketed(d))
+            if i.args.len() == d.args.len() =>
+        {
+            let mut i = i.clone();
+            for (a, da) in i.args.iter_mut().zip(d.args.iter()) {
+                match (a, da) {
+                    (GenericArgument::Type(t), GenericArgument::Type(dt)) => {
+                        *t = canon_self(t, dt, self_ty);
+                    }
+                    (GenericArgument::AssocType(at), GenericArgument::AssocType(dat)) => {
+                        at.ty = canon_self(&at.ty, &dat.ty, self_ty);
+                    }
+                    _ => {}
+                }
+            }
+            PathArguments::AngleBracketed(i)
+        }
+        (PathArguments::Parenthesized(i), PathArguments::Parenthesized(d))
+            if i.inputs.len() == d.inputs.len() =>
+        {
+            let mut i = i.clone();
+            for (t, dt) in i.inputs.iter_mut().zip(d.inputs.iter()) {
+                *t = canon_self(t, dt, self_ty);
+            }
+            if let (syn::ReturnType::Type(_, t), syn::ReturnType::Type(_, dt)) =
+                (&mut i.output, &d.output)
+            {
+                *t = Box::new(canon_self(t, dt, self_ty));
+            }
+            PathArguments::Parenthesized(i)
+        }
+        _ => impl_args.clone(),
+    }
+}
+
+/// [`canon_self`] through the trait bounds of a `dyn`/`impl Trait` type (bounds matched by position).
+fn canon_self_bounds(
+    bounds: &mut syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
+    decl: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
+    self_ty: &Type,
+) {
+    if bounds.len() != decl.len() {
+        return;
+    }
+    for (b, db) in bounds.iter_mut().zip(decl.iter()) {
+        if let (syn::TypeParamBound::Trait(tb), syn::TypeParamBound::Trait(dtb)) = (b, db) {
+            if tb.path.segments.len() != dtb.path.segments.len() {
+                continue;
+            }
+            for (seg, dseg) in tb.path.segments.iter_mut().zip(dtb.path.segments.iter()) {
+                seg.arguments = canon_self_args(&seg.arguments, &dseg.arguments, self_ty);
+            }
+        }
+    }
+}
+
+/// Are two types spelled identically? syn's `PartialEq` needs the `extra-traits` feature, which this
+/// crate deliberately does not enable, so compare rendered tokens: `A<T>` and `A < T >` both render
+/// as `A < T >`, and groups are stripped first so a macro-wrapped type still matches.
+fn same_spelling(a: &Type, b: &Type) -> bool {
+    strip_group(a).to_token_stream().to_string() == strip_group(b).to_token_stream().to_string()
+}
+
+/// The trait is `#[decycle] use`-imported, so its declaration is not available to canonicalize
+/// against ([`canonicalize_method_sig`]). Then a signature that spells the natural self type is
+/// *probably* a `Self` position written concretely, and would fail as E0053 on the generated
+/// terminator impl with rustc suggesting the user write `__ATerm_<nonce>`. Say what to do instead.
+///
+/// Skipped when the trait path itself mentions the self type (`impl Tr<A> for A`): there a `&A`
+/// parameter can be the trait's own type argument, which is *not* a `Self` position and must stay.
+fn check_concrete_self_spelling(
+    f: &syn::ImplItemFn,
+    self_ident: &Ident,
+    trait_path: &syn::Path,
+) -> syn::Result<()> {
+    let names: HashSet<String> = std::iter::once(self_ident.to_string()).collect();
+    if path_mentions(trait_path, &names) {
+        return Ok(());
+    }
+    let mut tys: Vec<&Type> = f
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|a| match a {
+            syn::FnArg::Typed(pt) => Some(&*pt.ty),
+            _ => None,
+        })
+        .collect();
+    if let ReturnType::Type(_, t) = &f.sig.output {
+        tys.push(t);
+    }
+    for ty in tys {
+        if type_mentions(ty, &names) {
+            return Err(syn::Error::new_spanned(
+                ty,
+                format!(
+                    "#[decycle(structural)]: this signature spells the concrete self type \
+                     `{self_ident}` where the trait's declaration may say `Self`, and the trait is \
+                     `use`-imported so decycle cannot check which it is. Spell `Self` here (the two \
+                     mean the same inside this impl, but only `Self` carries over to the generated \
+                     terminator impl), or move the trait declaration into this module.",
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Reject a **method-level** generic parameter, or method `where`-predicate, whose BOUND mentions
+/// `Self`.
+///
+/// The structural engine splits every method in two: the terminator's copy (where `Self` is
+/// `__ATerm`) and the `__run` decl carried into the local `__DecycleBody` trait, implemented for the
+/// natural type (where `Self` is `A`). A method's own generics are copied to both — so a bound like
+/// `F: Fn(&Self)` asks the single caller-supplied `F` to be both `Fn(&__ATerm)` and `Fn(&A)`, which
+/// nothing satisfies. Rejecting it here keeps that unprovable obligation from surfacing as a pile of
+/// E0277s naming `__DecycleBody_<nonce>` / `__ATerm_<nonce>`.
+///
+/// Only the *bounds* are examined: `where Self: Sized` (a very common method-level idiom) bounds
+/// `Self` rather than mentioning it in a bound, and works fine on both sides.
+fn reject_self_mentioning_method_bounds(sig: &syn::Signature, ctx: &ProjCtx) -> syn::Result<()> {
+    const MSG: &str = "#[decycle(structural)]: a method-level generic bound that mentions `Self` \
+                       (e.g. `F: Fn(&Self)`) is not supported — the method is emitted both on the \
+                       generated terminator (where `Self` is the terminator type) and, as the body \
+                       holder, for the natural type, so one `F` would have to satisfy the bound at \
+                       both. Take a concrete form the layout cast can reinterpret instead: \
+                       `fn(&Self)` or `&dyn Fn(&Self)` (or use the ranked engine, `#[decycle]`, \
+                       which supports the generic form).";
+    for p in &sig.generics.params {
+        if let GenericParam::Type(tp) = p {
+            if bounds_mention_self_resolved(&tp.bounds, ctx) {
+                return Err(syn::Error::new_spanned(p, MSG));
+            }
+        }
+    }
+    for pred in sig.generics.where_clause.iter().flat_map(|w| &w.predicates) {
+        if let WherePredicate::Type(pt) = pred {
+            if bounds_mention_self_resolved(&pt.bounds, ctx) {
+                return Err(syn::Error::new_spanned(pred, MSG));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// [`bounds_mention_self`], but a `Self::Assoc` projection is resolved first, so the answer is about
+/// what the bound MEANS: `F: Fn(&Self::Out)` mentions `Self` with `type Out = Self`, and does not
+/// with `type Out = i64`. A projection that cannot be resolved counts as mentioning `Self` (the
+/// bound would not compile on both sides either way, and this keeps the *bound* diagnostic — which
+/// names the real problem — rather than the projection one).
+fn bounds_mention_self_resolved(
+    bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
+    ctx: &ProjCtx,
+) -> bool {
+    if !bounds_mention_self(bounds) {
+        return false;
+    }
+    let mut resolved = bounds.clone();
+    match normalize_in_bounds(&mut resolved, ctx, 0) {
+        Ok(()) => bounds_mention_self(&resolved),
+        Err(_) => true,
+    }
 }
 
 /// True if `ty` contains an `impl Trait` node whose bounds mention `Self` (`impl Fn(&Self)`,
@@ -341,13 +686,21 @@ fn has_self_mentioning_impl_trait(ty: &Type) -> bool {
 /// result is cast back up to the Rec `Self`.
 fn rec_method(
     f: &syn::ImplItemFn,
-    natural: &Type,
-    reduced: &syn::Generics,
-    outer: &syn::Generics,
-    assoc_items: &[&ImplItem],
-    trait_path: &syn::Path,
-    nonce: u64,
+    decl_sig: Option<&syn::Signature>,
+    cx: &ImplCx,
 ) -> syn::Result<TokenStream> {
+    // Historical local names: the local `__DecycleBody` trait and impl are rendered from `local`
+    // (called `reduced` throughout this fn), and `body_trait_where` re-states the ENCLOSING impl's
+    // `reduced` predicates (called `outer`).
+    let ImplCx {
+        natural,
+        local: reduced,
+        reduced: outer,
+        assoc_items,
+        trait_path,
+        nonce,
+        ..
+    } = *cx;
     let attrs = &f.attrs;
     let vis = &f.vis;
     let ctx = ProjCtx::new(assoc_items, trait_path);
@@ -395,6 +748,16 @@ fn rec_method(
             }
         }
     }
+    // A method-level generic whose BOUND mentions `Self` (`fn apply<F: Fn(&Self)>`) cannot be
+    // carried across the split: the terminator's method needs `F: Fn(&__ATerm)` while the copied
+    // `__run` decl — implemented for the natural type — needs `F: Fn(&A)`, and no single `F` proves
+    // both. Reject it here, on the user's own bound, instead of emitting three E0277s that name
+    // `__DecycleBody`/`__ATerm`. The trait's own declaration is checked too, so an impl that spells
+    // the bound concretely (`F: Fn(&A)` for a declared `F: Fn(&Self)`) is caught just the same.
+    reject_self_mentioning_method_bounds(&f.sig, &ctx)?;
+    if let Some(d) = decl_sig {
+        reject_self_mentioning_method_bounds(d, &ctx)?;
+    }
     // Rewrite destructured / `mut` / `ref` params to fresh idents so the dispatch can forward them;
     // the original patterns are rebound at the top of the body. A `mut self` receiver's `mut` is
     // stripped the same way (it is a pattern, illegal in the bodiless `__run` decl) and returned so
@@ -439,10 +802,23 @@ fn rec_method(
     let trait_where = body_trait_where(outer);
     let use_g = wrap_angle(&params_use(reduced)); // `<Span, Token>` at the impl/call
 
-    // associated-item decls (for the local trait) and defs (for the local impl), so a `Self::Assoc`
+    // associated-TYPE decls (for the local trait) and defs (for the local impl), so a `Self::Assoc`
     // in the body resolves against the natural type.
-    let assoc_decls: Vec<TokenStream> = assoc_items.iter().map(|it| assoc_decl(it)).collect();
-    let assoc_defs: Vec<TokenStream> = assoc_items.iter().map(|it| it.to_token_stream()).collect();
+    //
+    // Associated CONSTS are deliberately NOT declared here. The body runs inside
+    // `impl __DecycleBody for A`, and `A` also implements the real trait in that same scope — so a
+    // `Self::K` naming a const declared by BOTH traits is ambiguous in the value namespace
+    // (`error[E0034]: multiple applicable items in scope`, one candidate being
+    // `__DecycleBody_<nonce>`). Leaving consts off the local trait leaves exactly one candidate, the
+    // real trait's, which is the one the user meant. The TYPE namespace has no such problem —
+    // `Self::Out` resolves with both traits in scope — so the type decls stay (and they are what
+    // `normalize_projections` reads).
+    let assoc_types: Vec<&&ImplItem> = assoc_items
+        .iter()
+        .filter(|it| matches!(it, ImplItem::Type(_)))
+        .collect();
+    let assoc_decls: Vec<TokenStream> = assoc_types.iter().map(|it| assoc_decl(it)).collect();
+    let assoc_defs: Vec<TokenStream> = assoc_types.iter().map(|it| it.to_token_stream()).collect();
 
     // dispatch: cast receiver + any Self-typed args into natural-space, forward the rest, call __run,
     // cast result up.
@@ -467,11 +843,17 @@ fn rec_method(
     // cover the copy holding the user's statements.
     let prop = crate::propagated_method_attrs(attrs);
     // This is the TERMINATOR (`__MTerm`) copy — an internal delegate, not the callable entry — so it
-    // must NOT carry symbol attrs (`#[no_mangle]` etc.); those stay on the natural impl (`nat_method`)
-    // so the requested symbol is produced exactly once.
-    let outer_attrs: Vec<&Attribute> = attrs.iter().filter(|a| !crate::is_symbol_attr(a)).collect();
+    // carries only the attrs meant to be replicated onto every copy (`crate::propagated_method_attrs`:
+    // `#[track_caller]`, lint levels, hints). Everything else stays on the natural impl
+    // (`nat_method`) and applies exactly once: a symbol attr (`#[no_mangle]`) would otherwise fight
+    // for the same fixed symbol, and — the reason this is not just `is_symbol_attr` — an arbitrary
+    // ATTRIBUTE MACRO would be expanded twice, once per copy. Double-expansion is not cosmetic: an
+    // attribute macro that emits a named item alongside the method fails outright (`E0407`), and
+    // `#[deprecated]` yields two `useless_deprecated` errors. The ranked engine keeps such attrs on a
+    // single copy for the same reason. (Same list as `prop`, deliberately: every attr that belongs
+    // on the body-holding `__run` belongs on the terminator frame between it and the caller.)
     Ok(quote! {
-        #inline #(#outer_attrs)* #vis #outer_sig {
+        #inline #(#prop)* #vis #outer_sig {
             trait #body_tr #trait_g : Sized #trait_where {
                 #(#assoc_decls)*
                 #run_sig ;
@@ -529,19 +911,17 @@ fn body_trait_where(outer: &syn::Generics) -> TokenStream {
     }
 }
 
-/// The trait-declaration form of an associated impl item: `type Out = i64;` → `type Out;`,
-/// `const N: usize = 3;` → `const N: usize;`.
+/// The trait-declaration form of an associated impl item: `type Out = i64;` → `type Out;`.
+///
+/// Associated CONSTS have no declaration form here on purpose — declaring one on the local
+/// `__DecycleBody` trait makes every `Self::K` in a body ambiguous against the real trait's own
+/// const (E0034). The caller filters to associated types before calling this.
 fn assoc_decl(item: &ImplItem) -> TokenStream {
     match item {
         ImplItem::Type(t) => {
             let id = &t.ident;
             let (ig, _, wg) = t.generics.split_for_impl();
             quote! { type #id #ig #wg ; }
-        }
-        ImplItem::Const(c) => {
-            let id = &c.ident;
-            let ty = &c.ty;
-            quote! { const #id : #ty ; }
         }
         _ => quote!(),
     }
@@ -562,13 +942,14 @@ fn inline_attr(attrs: &[Attribute]) -> TokenStream {
 
 /// Delegating method on the natural type: cast the receiver (if any) into `Rec`-space, call the Rec
 /// impl's trait method, and cast the result back.
-fn nat_method(
-    f: &syn::ImplItemFn,
-    closed_rec: &Type,
-    trait_path: &syn::Path,
-    assoc_items: &[&ImplItem],
-    nonce: u64,
-) -> syn::Result<TokenStream> {
+fn nat_method(f: &syn::ImplItemFn, cx: &ImplCx) -> syn::Result<TokenStream> {
+    let ImplCx {
+        term_ty: closed_rec,
+        trait_path,
+        assoc_items,
+        nonce,
+        ..
+    } = *cx;
     let attrs = &f.attrs;
     let vis = &f.vis;
     // Same projection context as the terminator side, so both classify `Self::Out` identically —
@@ -686,7 +1067,10 @@ fn dyn_fn_adapter(
             "#[decycle(structural)]: only `&dyn Fn(..)` trait objects mentioning `Self` can be \
              forwarded. `FnMut`/`FnOnce`, additional bounds such as `+ Send`, and user traits \
              mentioning `Self` would need a vtable for a trait that does not exist after `Self` \
-             is substituted. Use a generic parameter (`F: FnMut(&Self)`) instead.",
+             is substituted. Take a `&dyn Fn(&Self)` (rebuilt by coercion) or a `fn(&Self)` \
+             pointer instead — a method-level generic parameter does NOT work here, because its \
+             bound would mention `Self` and this engine emits the method on two different `Self` \
+             types. (The ranked engine, `#[decycle]`, supports the generic form.)",
         ));
     };
 
@@ -763,7 +1147,9 @@ fn forward_args(
                         "#[decycle(structural)]: a trait object mentioning `Self` in this position \
                          cannot be forwarded soundly (its vtable would name a different trait once \
                          `Self` is substituted). Only a direct `&dyn Fn(..)` argument is rebuilt by \
-                         coercion; use that, a `fn(..)` pointer, or a generic parameter instead.",
+                         coercion; use that or a `fn(..)` pointer. A method-level generic parameter \
+                         is NOT an alternative here — its bound would mention `Self`, which this \
+                         engine cannot carry to both copies of the method.",
                     ));
                 }
                 let dst = subst_self(&ty, target);

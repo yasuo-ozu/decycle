@@ -242,6 +242,13 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
         } else {
             config.allow_crate();
             config.allow_primitive();
+            // The standard prelude is in scope wherever the carrier macro is expanded, so its
+            // names need no interning — and without them here, type-leak hard-errors on any
+            // relative trait path, which `process_trait` turns into `use absolute path`. That
+            // rejected `fn f<T: Clone>(..)` on a standalone `#[decycle]` trait, while the
+            // identical trait inside a `#[decycle] mod` compiled fine. `allowed_paths = [..]`
+            // still replaces the whole set, exactly as before.
+            config.allow_std_prelude();
         }
         let ret = process_trait(
             &item,

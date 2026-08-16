@@ -1,0 +1,38 @@
+error: decycle: generic parameter `T` of #[decycle] trait `Ca` cannot have a default
+
+         = help: decycle re-spells every use of `Ca` with a synthesized rank argument inserted into the argument list the user WROTE, so each use site has to spell every parameter; a default lets a use site leave `T` out, and that expands to a rank-lowered path with too few arguments. Drop the `= u8` and write `T` at every use site.
+
+  --> tests/ui/ranked_trait_default_type_param.rs:11:18
+   |
+11 |     pub trait Ca<T = u8> {
+   |                  ^^^^^^
+
+error[E0275]: overflow evaluating the requirement `A: Ca`
+  --> tests/ui/ranked_trait_default_type_param.rs:22:9
+   |
+22 |         B: Cb,
+   |         ^^^^^
+   |
+note: required for `B` to implement `Cb`
+  --> tests/ui/ranked_trait_default_type_param.rs:32:10
+   |
+32 |     impl Cb for B
+   |          ^^     ^
+33 |     where
+34 |         A: Ca,
+   |            -- unsatisfied trait bound introduced here
+
+error[E0275]: overflow evaluating the requirement `B: Cb`
+  --> tests/ui/ranked_trait_default_type_param.rs:34:9
+   |
+34 |         A: Ca,
+   |         ^^^^^
+   |
+note: required for `A` to implement `Ca`
+  --> tests/ui/ranked_trait_default_type_param.rs:20:10
+   |
+20 |     impl Ca for A
+   |          ^^     ^
+21 |     where
+22 |         B: Cb,
+   |            -- unsatisfied trait bound introduced here

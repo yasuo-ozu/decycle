@@ -21,7 +21,6 @@ note: required for `R` to implement `Ev`
 22 |     where
 23 |         L: Ev,
    |            -- unsatisfied trait bound introduced here
-   = help: see issue #48214
 
 error[E0275]: overflow evaluating the requirement `R: Ev`
   --> tests/ui/track_caller_unbounded.rs:23:9
@@ -37,4 +36,3 @@ note: required for `L` to implement `Ev`
 15 |     where
 16 |         R: Ev,
    |            -- unsatisfied trait bound introduced here
-   = help: see issue #48214

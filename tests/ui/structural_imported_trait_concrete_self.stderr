@@ -1,0 +1,19 @@
+error: #[decycle(structural)]: this signature spells the concrete self type `A` where the trait's declaration may say `Self`, and the trait is `use`-imported so decycle cannot check which it is. Spell `Self` here (the two mean the same inside this impl, but only `Self` carries over to the generated terminator impl), or move the trait declaration into this module.
+  --> tests/ui/structural_imported_trait_concrete_self.rs:25:32
+   |
+25 |         fn merge(&self, other: &A) -> i64 {
+   |                                ^^
+
+error: cannot find attribute `decycle` in this scope
+  --> tests/ui/structural_imported_trait_concrete_self.rs:17:7
+   |
+17 |     #[decycle]
+   |       ^^^^^^^
+   |
+   = note: `decycle` is in scope, but it is a crate, not an attribute
+
+error[E0275]: overflow evaluating the requirement `A: Vis`
+  --> tests/ui/structural_imported_trait_concrete_self.rs:23:9
+   |
+23 |         A: Vis,
+   |         ^^^^^^

@@ -26,7 +26,6 @@ note: required for `B` to implement `Eval`
 52 |     where
 53 |         A: Eval,
    |            ---- unsatisfied trait bound introduced here
-   = help: see issue #48214
 
 error[E0275]: overflow evaluating the requirement `B: Eval`
   --> tests/ui/value_generic_growth_ranked.rs:53:9
@@ -42,4 +41,3 @@ note: required for `A` to implement `Eval`
 40 |     where
 41 |         B: Eval,
    |            ---- unsatisfied trait bound introduced here
-   = help: see issue #48214

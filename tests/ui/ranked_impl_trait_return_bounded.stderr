@@ -41,4 +41,3 @@ note: required for `A` to implement `Ca`
 20 |     where
 21 |         B: Cb,
    |            -- unsatisfied trait bound introduced here
-   = help: see issue #48214

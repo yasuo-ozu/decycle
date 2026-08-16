@@ -371,23 +371,32 @@ fn requalify_foreign_premises(
 /// "this impl's own self type", so substituting it in is semantics-preserving, unlike leaving
 /// the literal `Self` keyword (E0411 — "cannot find type `Self` in this scope").
 fn subst_bare_self_in_generics(generics: &Generics, self_ty: &Type) -> Generics {
-    struct BareSelfSubst<'a> {
-        self_ty: &'a Type,
-    }
-    impl syn::visit_mut::VisitMut for BareSelfSubst<'_> {
-        fn visit_type_mut(&mut self, ty: &mut Type) {
-            if let Type::Path(TypePath { qself: None, path }) = ty {
-                if path.is_ident("Self") {
-                    *ty = self.self_ty.clone();
-                    return;
-                }
-            }
-            syn::visit_mut::visit_type_mut(self, ty);
-        }
-    }
     let mut g = generics.clone();
     syn::visit_mut::VisitMut::visit_generics_mut(&mut BareSelfSubst { self_ty }, &mut g);
     g
+}
+
+struct BareSelfSubst<'a> {
+    self_ty: &'a Type,
+}
+impl syn::visit_mut::VisitMut for BareSelfSubst<'_> {
+    fn visit_type_mut(&mut self, ty: &mut Type) {
+        if let Type::Path(TypePath { qself: None, path }) = ty {
+            if path.is_ident("Self") {
+                *ty = self.self_ty.clone();
+                return;
+            }
+        }
+        syn::visit_mut::visit_type_mut(self, ty);
+    }
+}
+
+/// [`subst_bare_self_in_generics`] for a single type: every bare `Self` occurrence anywhere
+/// inside `ty` (`Self`, `Vec<Self>`, `(Self, u8)`) becomes `self_ty`.
+fn subst_bare_self_in_type(ty: &Type, self_ty: &Type) -> Type {
+    let mut t = ty.clone();
+    syn::visit_mut::VisitMut::visit_type_mut(&mut BareSelfSubst { self_ty }, &mut t);
+    t
 }
 
 fn emit_impl_items_leaf(
@@ -509,7 +518,7 @@ fn emit_impl_items_leaf(
                     let fp = fingerprint_expr(
                         decycle,
                         &quote!(Self),
-                        is_syntactically_unsized(&impl_.self_ty),
+                        impl_self_may_be_unsized(impl_),
                         &trait_.generics,
                         &self_targs,
                         Some(&sig.generics),
@@ -986,6 +995,76 @@ fn method_is_generic(sig: &Signature) -> bool {
         || sig_has_impl_trait_input(sig)
 }
 
+/// Can a re-entry registration for `sibling` — a GENERIC method of some `#[decycle]` trait — be
+/// named from inside the body of `current`?
+///
+/// A registration must spell the callee's method generics: both the marker key
+/// (`Mk<Target, .., M>`) and the `Re::<Target, .., M>` fn item are instantiated at them, and the
+/// fingerprint folds their layout. The registering scope holds exactly one set of method
+/// generics — `current`'s — so the answer is yes precisely when `sibling` declares the SAME ones:
+/// same order, same kinds, same idents, same bounds, same where-clause. That is the shape a cycle
+/// threading one generic method through its traits has (`Ca::step<T: Copy>` calling
+/// `Cb::step<T: Copy>`), and it is the case that used to hit the fail-closed lookup panic at
+/// `recurse_level = 1` — at level >= 2 the callee's own inductive frame runs first and rule 1
+/// registers it there, which is why the released tests (all at level 3) never saw this.
+///
+/// Everything else genuinely CANNOT be named and stays skipped:
+///
+/// * a differently-declared sibling (`cb<U: Clone>` reached from `ca<T: Copy>`) — even if the
+///   arity matched, `U`'s bounds are not `T`'s and the emitted `Re::<_, T>` would not compile;
+/// * a generic sibling reached from a NON-generic method (the common `recurse_level = 1`
+///   cross-trait case where the callee's type argument is chosen inside the user's own body) —
+///   nothing in scope names it, so the floor keeps its documented fail-closed panic;
+/// * an argument-position `impl Trait` on either side: it desugars to a fresh `ImplTrait{N}`
+///   parameter minted per impl copy, which no other scope can spell.
+///
+/// Any bound mentioning `Self` also disqualifies the sibling: its `Self` is the callee's, and
+/// `emit_reentry_items` projects it through the callee's own trait, so the caller cannot
+/// discharge it.
+fn sibling_method_generics_nameable(current: &Signature, sibling: &Signature) -> bool {
+    if sig_has_impl_trait_input(current) || sig_has_impl_trait_input(sibling) {
+        return false;
+    }
+    let nonlifetime = |sig: &Signature| -> Vec<String> {
+        sig.generics
+            .params
+            .iter()
+            .filter(|p| !matches!(p, GenericParam::Lifetime(_)))
+            .map(|p| param_decl(p, DeclBounds::Keep).to_string())
+            .collect()
+    };
+    if nonlifetime(current) != nonlifetime(sibling) {
+        return false;
+    }
+    let where_of = |sig: &Signature| -> String {
+        sig.generics
+            .where_clause
+            .as_ref()
+            .map(|wc| quote!(#wc).to_string())
+            .unwrap_or_default()
+    };
+    if where_of(current) != where_of(sibling) {
+        return false;
+    }
+    !generics_mention_self(&sibling.generics)
+}
+
+/// True iff `Self` appears anywhere in `generics` (a param bound or a where-predicate).
+fn generics_mention_self(generics: &Generics) -> bool {
+    struct Find(bool);
+    impl<'ast> syn::visit::Visit<'ast> for Find {
+        fn visit_path(&mut self, p: &'ast Path) {
+            if p.segments.first().is_some_and(|s| s.ident == "Self") {
+                self.0 = true;
+            }
+            syn::visit::visit_path(self, p);
+        }
+    }
+    let mut f = Find(false);
+    syn::visit::Visit::visit_generics(&mut f, generics);
+    f.0
+}
+
 // Per-param declaration rendering — `param_decl` with `DeclBounds::Unsized` (marker/alias generics:
 // type params get `?Sized`, F-M2) and `DeclBounds::Keep` (re-entry fn / ranked-trait generics:
 // bounds kept, defaults stripped) — lives in `crate::generics_fmt`, shared with the structural
@@ -1054,6 +1133,21 @@ impl syn::visit_mut::VisitMut for RenameLifetimes<'_> {
 /// `for<'a> B<'a>: Cb` (or `B: for<'a> Cb<'a>`) HRTB binder is fresh-renamed and carried on the
 /// returned `CyclicBound` so `build_shared_registrations` can declare it at the register-once
 /// fn instead of silently dropping it (which previously left `'a` undeclared → E0261).
+///
+/// The target is returned with every bare `Self` replaced by the impl's own self type. Inside
+/// the impl the two spell the same type, but every consumer of a `CyclicBound` lives OUTSIDE it:
+///
+/// * `reachable_side_bounds_ok` unifies the target against candidate impls' self types
+///   (`unify_impl_against_obligation`), and nothing ever unifies with the path `Self` — so a
+///   cyclic bound spelled `where Self: OtherTrait` failed the reachability check every time and
+///   `build_shared_registrations` silently dropped its cross-edge registration, leaving the
+///   callee's floor to hit the fail-closed "re-entry fn not registered" panic. The very same
+///   cycle spelled with the concrete type worked.
+/// * `emit_registration` splices the target into the FREE `__dcl_register_once_*` fn, which has
+///   no `Self` at all — so had the walk ever matched a `Self`-rooted target, the emitted
+///   `Mk<Self, ..>` / `Re::<Self, ..>` would have been E0411 ("cannot find type `Self` in this
+///   scope"). Substituting here fixes the reachability walk and that latent emission bug at
+///   once, since both read this one field.
 fn cyclic_where_bounds(
     impl_: &ItemImpl,
     replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
@@ -1095,7 +1189,9 @@ fn cyclic_where_bounds(
                         pt.lifetimes.iter().chain(tb.lifetimes.iter()),
                         &mut hr_counter,
                     );
-                    let mut target = pt.bounded_ty.clone();
+                    // `Self` means "this impl's self type" only INSIDE the impl; every consumer
+                    // of the returned target reads it from outside (see the doc comment).
+                    let mut target = subst_bare_self_in_type(&pt.bounded_ty, &impl_.self_ty);
                     if !rename.is_empty() {
                         syn::visit_mut::VisitMut::visit_type_mut(
                             &mut RenameLifetimes { rename: &rename },
@@ -1163,6 +1259,133 @@ fn is_syntactically_unsized(ty: &Type) -> bool {
         Type::Path(TypePath { qself: None, path }) => path.is_ident("str"),
         _ => false,
     }
+}
+
+/// The idents of `generics`' type params that are declared `?Sized` (inline or in the
+/// where-clause).
+fn maybe_unsized_type_params(generics: &Generics) -> std::collections::HashSet<Ident> {
+    generics
+        .params
+        .iter()
+        .filter_map(|p| match p {
+            GenericParam::Type(tp)
+                if type_param_is_maybe_unsized(tp, generics.where_clause.as_ref()) =>
+            {
+                Some(tp.ident.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// True iff `size_of::<ty>()` would fail to compile in a scope where `maybe_unsized` are the
+/// `?Sized` type params — i.e. `ty` is [`is_syntactically_unsized`] OR its sizedness rides on a
+/// `?Sized` parameter.
+///
+/// `is_syntactically_unsized` alone recognises only the three ground unsized spellings (`dyn`,
+/// `[T]`, `str`), so `impl<T: ?Sized> Ca for Wrap<T>` — ordinary Rust, and fine without the macro
+/// — reached [`fingerprint_expr`] with `target_is_unsized = false` and expanded to
+/// `size_of::<Self>()` on a `Self` that has no statically-known size: E0277 spanned at the
+/// attribute, with rustc helpfully suggesting the user drop `?Sized` from their own public API.
+///
+/// Deliberately an over-approximation for a parameterized path (`Box<T>` with `T: ?Sized` is in
+/// fact sized, but is reported here as possibly-unsized): being wrong this way only drops one
+/// layout fold from the key — which stays sound because EVERY site that keys the same floor
+/// computes the flag the same way (see `impl_self_may_be_unsized` /
+/// `bound_target_floor_is_unsized`) — whereas being wrong the other way is a hard compile error.
+fn type_may_be_unsized(ty: &Type, maybe_unsized: &std::collections::HashSet<Ident>) -> bool {
+    if is_syntactically_unsized(ty) {
+        return true;
+    }
+    match ty {
+        Type::Path(TypePath { qself: None, path }) => {
+            if let Some(seg) = path.segments.last() {
+                if path.segments.len() == 1
+                    && matches!(seg.arguments, PathArguments::None)
+                    && maybe_unsized.contains(&seg.ident)
+                {
+                    return true;
+                }
+                if let PathArguments::AngleBracketed(ab) = &seg.arguments {
+                    return ab.args.iter().any(|a| {
+                        matches!(a, GenericArgument::Type(t) if type_may_be_unsized(t, maybe_unsized))
+                    });
+                }
+            }
+            false
+        }
+        // A tuple is unsized exactly when its LAST element is.
+        Type::Tuple(t) => t
+            .elems
+            .last()
+            .is_some_and(|e| type_may_be_unsized(e, maybe_unsized)),
+        Type::Paren(p) => type_may_be_unsized(&p.elem, maybe_unsized),
+        Type::Group(g) => type_may_be_unsized(&g.elem, maybe_unsized),
+        // References, raw pointers, arrays, fn pointers … are sized whatever they point at.
+        _ => false,
+    }
+}
+
+/// The `target_is_unsized` flag for every key an impl's OWN floor participates in: its leaf's
+/// `lookup` and its rule-1 / C4 `Self` registrations. All three read the same impl, so they agree
+/// by construction.
+fn impl_self_may_be_unsized(impl_: &ItemImpl) -> bool {
+    type_may_be_unsized(&impl_.self_ty, &maybe_unsized_type_params(&impl_.generics))
+}
+
+/// The same flag for a rule-2 CROSS-EDGE registration, whose target (`Wrap<u32>`) is spelled in
+/// the registering impl but whose floor is emitted from whichever impl of `trait_ident` serves it
+/// (`impl<T: ?Sized> Ca for Wrap<T>`). The flag must be that impl's, not the spelling's: keyed on
+/// the spelling, a concrete `Wrap<u32>` would fold a layout the generic floor deliberately omits,
+/// and the two keys would never meet.
+///
+/// Falls back to the pre-existing spelling-only rule when no candidate impl matches (the caller
+/// then skips the registration anyway — `reachable_side_bounds_ok` needs a match) or when
+/// candidates disagree.
+fn bound_target_floor_is_unsized(
+    target: &Type,
+    trait_ident: &Ident,
+    targs: &[GenericArgument],
+    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+) -> bool {
+    let Some((_, _, impls)) = replacing_table.get(trait_ident) else {
+        return is_syntactically_unsized(target);
+    };
+    let mut decision: Option<bool> = None;
+    for cand in impls {
+        let pattern_vars: std::collections::HashSet<Ident> = cand
+            .generics
+            .params
+            .iter()
+            .filter_map(|p| match p {
+                GenericParam::Type(t) => Some(t.ident.clone()),
+                _ => None,
+            })
+            .collect();
+        let cand_targs = cand
+            .trait_
+            .as_ref()
+            .map(|(_, path, _)| nonlifetime_path_args(&path.segments.last().unwrap().arguments))
+            .unwrap_or_default();
+        if unify_impl_against_obligation(
+            &pattern_vars,
+            &cand.self_ty,
+            &cand_targs,
+            target,
+            targs,
+        )
+        .is_none()
+        {
+            continue;
+        }
+        let d = impl_self_may_be_unsized(cand);
+        match decision {
+            None => decision = Some(d),
+            Some(prev) if prev != d => return is_syntactically_unsized(target),
+            _ => {}
+        }
+    }
+    decision.unwrap_or_else(|| is_syntactically_unsized(target))
 }
 
 /// True iff every occurrence of `s_ident` among `tys` is the IMMEDIATE referent of a `&`/`&mut`
@@ -1261,6 +1484,11 @@ pub fn fingerprint_expr(
         .iter()
         .filter(|p| !matches!(p, GenericParam::Lifetime(_)))
         .collect();
+    // The zip is total because a `#[decycle]` trait may not declare a parameter DEFAULT
+    // (`check_no_defaulted_trait_generics` rejects that up front), so every use site has to write
+    // every argument. Were a default allowed, a use site could omit its argument and this loop
+    // would silently fold fewer than the trait declares — two instantiations differing only in
+    // the omitted argument would then share a registry key.
     for (param, arg) in tparams.iter().zip(targs.iter()) {
         match (param, arg) {
             (GenericParam::Type(tp), GenericArgument::Type(t))
@@ -1601,6 +1829,12 @@ fn format_side_bound(bt: &Type, tb: &TraitBound, subst: Option<&HashMap<Ident, T
 /// (`remove_cyclic_bounds` already computes exactly that split) and optionally substituted —
 /// used both for the registering impl's own available facts (`subst = None`) and, through a
 /// reached impl's unification, for what that reached impl needs (`subst = Some(..)`).
+///
+/// A RELAXED bound (`T: ?Sized`) is not a predicate at all — it withdraws the implicit `Sized`
+/// requirement rather than adding one — so it is skipped on both sides. Counting it as "needed"
+/// made a reached `impl<T: ?Sized> Ca for Wrap<T>` demand a literal `u32 : ?Sized` from the
+/// registering impl (which of course states no such thing), so every `?Sized` impl in a cycle
+/// silently lost all of its registrations.
 fn side_predicate_strings(
     generics: &Generics,
     replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
@@ -1611,6 +1845,7 @@ fn side_predicate_strings(
         Some(s) => apply_type_subst(ty, s),
         None => ty.clone(),
     };
+    let is_relaxed = |tb: &TraitBound| matches!(tb.modifier, TraitBoundModifier::Maybe(_));
     let mut out = Vec::new();
     for p in &g.params {
         if let GenericParam::Type(tp) = p {
@@ -1620,6 +1855,9 @@ fn side_predicate_strings(
             }));
             for b in &tp.bounds {
                 if let TypeParamBound::Trait(tb) = b {
+                    if is_relaxed(tb) {
+                        continue;
+                    }
                     out.push(format_side_bound(&bt, tb, subst));
                 }
             }
@@ -1631,6 +1869,9 @@ fn side_predicate_strings(
                 let bt = sub(&pt.bounded_ty);
                 for b in &pt.bounds {
                     if let TypeParamBound::Trait(tb) = b {
+                        if is_relaxed(tb) {
+                            continue;
+                        }
                         out.push(format_side_bound(&bt, tb, subst));
                     }
                 }
@@ -2379,7 +2620,7 @@ fn build_self_registrations(
             .unwrap()
             .arguments,
     );
-    let self_unsized = is_syntactically_unsized(&impl_.self_ty);
+    let self_unsized = impl_self_may_be_unsized(impl_);
     let mut out = TokenStream::new();
     let current_margs = type_const_idents(&current_sig.generics);
     let fp = fingerprint_expr(
@@ -2402,16 +2643,28 @@ fn build_self_registrations(
     ));
     for item in &trait_.items {
         let TraitItem::Fn(tf) = item else { continue };
-        if tf.sig.ident == current_sig.ident || method_is_generic(&tf.sig) {
+        if tf.sig.ident == current_sig.ident {
             continue;
         }
+        // A generic sibling is registered when — and only when — this method's own generics
+        // name its (`sibling_method_generics_nameable`); otherwise there is nothing in scope to
+        // instantiate `Mk`/`Re` at and the sibling keeps the fail-closed lookup panic.
+        let sibling_generics = if method_is_generic(&tf.sig) {
+            if !sibling_method_generics_nameable(current_sig, &tf.sig) {
+                continue;
+            }
+            Some(&tf.sig.generics)
+        } else {
+            None
+        };
+        let margs = sibling_generics.map(type_const_idents).unwrap_or_default();
         let fp = fingerprint_expr(
             decycle,
             &quote!(Self),
             self_unsized,
             &trait_.generics,
             &self_targs,
-            None,
+            sibling_generics,
         );
         out.extend(emit_registration(
             decycle,
@@ -2420,7 +2673,7 @@ fn build_self_registrations(
             &tf.sig.ident,
             &quote!(Self),
             &self_targs,
-            &[],
+            &margs,
             fp,
         ));
     }
@@ -2494,10 +2747,15 @@ fn build_shared_registrations(
                        // but keeping the sets aligned avoids a stray param on a no-op fn)
         }
         binders.extend(cb.binder.iter().cloned());
-        let target_unsized = is_syntactically_unsized(&cb.target);
+        let target_unsized =
+            bound_target_floor_is_unsized(&cb.target, &cb.trait_ident, &cb.targs, replacing_table);
         let target_tokens = quote!(#{&cb.target});
         for item in &sibling_trait.items {
             let TraitItem::Fn(tf) = item else { continue };
+            // A GENERIC sibling cannot be instantiated here: this fn is shared by every method
+            // of the impl and declares only the impl's own generics, so it has no way to spell
+            // the callee's method type arguments. It is registered instead from the prologue of
+            // whichever method DOES name them — `build_cross_edge_generic_registrations`.
             if method_is_generic(&tf.sig) {
                 continue;
             }
@@ -2522,6 +2780,88 @@ fn build_shared_registrations(
         }
     }
     (out, binders)
+}
+
+/// Rule 2, for the GENERIC methods `build_shared_registrations` has to leave out.
+///
+/// Same bounds, same reachability gate, same fingerprint recipe — the only difference is WHERE
+/// the statement lands. A generic method's registration has to name the callee's method type
+/// arguments, and the one scope that holds any is the body of the method currently descending,
+/// so this is emitted INLINE in each method's prologue (like rule 1) rather than in the shared
+/// per-impl `__dcl_register_once_*` fn. `sibling_method_generics_nameable` decides which
+/// siblings that scope can actually spell; the rest keep the fail-closed lookup panic.
+///
+/// Without this, a cross edge to a generic cyclic method had NO rule-2 registration at all, so at
+/// `recurse_level = 1` — where the callee's own inductive frame never runs, and with it rule 1's
+/// registration of that method — its floor always panicked. The identical cycle with a
+/// non-generic method has always worked.
+///
+/// An HRTB-bound target (`for<'a> B<'a>: Cb`) is skipped: its fresh binder lifetimes are declared
+/// on the register-once fn's own generics (C1), which a method body has no equivalent of.
+fn build_cross_edge_generic_registrations(
+    impl_: &ItemImpl,
+    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+    current_sig: &Signature,
+    decycle: &Path,
+) -> TokenStream {
+    let mut out = TokenStream::new();
+    if !method_is_generic(current_sig) {
+        return out; // nothing in scope names a callee's method generics
+    }
+    let rt = quote!(#{name!("ranked_traits")});
+    for cb in cyclic_where_bounds(impl_, replacing_table) {
+        let Some((sibling_trait, _, _)) = replacing_table.get(&cb.trait_ident) else {
+            continue;
+        };
+        if !cb.binder.is_empty() {
+            continue;
+        }
+        let generic_siblings: Vec<&TraitItemFn> = sibling_trait
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                TraitItem::Fn(tf)
+                    if method_is_generic(&tf.sig)
+                        && sibling_method_generics_nameable(current_sig, &tf.sig) =>
+                {
+                    Some(tf)
+                }
+                _ => None,
+            })
+            .collect();
+        if generic_siblings.is_empty() {
+            continue; // don't pay for the reachability walk when nothing would be emitted
+        }
+        if !reachable_side_bounds_ok(impl_, &cb.target, &cb.trait_ident, &cb.targs, replacing_table)
+        {
+            continue;
+        }
+        let target_unsized =
+            bound_target_floor_is_unsized(&cb.target, &cb.trait_ident, &cb.targs, replacing_table);
+        let target_tokens = quote!(#{&cb.target});
+        for tf in generic_siblings {
+            let margs = type_const_idents(&tf.sig.generics);
+            let fp = fingerprint_expr(
+                decycle,
+                &target_tokens,
+                target_unsized,
+                &sibling_trait.generics,
+                &cb.targs,
+                Some(&tf.sig.generics),
+            );
+            out.extend(emit_registration(
+                decycle,
+                &rt,
+                &cb.trait_ident,
+                &tf.sig.ident,
+                &target_tokens,
+                &cb.targs,
+                &margs,
+                fp,
+            ));
+        }
+    }
+    out
 }
 
 fn parse_comma_separated<T: Parse>(input: ParseStream) -> Result<Vec<T>> {
@@ -2631,12 +2971,11 @@ fn reentry_fn_name(trait_ident: &Ident, method_ident: &Ident) -> Ident {
     name!("__Re_{}_{}", trait_ident, method_ident)
 }
 
-/// The erased fn-pointer type-alias ident (`__Fp_<Trait>_<method><suffix>`). Exposed for
-/// completeness; only decycle's own floors ever transmute through it.
-#[cfg(test)]
-fn reentry_alias_name(trait_ident: &Ident, method_ident: &Ident) -> Ident {
-    name!("__Fp_{}_{}", trait_ident, method_ident)
-}
+// The erased fn-pointer type-alias ident (`__Fp_<Trait>_<method><suffix>`) is minted inline in
+// `emit_reentry_items`/`emit_impl_items_leaf`. There is deliberately no `reentry_alias_name`
+// accessor: nothing outside those two emission sites may name the alias (only decycle's own
+// floors transmute through it), and a `#[cfg(test)]` accessor that no test called made
+// `cargo clippy --all-targets -- -D warnings` fail on the `lib test` target ("never used").
 
 /// A caller-supplied ranking rule for an indirect / projection cross-edge that decycle's plain scan
 /// can't rank on its own.
@@ -3045,6 +3384,54 @@ fn check_assoc_type_self(
     }
 }
 
+/// A DEFAULT on a `#[decycle]` trait's own generic parameter (`trait Ca<T = u8>`) is rejected up
+/// front.
+///
+/// Every stage below assumes a use site's WRITTEN argument list lines up one-for-one with the
+/// trait's declared parameters:
+///
+/// * the ranked trait declaration renders its params with `param_decl(_, DeclBounds::Keep)`,
+///   which strips defaults, while every use site (the leaf's `XxxRanked<(), ..>` header, the
+///   inductive `Self: XxxRanked<Rank, ..>` bound, the Final impl's delegation path) reproduces the
+///   impl's written arguments and merely inserts the rank. So `impl Ca for A` — legal Rust,
+///   leaning on the default — expands to `CaRanked<Rank>` against a two-parameter trait: an E0107
+///   cascade naming decycle's own generated internals (`Rank8909…`, the `__Mk`/`__Fp` marker and
+///   alias), which no user can act on.
+/// * `fingerprint_expr` zips the declared params against the written args, silently folding only
+///   as many as were written — so two instantiations differing only in an omitted defaulted
+///   argument would share a registry key.
+///
+/// Carrying defaults through would mean padding every trait-path argument list decycle can see
+/// (impl headers, where-predicates, `impl Trait` bounds, supertraits, and paths inside user
+/// bodies) — the last of which decycle deliberately never reads. Rejecting the declaration is the
+/// honest boundary; the workaround is one line (drop the default, spell the argument).
+fn check_no_defaulted_trait_generics(
+    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+) {
+    for (trait_, _, _) in replacing_table.values() {
+        for param in &trait_.generics.params {
+            let (ident, default) = match param {
+                GenericParam::Type(tp) => (&tp.ident, tp.default.as_ref().map(|d| quote!(#d))),
+                GenericParam::Const(cp) => (&cp.ident, cp.default.as_ref().map(|d| quote!(#d))),
+                GenericParam::Lifetime(_) => continue,
+            };
+            if let Some(default) = default {
+                abort!(
+                    param,
+                    "decycle: generic parameter `{}` of #[decycle] trait `{}` cannot have a default",
+                    ident,
+                    &trait_.ident;
+                    help = "decycle re-spells every use of `{}` with a synthesized rank argument inserted into the argument list the user WROTE, so each use site has to spell every parameter; a default lets a use site leave `{}` out, and that expands to a rank-lowered path with too few arguments. Drop the `= {}` and write `{}` at every use site.",
+                    &trait_.ident,
+                    ident,
+                    default,
+                    ident
+                );
+            }
+        }
+    }
+}
+
 /// A `#[decycle]` trait listed as a supertrait of ANOTHER `#[decycle]` trait — both in the
 /// same `replacing_table` batch — makes the ranked-trait definitions mutually referential
 /// in a way the rank-rewriting scheme can't discharge (E0283 at the use site: the
@@ -3208,6 +3595,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
 
     check_assoc_type_self(&replacing_table);
     check_no_decycle_supertraits(&replacing_table);
+    check_no_defaulted_trait_generics(&replacing_table);
 
     // C2: enroll each foreign-typed but in-module-impl'd concrete impl (e.g.
     // `impl __UnparseDyn for Group<Substruct,O,C>`) into its trait's ranked set. The
@@ -3554,6 +3942,17 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                                         rule1_ok,
                                         &decycle_path,
                                     );
+                                    // Rule 2 for GENERIC cyclic methods: the shared
+                                    // register-once fn below declares only the impl's own
+                                    // generics, so a callee's method type arguments can only be
+                                    // named here, in the body of the method that holds them.
+                                    let rule2_generic_regs =
+                                        build_cross_edge_generic_registrations(
+                                            impl_,
+                                            &replacing_table,
+                                            sig,
+                                            &decycle_path,
+                                        );
                                     // Open a registration scope FIRST and hold it for the rest
                                     // of the body: everything registered below is rolled back
                                     // when this frame exits (including on unwind), so a nested
@@ -3566,6 +3965,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                                         {
                                             let #scope_guard = #decycle_path::__reentry::scope();
                                             #rule1_regs
+                                            #rule2_generic_regs
                                             #register_once_fn
                                             #(if !call_targs.is_empty()) { ::<#(#call_targs),*> }
                                             ();

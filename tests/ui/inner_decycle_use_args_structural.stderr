@@ -1,0 +1,46 @@
+error: #[decycle] takes no arguments on an item inside a #[decycle] module
+
+         = help: engine options (`structural`, `recurse_level`, `support_infinite_cycle`) belong on the enclosing `#[decycle] mod`; trait options (`marker`, `alter_macro_name`, `allowed_paths`) apply only to a `#[decycle]` trait declared outside such a module
+
+  --> tests/ui/inner_decycle_use_args_structural.rs:14:15
+   |
+14 |     #[decycle(marker = ::nope::Marker)]
+   |               ^^^^^^
+
+error: cannot find attribute `decycle` in this scope
+  --> tests/ui/inner_decycle_use_args_structural.rs:14:7
+   |
+14 |     #[decycle(marker = ::nope::Marker)]
+   |       ^^^^^^^
+   |
+   = note: `decycle` is in scope, but it is a crate, not an attribute
+
+error[E0275]: overflow evaluating the requirement `A: Ev`
+  --> tests/ui/inner_decycle_use_args_structural.rs:22:9
+   |
+22 |         B: Ev,
+   |         ^^^^^
+   |
+note: required for `B` to implement `Ev`
+  --> tests/ui/inner_decycle_use_args_structural.rs:29:10
+   |
+29 |     impl Ev for B
+   |          ^^     ^
+30 |     where
+31 |         A: Ev,
+   |            -- unsatisfied trait bound introduced here
+
+error[E0275]: overflow evaluating the requirement `B: Ev`
+  --> tests/ui/inner_decycle_use_args_structural.rs:31:9
+   |
+31 |         A: Ev,
+   |         ^^^^^
+   |
+note: required for `A` to implement `Ev`
+  --> tests/ui/inner_decycle_use_args_structural.rs:20:10
+   |
+20 |     impl Ev for A
+   |          ^^     ^
+21 |     where
+22 |         B: Ev,
+   |            -- unsatisfied trait bound introduced here

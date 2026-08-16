@@ -25,6 +25,40 @@ pub fn type_head_ident(ty: &Type) -> Option<Ident> {
     }
 }
 
+/// The head ident of a type, but **only** when the type is spelled as a module-local item — a bare
+/// single-segment path, or its no-op `self::`-qualified form.
+///
+/// This is [`type_head_ident`] with [`path_names_local_ident`]'s locality rule folded in, for the
+/// places that compare a head against a set of the *processed module's own* idents. Using the
+/// last segment there confuses `crate::other::B` with the local `B`: a foreign type would join a
+/// sibling's premise group (`sharing_sources`), or pass the "this bound is rank-lowerable" check
+/// (`validate_impl_where_bounds`, `peel`) and get rank-lowered into a `TrRanked<…>` wall.
+pub fn local_type_head_ident(ty: &Type) -> Option<Ident> {
+    let Type::Path(TypePath { qself: None, path }) = ty else {
+        return None;
+    };
+    let mut probe = path.clone();
+    strip_leading_self(&mut probe);
+    (probe.segments.len() == 1 && probe.leading_colon.is_none())
+        .then(|| probe.segments[0].ident.clone())
+}
+
+/// `ident`'s spelling with any raw-identifier prefix removed: `r#loop` → `loop`.
+///
+/// Every generated name in this crate is built by interpolating user idents into a `format!` and
+/// handing the result to `Ident::new`, which **panics** on a `#` — so a raw identifier anywhere in
+/// the input (`struct r#loop`, `mod r#match`) turned into a bare, span-less proc-macro panic
+/// (`"__DecycleNat_r#loop_m" is not a valid identifier`) on perfectly legal code. The generated
+/// names only need to be unique and deterministic, and dropping the two-character prefix keeps
+/// both: `r#loop` and `loop` cannot co-exist as one module's items in the first place.
+pub fn unraw(ident: &Ident) -> String {
+    let name = ident.to_string();
+    match name.strip_prefix("r#") {
+        Some(stripped) => stripped.to_owned(),
+        None => name,
+    }
+}
+
 /// Is `path` **depth-fragile** — i.e. does its meaning change when the item carrying it is re-emitted
 /// inside a deeper module? Only `super::`/`self::`-rooted paths are: an absolute (`::a::b`) or
 /// `crate::`-rooted path denotes the same item at any depth.

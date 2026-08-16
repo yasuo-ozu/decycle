@@ -120,19 +120,63 @@ pub(crate) fn randomize_impl_generics(
     renamer
 }
 
-/// Recognize a `#[decycle]` attribute on an inner item — the bare `#[decycle]` or the two-segment
-/// `#[<crate>::decycle]` form, where `<crate>` is the decycle crate name *as passed to the macro*
-/// (`decycle_crate` — the leading segment of the `decycle = …` path argument, default `decycle`).
+/// Does `attr`'s PATH name decycle — the bare `#[decycle]` or the two-segment `#[<crate>::decycle]`
+/// form, where `<crate>` is the decycle crate name *as passed to the macro* (`decycle_crate` — the
+/// leading segment of the `decycle = …` path argument, default `decycle`)?
+///
 /// We deliberately do NOT read the consumer's `Cargo.toml` to discover a dependency rename: a renamed
 /// decycle must be named explicitly via `#[decycle(decycle = ::my_rename)]`, and the two-segment inner
 /// form is matched against that name. (Dropping the manifest read removes the `toml` dependency and
 /// lowers the crate's MSRV.)
-fn is_decycle_attribute(attr: &Attribute, decycle_crate: &Ident) -> bool {
+///
+/// Arguments are not inspected. Everything that *acts* on the marker goes through
+/// [`is_decycle_attribute`], which rejects them; this bare predicate exists for the read-only
+/// [`analysis`] module, whose whole contract is to inspect a module without diagnosing it — and
+/// which, unlike the engines, is routinely called outside a `#[proc_macro_error]` entry point,
+/// where `abort!` could only panic.
+fn names_decycle_attribute(attr: &Attribute, decycle_crate: &Ident) -> bool {
     let path = attr.path();
     path.is_ident("decycle")
         || (path.segments.len() == 2
             && (path.segments[0].ident == "decycle" || &path.segments[0].ident == decycle_crate)
             && path.segments[1].ident == "decycle")
+}
+
+/// Recognize a `#[decycle]` marker on an INNER item (a trait, a trait alias, a `use`, a nested
+/// module) — and reject any argument list it carries.
+///
+/// The inner marker is a marker, nothing more: every knob is read from the attribute on the
+/// enclosing `mod` (`structural`, `recurse_level`, `support_infinite_cycle`) or belongs to a
+/// `#[decycle]` trait declared OUTSIDE such a module (`marker`, `alter_macro_name`,
+/// `allowed_paths`). Arguments written here used to be dropped on the floor, silently — including
+/// the ones that are hard errors at the top level. The worst of them was `#[decycle(structural)]`
+/// written on the inner trait instead of on the module: the user asked for the structural engine,
+/// got no diagnostic, and was quietly given the ranked one.
+///
+/// The rejection lives HERE, at the predicate, so it covers every consumer: both engines' marker
+/// scans (`ranked::process_module`, `structural::collect_decycle_traits`) and the nested-module
+/// check. `#[decycle()]` — an empty list — is accepted, being no argument at all.
+fn is_decycle_attribute(attr: &Attribute, decycle_crate: &Ident) -> bool {
+    if !names_decycle_attribute(attr, decycle_crate) {
+        return false;
+    }
+    use syn::spanned::Spanned;
+    match &attr.meta {
+        Meta::Path(_) => {}
+        Meta::List(list) if list.tokens.is_empty() => {}
+        Meta::List(list) => reject_inner_decycle_args(list.tokens.span()),
+        Meta::NameValue(nv) => reject_inner_decycle_args(nv.value.span()),
+    }
+    true
+}
+
+/// The abort for [`is_decycle_attribute`], split out so the diagnostic is written once.
+fn reject_inner_decycle_args(args: proc_macro2::Span) -> ! {
+    proc_macro_error::abort!(
+        args,
+        "#[decycle] takes no arguments on an item inside a #[decycle] module";
+        hint = "engine options (`structural`, `recurse_level`, `support_infinite_cycle`) belong on the enclosing `#[decycle] mod`; trait options (`marker`, `alter_macro_name`, `allowed_paths`) apply only to a `#[decycle]` trait declared outside such a module"
+    )
 }
 
 fn ident_to_path(ident: &Ident) -> Path {

@@ -46,7 +46,6 @@ note: required for `B` to implement `Cb`
 35 |     where
 36 |         A: Ca,
    |            -- unsatisfied trait bound introduced here
-   = help: see issue #48214
 
 error[E0275]: overflow evaluating the requirement `B: Cb`
   --> tests/ui/fn_sugar_bound.rs:36:9
@@ -62,4 +61,3 @@ note: required for `A` to implement `Ca`
 23 |     where
 24 |         B: Cb(usize) -> usize,
    |            ------------------ unsatisfied trait bound introduced here
-   = help: see issue #48214

@@ -1,0 +1,38 @@
+error: decycle: generic parameter `N` of #[decycle] trait `Ca` cannot have a default
+
+         = help: decycle re-spells every use of `Ca` with a synthesized rank argument inserted into the argument list the user WROTE, so each use site has to spell every parameter; a default lets a use site leave `N` out, and that expands to a rank-lowered path with too few arguments. Drop the `= 4` and write `N` at every use site.
+
+ --> tests/ui/ranked_trait_default_const_param.rs:8:18
+  |
+8 |     pub trait Ca<const N: usize = 4> {
+  |                  ^^^^^^^^^^^^^^^^^^
+
+error[E0275]: overflow evaluating the requirement `A: Ca`
+  --> tests/ui/ranked_trait_default_const_param.rs:19:9
+   |
+19 |         B: Cb,
+   |         ^^^^^
+   |
+note: required for `B` to implement `Cb`
+  --> tests/ui/ranked_trait_default_const_param.rs:29:10
+   |
+29 |     impl Cb for B
+   |          ^^     ^
+30 |     where
+31 |         A: Ca<4>,
+   |            ----- unsatisfied trait bound introduced here
+
+error[E0275]: overflow evaluating the requirement `B: Cb`
+  --> tests/ui/ranked_trait_default_const_param.rs:31:9
+   |
+31 |         A: Ca<4>,
+   |         ^^^^^^^^
+   |
+note: required for `A` to implement `Ca`
+  --> tests/ui/ranked_trait_default_const_param.rs:17:10
+   |
+17 |     impl Ca<4> for A
+   |          ^^^^^     ^
+18 |     where
+19 |         B: Cb,
+   |            -- unsatisfied trait bound introduced here

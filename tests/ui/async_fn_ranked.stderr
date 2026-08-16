@@ -8,10 +8,10 @@ error: decycle: `async fn` in method `ev` of a #[decycle] cycle is not supported
    |         ^^^^^
 
 error[E0275]: overflow evaluating the requirement `A: Ev`
-  --> tests/ui/async_fn_ranked.rs:18:9
+  --> tests/ui/async_fn_ranked.rs:18:43
    |
 18 |         async fn ev(&self, depth: u64) -> u64 {
-   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                                           ^^^
    |
 note: required for `B` to implement `Ev`
   --> tests/ui/async_fn_ranked.rs:26:10
@@ -28,10 +28,10 @@ note: required by a bound in `<A as Ev>`
    |            ^^ required by this bound in `<A as Ev>`
 
 error[E0275]: overflow evaluating the requirement `B: Ev`
-  --> tests/ui/async_fn_ranked.rs:30:9
+  --> tests/ui/async_fn_ranked.rs:30:43
    |
 30 |         async fn ev(&self, depth: u64) -> u64 {
-   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                                           ^^^
    |
 note: required for `A` to implement `Ev`
   --> tests/ui/async_fn_ranked.rs:14:10

@@ -24,7 +24,6 @@ note: required for `B` to implement `m::Loop`
 28 |     where
 29 |         A: Loop,
    |            ---- unsatisfied trait bound introduced here
-   = help: see issue #48214
 
 error[E0275]: overflow evaluating the requirement `B: m::Loop`
   --> tests/ui/unsupported_impl_item.rs:29:9
@@ -40,4 +39,3 @@ note: required for `A` to implement `m::Loop`
 15 |     where
 16 |         B: Loop,
    |            ---- unsatisfied trait bound introduced here
-   = help: see issue #48214

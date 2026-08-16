@@ -1,0 +1,19 @@
+error: #[decycle(structural)]: a method-level generic bound that mentions `Self` (e.g. `F: Fn(&Self)`) is not supported — the method is emitted both on the generated terminator (where `Self` is the terminator type) and, as the body holder, for the natural type, so one `F` would have to satisfy the bound at both. Take a concrete form the layout cast can reinterpret instead: `fn(&Self)` or `&dyn Fn(&Self)` (or use the ranked engine, `#[decycle]`, which supports the generic form).
+  --> tests/ui/structural_method_where_self_bound.rs:17:13
+   |
+17 |             F: Fn(&Self) -> i64;
+   |             ^^^^^^^^^^^^^^^^^^^
+
+error: cannot find attribute `decycle` in this scope
+  --> tests/ui/structural_method_where_self_bound.rs:13:7
+   |
+13 |     #[decycle]
+   |       ^^^^^^^
+   |
+   = note: `decycle` is in scope, but it is a crate, not an attribute
+
+error[E0275]: overflow evaluating the requirement `A: Vis`
+  --> tests/ui/structural_method_where_self_bound.rs:25:9
+   |
+25 |         A: Vis,
+   |         ^^^^^^

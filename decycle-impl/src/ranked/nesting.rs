@@ -26,6 +26,7 @@
 //! diagnostics that mention one are stable enough to match in a golden test.
 
 use proc_macro2::{Group, Ident, Spacing, TokenStream, TokenTree};
+use proc_macro_error::abort;
 use syn::spanned::Spanned;
 use std::collections::HashSet;
 use syn::visit_mut::VisitMut;
@@ -56,7 +57,14 @@ pub(crate) fn defuse_nesting(
     let aliases: Vec<(String, String)> = heads
         .iter()
         .map(|head| {
-            let name = format!("__DecycleNat_{head}_{module_ident}");
+            // `unraw`, not the `Display` spelling: `Ident::new` panics on the `#` of a raw
+            // identifier, so `struct r#loop` used to blow the macro up with an unspanned
+            // `"__DecycleNat_r#loop_m" is not a valid identifier`.
+            let name = format!(
+                "__DecycleNat_{}_{}",
+                crate::helper::unraw(head),
+                crate::helper::unraw(module_ident)
+            );
             let alias = Ident::new(&name, head.span());
             items.push(syn::parse_quote! {
                 #[allow(non_camel_case_types, unused_imports)]
@@ -84,7 +92,7 @@ pub(crate) fn defuse_nesting(
     // resolves a method call.
     let mut lifted: Vec<(Ident, Path)> = Vec::new();
     let rel_mod = Ident::new(
-        &format!("__DecycleRelMod_{module_ident}"),
+        &format!("__DecycleRelMod_{}", crate::helper::unraw(module_ident)),
         module_ident.span(),
     );
     for im in adopted.iter_mut() {
@@ -371,10 +379,10 @@ impl AliasHeads<'_> {
 ///   `segments`, so collapsing the path to a single segment corrupts the syntax tree. The trait
 ///   sub-path before `as` is an importable item though, and is lifted on its own — a re-emitted
 ///   body's `<String as super::x::Tr>::f(..)` needs exactly that.
-/// - **plain expression paths.** A body path can name things `use` cannot import (`super::x::Tr::f`
-///   ends in an associated fn), so no alias can be bound for the general case; only types, trait
-///   bounds, and qualified-path trait references are rewritten, and a plain body path is left to
-///   resolve normally.
+///
+/// A path in **value position** (an expression, a struct literal, a pattern) is lifted too, but only
+/// by its two-segment PREFIX — see [`LiftRelative::lift_value_path`]. Leaving those "to resolve
+/// normally" was the one silent-wrong case in this file: they do resolve, to a *different* item.
 struct LiftRelative<'a> {
     lifted: &'a mut Vec<(Ident, Path)>,
     cyclic_traits: &'a HashSet<Ident>,
@@ -411,7 +419,7 @@ impl LiftRelative<'_> {
                     &format!(
                         "__DecycleRelPath_{}_{}",
                         self.lifted.len(),
-                        self.module_ident
+                        crate::helper::unraw(self.module_ident)
                     ),
                     span,
                 );
@@ -444,6 +452,48 @@ impl LiftRelative<'_> {
     /// deliberately names the original, un-ranked trait and is lifted like any other premise.
     fn spells_cycle_edge(&self, path: &Path) -> bool {
         crate::helper::path_names_local_ident(path, self.cyclic_traits)
+    }
+
+    /// Lift a path written in **value position** — an expression, a struct literal, or a pattern.
+    ///
+    /// Only the two-segment PREFIX (`super::X` / `self::X`) is bound to an alias; everything after
+    /// it rides along unchanged. That is what makes this work where lifting the whole path cannot:
+    /// a value path may end in something `use` is unable to import (`super::x::Tr::f` ends in an
+    /// associated fn, `super::Type::CONST` in an associated const), but its second segment always
+    /// names an item that `use` CAN import — a module, a type, an enum, a function, a constant —
+    /// because that is the only thing a `super::`-rooted path's first named segment can be. Once it
+    /// is reached through `#rel_mod::#alias`, the rest of the path resolves off it exactly as
+    /// before.
+    ///
+    /// This used to be skipped entirely, on the grounds that a body path resolves normally. It does
+    /// resolve — to the WRONG item. `finalize` re-emits the impl one or two modules deeper, where
+    /// `super::` names the processed module (which glob-imports its own parent), so
+    /// `super::helper()` silently called the module's own `helper` instead of the crate root's.
+    /// Silent, because the module usually does define the shadowing name; when it does not, the
+    /// error names an innocent `super::`.
+    fn lift_value_path(&mut self, path: &mut Path) {
+        if path.leading_colon.is_some() || path.segments.len() < 2 {
+            return;
+        }
+        let root = path.segments[0].ident.to_string();
+        if root != "super" && root != "self" {
+            return;
+        }
+        let mut prefix = Path {
+            leading_colon: None,
+            segments: path.segments.iter().take(2).cloned().collect(),
+        };
+        // `self::Tr::f(..)` — the bare-or-`self::` spelling of a routed trait is the engine's own
+        // cycle-edge signal, which downstream rewrites must still recognise. Left as written, like
+        // every other occurrence of that spelling.
+        if self.spells_cycle_edge(&prefix) {
+            return;
+        }
+        if !self.lift(&mut prefix) {
+            return;
+        }
+        let tail = path.segments.iter().skip(2).cloned();
+        path.segments = prefix.segments.into_iter().chain(tail).collect();
     }
 
     /// Lift the TRAIT sub-path of a qualified path: `<String as super::x::Tr>::f` becomes
@@ -494,12 +544,111 @@ impl VisitMut for LiftRelative<'_> {
         self.lift(&mut tb.path);
     }
 
-    // The one expression form that CAN be lifted: the trait reference inside a qualified call
-    // (`<String as super::x::Tr>::f(..)`) names an importable trait, unlike a plain body path.
+    // A qualified call (`<String as super::x::Tr>::f(..)`) has its trait sub-path lifted whole;
+    // any other expression path is lifted by its prefix.
     fn visit_expr_path_mut(&mut self, ep: &mut ExprPath) {
         syn::visit_mut::visit_expr_path_mut(self, ep);
-        if let Some(qself) = &mut ep.qself {
-            self.lift_qself(qself, &mut ep.path);
+        match &mut ep.qself {
+            Some(qself) => self.lift_qself(qself, &mut ep.path),
+            None => self.lift_value_path(&mut ep.path),
         }
+    }
+
+    // The remaining value-position paths syn models with a `Path` field of their own. (A bare
+    // *path pattern* is not among them: syn 2 models `Pat::Path` as an `ExprPath`, so
+    // `super::Tag::Real` in a `match` arm goes through the override above.) All of them resolve
+    // exactly as an expression path does — a struct literal naming `super::Outer` used to build the
+    // processed module's own `Outer` after re-emission.
+    fn visit_expr_struct_mut(&mut self, es: &mut syn::ExprStruct) {
+        syn::visit_mut::visit_expr_struct_mut(self, es);
+        if es.qself.is_none() {
+            self.lift_value_path(&mut es.path);
+        }
+    }
+
+    fn visit_pat_struct_mut(&mut self, ps: &mut syn::PatStruct) {
+        syn::visit_mut::visit_pat_struct_mut(self, ps);
+        if ps.qself.is_none() {
+            self.lift_value_path(&mut ps.path);
+        }
+    }
+
+    fn visit_pat_tuple_struct_mut(&mut self, pt: &mut syn::PatTupleStruct) {
+        syn::visit_mut::visit_pat_tuple_struct_mut(self, pt);
+        if pt.qself.is_none() {
+            self.lift_value_path(&mut pt.path);
+        }
+    }
+
+    /// A `super::`/`self::`-rooted path inside a macro invocation cannot be lifted: `syn` hands the
+    /// invocation over as an opaque token stream, and rewriting one is only sound for the handful of
+    /// std macros `AliasHeads` allowlists — an ident there may be data (`stringify!`), and a path
+    /// prefix rewritten inside `concat_idents!`/`env!` would change meaning outright.
+    ///
+    /// Left alone it is the silent-wrong case again, so it is rejected instead: loud, at the macro
+    /// the caller wrote, with the fix in the message.
+    fn visit_macro_mut(&mut self, mac: &mut Macro) {
+        if let Some(span) = relative_path_root_in_tokens(&mac.tokens) {
+            abort!(
+                span,
+                "decycle: a `super::`/`self::`-rooted path inside a macro invocation is not supported in a #[decycle] impl body";
+                help = "decycle re-emits this impl inside a generated helper module, where the path would silently name a different item — and a macro's tokens cannot be rewritten safely. Use a `crate::`-rooted path instead, or bind the item to a name outside the macro first."
+            )
+        }
+        syn::visit_mut::visit_macro_mut(self, mac);
+    }
+
+    /// Same reasoning for a `use super::…;` / `use self::…;` written INSIDE a method body: it is not
+    /// a `Path` (syn models it as a `UseTree`), and a `use` item cannot be re-rooted at the alias
+    /// module — a 2018-edition `use` path has to start with `crate`/`self`/`super`/`::`/a crate
+    /// name, so there is no spelling of `#rel_mod::#alias` that works there.
+    fn visit_item_use_mut(&mut self, iu: &mut syn::ItemUse) {
+        if let Some(span) = relative_use_root(&iu.tree) {
+            abort!(
+                span,
+                "decycle: a `use super::…;` / `use self::…;` inside a #[decycle] impl body is not supported";
+                help = "decycle re-emits this impl inside a generated helper module, where the import would silently resolve against a different module. Use a `crate::`-rooted import instead, or move it out to the module level."
+            )
+        }
+        syn::visit_mut::visit_item_use_mut(self, iu);
+    }
+}
+
+/// The span of a `super`/`self` token that starts a path (i.e. is followed by `::`) anywhere in
+/// `tokens`, including inside nested groups.
+///
+/// `Self` is deliberately not matched: it is impl-relative and travels with the impl, so it means
+/// the same thing at any depth.
+fn relative_path_root_in_tokens(tokens: &TokenStream) -> Option<proc_macro2::Span> {
+    let toks: Vec<TokenTree> = tokens.clone().into_iter().collect();
+    for (i, tt) in toks.iter().enumerate() {
+        match tt {
+            TokenTree::Ident(id) => {
+                let name = id.to_string();
+                if (name == "super" || name == "self")
+                    && matches!(toks.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == ':')
+                {
+                    return Some(id.span());
+                }
+            }
+            TokenTree::Group(g) => {
+                if let Some(span) = relative_path_root_in_tokens(&g.stream()) {
+                    return Some(span);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The span of a `use` tree's leading `super`/`self` segment, if it has one.
+fn relative_use_root(tree: &syn::UseTree) -> Option<proc_macro2::Span> {
+    match tree {
+        syn::UseTree::Path(p) => {
+            (p.ident == "super" || p.ident == "self").then(|| p.ident.span())
+        }
+        syn::UseTree::Group(g) => g.items.iter().find_map(relative_use_root),
+        _ => None,
     }
 }

@@ -41,8 +41,11 @@
 //! 1. the impl's self type is a **cycle member** (per [`crate::analysis::cyclic_subgraph`]);
 //! 2. the method has a **method-level generic type parameter** (or an argument-position `impl Trait`,
 //!    which is one anonymously) taken **by value** as an argument;
-//! 3. the body contains a call to a method of **the same name** — so the callee's parameter at that
-//!    position is provably the same by-value generic — and
+//! 3. the body contains a call that **resolves to the cycle's own trait method** — the same name,
+//!    reached through a spelling that names a routed trait or `Self` (`<B as Eval>::eval(..)`,
+//!    `Eval::eval(..)`, `Self::eval(..)`) or through a receiver rooted at `self` or at a cycle
+//!    member (`self.eval(..)`, `B.eval(..)`) — so the callee's parameter at that position is
+//!    provably the same by-value generic; and
 //! 4. the argument at that position is `&expr` / `&mut expr` whose root binding is **tainted**: it is
 //!    that by-value generic parameter, or a local whose initialiser is rooted at one.
 //!
@@ -50,10 +53,21 @@
 //! *fixed* `&mut Vec<u8>`, which closes after one step. Condition 3 is what keeps
 //! `<B as Eval>::eval_by_ref(&mut src, …)` legal, where the callee takes `&mut S` and `S` never grows.
 //!
+//! Condition 3 used to be *only* "a call to a method of the same name", which does not establish any
+//! of what the diagnostic then asserts. `Helper.eval(&src)`, calling a **different trait's** method
+//! `Aux::eval<S>(&self, src: &S)` — which takes `S` by REFERENCE, so nothing grows at all — was
+//! rejected outright, as was a plain free function that happened to share the name. That is a false
+//! positive with no escape hatch on a program that compiles and runs without `#[decycle]`, which is
+//! strictly worse than the rustc diagnostic this pass exists to replace.
+//!
 //! Known gaps, all of them false *negatives* (the program still fails, just with rustc's diagnostic):
 //!
 //! * **cross-method recursion** — `A::f` reborrowing into `B::g`, which reborrows back into `A::f`.
 //!   Condition 3 keys on the method name, so this is missed.
+//! * **a call routed through a type rather than a trait** — `B::eval(..)`, or a receiver bound to a
+//!   local (`let b = B; b.eval(..)`). Neither spelling proves the callee is the trait method (an
+//!   inherent method of the same name shadows it, with a signature of its own), and guessing there
+//!   is what produced the false positive above.
 //! * **non-reference wrappers** — passing `Wrap(src)` rather than `&mut src` grows identically, but
 //!   only `&`/`&mut` is recognised, since a call or struct literal at that position is far more often
 //!   a legitimate fixed type.
@@ -76,8 +90,18 @@ use crate::analysis;
 use std::collections::HashSet;
 use syn::visit::Visit;
 use syn::{
-    Expr, FnArg, Ident, ImplItem, Item, ItemImpl, ItemMod, Pat, Path, Signature, Stmt, Type,
+    Expr, ExprPath, FnArg, Ident, ImplItem, Item, ItemImpl, ItemMod, Pat, Path, Signature, Stmt,
+    Type, UseTree,
 };
+
+/// What a call site has to name for its callee to be the cycle's own trait method — condition 3.
+struct Callees {
+    /// Idents of the traits `#[decycle]` routes through this module. A path segment naming one
+    /// (`Eval::eval(..)`, `<B as Eval>::eval(..)`) names the trait method itself.
+    routed_traits: HashSet<String>,
+    /// The cycle members' type names, so a receiver spelled as one (`B.eval(..)`) is recognised.
+    members: HashSet<String>,
+}
 
 /// Reject any value-level instantiation growth reachable in `module`. Engine-independent — the growth
 /// defeats ranked and structural alike — so both entry points call it before doing any work.
@@ -89,6 +113,10 @@ pub(crate) fn check_value_generic_growth(module: &ItemMod, decycle: &Path) -> sy
     if cyclic.is_empty() {
         return Ok(());
     }
+    let callees = Callees {
+        routed_traits: routed_trait_names(items, decycle),
+        members: cyclic.clone(),
+    };
     for item in items {
         let Item::Impl(im) = item else { continue };
         if im.trait_.is_none() {
@@ -99,11 +127,49 @@ pub(crate) fn check_value_generic_growth(module: &ItemMod, decycle: &Path) -> sy
         }
         for ii in &im.items {
             if let ImplItem::Fn(f) = ii {
-                check_method(&f.sig, &f.block)?;
+                check_method(&f.sig, &f.block, &callees)?;
             }
         }
     }
     Ok(())
+}
+
+/// The idents of the traits routed through this module — `#[decycle] trait Tr` and
+/// `#[decycle] use path::Tr` (under its local name).
+///
+/// A small re-derivation of `analysis`'s private `routed_traits`, kept here because this pass runs
+/// before any of the engine's own bookkeeping exists and only needs the names.
+fn routed_trait_names(items: &[Item], decycle: &Path) -> HashSet<String> {
+    fn use_idents(tree: &UseTree, out: &mut HashSet<String>) {
+        match tree {
+            UseTree::Path(p) => use_idents(&p.tree, out),
+            UseTree::Name(n) => {
+                out.insert(n.ident.to_string());
+            }
+            UseTree::Rename(r) => {
+                out.insert(r.rename.to_string());
+            }
+            UseTree::Group(g) => g.items.iter().for_each(|t| use_idents(t, out)),
+            UseTree::Glob(_) => {}
+        }
+    }
+    let mut out = HashSet::new();
+    let Some(first) = decycle.segments.first() else {
+        return out;
+    };
+    let decycle_crate = &first.ident;
+    let marked =
+        |attrs: &[syn::Attribute]| attrs.iter().any(|a| crate::is_decycle_attribute(a, decycle_crate));
+    for item in items {
+        match item {
+            Item::Trait(t) if marked(&t.attrs) => {
+                out.insert(t.ident.to_string());
+            }
+            Item::Use(u) if marked(&u.attrs) => use_idents(&u.tree, &mut out),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// The cycle members' type names. An empty set (no cycle at all) short-circuits the whole pass.
@@ -296,7 +362,7 @@ fn collect_lets(
     .visit_block(block);
 }
 
-fn check_method(sig: &Signature, block: &syn::Block) -> syn::Result<()> {
+fn check_method(sig: &Signature, block: &syn::Block, callees: &Callees) -> syn::Result<()> {
     let by_value = by_value_generic_args(sig);
     if by_value.is_empty() {
         return Ok(());
@@ -314,14 +380,13 @@ fn check_method(sig: &Signature, block: &syn::Block) -> syn::Result<()> {
         .collect();
     let (taint, derived) = tainted_bindings(block, &seeds, &own_generics);
     let positions: HashSet<usize> = by_value.iter().map(|(i, _)| *i).collect();
-    let has_receiver = sig.receiver().is_some();
 
     struct V<'a> {
         name: &'a Ident,
         positions: &'a HashSet<usize>,
         taint: &'a HashSet<String>,
         derived: &'a HashSet<String>,
-        has_receiver: bool,
+        callees: &'a Callees,
         found: Option<(&'a Expr, bool)>,
     }
     impl<'a> V<'a> {
@@ -346,25 +411,65 @@ fn check_method(sig: &Signature, block: &syn::Block) -> syn::Result<()> {
                 }
             }
         }
+
+        /// Does this path call name the cycle's own trait method (condition 3)?
+        ///
+        /// Only a spelling that names a **trait** — or `Self`, whose impl is the one being checked —
+        /// establishes that the callee's signature is the trait's, and hence that its parameter at
+        /// the flagged position is the same by-value generic. A bare single-segment path is a free
+        /// function; a type-rooted path (`B::eval`) may be an inherent method with an unrelated
+        /// signature.
+        fn path_names_trait_method(&self, p: &ExprPath) -> bool {
+            if !p.path.segments.last().is_some_and(|s| &s.ident == self.name) {
+                return false;
+            }
+            let owner = match &p.qself {
+                // `<B as Eval>::eval(..)` — the segments before `as`'s end name the trait.
+                Some(q) => match q.position.checked_sub(1) {
+                    Some(ix) => p.path.segments.get(ix),
+                    // `<B>::eval(..)`: no trait named at all.
+                    None => return false,
+                },
+                // `Eval::eval(..)`, `Self::eval(..)`, `path::to::Eval::eval(..)`.
+                None => match p.path.segments.len().checked_sub(2) {
+                    Some(ix) => p.path.segments.get(ix),
+                    None => return false,
+                },
+            };
+            owner.is_some_and(|s| {
+                s.ident == "Self" || self.callees.routed_traits.contains(&s.ident.to_string())
+            })
+        }
+
+        /// Is this method call's receiver one the cycle's own trait method can be reached through —
+        /// `self` (or a projection of it), or a cycle member named outright (`B.eval(..)`)?
+        fn receiver_reaches_cycle(&self, receiver: &Expr) -> bool {
+            root_ident(receiver).is_some_and(|id| {
+                id == "self" || self.callees.members.contains(&id.to_string())
+            })
+        }
     }
     impl<'ast> Visit<'ast> for V<'ast> {
         fn visit_expr(&mut self, e: &'ast Expr) {
             match e {
-                // `<B as Eval>::eval(a, b)`, `B::eval(a, b)`, `Eval::eval(a, b)`. A path call to a
-                // method WITH a receiver is UFCS, so the receiver is `args[0]`.
+                // `<B as Eval>::eval(a, b)`, `Eval::eval(a, b)`, `Self::eval(a, b)`. A path call is
+                // UFCS: its arguments line up ONE-TO-ONE with the callee's inputs, the receiver
+                // included, whether or not the CALLER has one. (`base` used to be
+                // `usize::from(has_receiver)`, which both mis-mapped a free call made from a method
+                // and shifted a genuine UFCS call's arguments off by one.)
                 Expr::Call(c) => {
                     if let Expr::Path(p) = &*c.func {
-                        if p.path
-                            .segments
-                            .last()
-                            .is_some_and(|s| &s.ident == self.name)
-                        {
-                            self.scan(&c.args, usize::from(self.has_receiver));
+                        if self.path_names_trait_method(p) {
+                            self.scan(&c.args, 0);
                         }
                     }
                 }
                 // `x.eval(a, b)` — the receiver is `x`, so `args[0]` is `sig.inputs[1]`.
-                Expr::MethodCall(mc) if &mc.method == self.name => self.scan(&mc.args, 1),
+                Expr::MethodCall(mc)
+                    if &mc.method == self.name && self.receiver_reaches_cycle(&mc.receiver) =>
+                {
+                    self.scan(&mc.args, 1)
+                }
                 _ => {}
             }
             syn::visit::visit_expr(self, e);
@@ -376,7 +481,7 @@ fn check_method(sig: &Signature, block: &syn::Block) -> syn::Result<()> {
         positions: &positions,
         taint: &taint,
         derived: &derived,
-        has_receiver,
+        callees,
         found: None,
     };
     v.visit_block(block);

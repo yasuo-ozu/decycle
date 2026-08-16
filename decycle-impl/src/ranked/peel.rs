@@ -15,7 +15,6 @@
 //! Bounds that are not cyclic, and cyclic bounds that already name a rankable head (or target `Self`
 //! or one of the impl's own type parameters), are left exactly as written.
 
-use crate::helper::type_head_ident;
 use std::collections::HashSet;
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
@@ -48,9 +47,12 @@ pub(crate) fn peel_cyclic_bounds(
             continue;
         };
         // Already fine: `Self` / an impl type-param (the engine handles those directly), or a head
-        // that is itself a cycle member.
+        // that is itself a cycle member — recognised by the BARE (or `self::`-qualified) spelling
+        // only, exactly like `cycle_types_within` below. Keying on the last segment made
+        // `crate::other::Stmt` pass for the local member `Stmt`.
         if is_local_target(&pt.bounded_ty)
-            || type_head_ident(&pt.bounded_ty).is_some_and(|h| cycle_self_heads.contains(&h))
+            || crate::helper::local_type_head_ident(&pt.bounded_ty)
+                .is_some_and(|h| cycle_self_heads.contains(&h))
         {
             push(pred.clone(), &mut out);
             continue;

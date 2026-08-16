@@ -11,19 +11,9 @@ error: cannot find attribute `decycle` in this scope
    |       ^^^^^^^
    |
    = note: `decycle` is in scope, but it is a crate, not an attribute
-help: consider importing one of these attribute macros
-   |
-10 +     use crate::decycle;
-   |
-10 +     use decycle::decycle;
-   |
-10 +     use decycle_macro::decycle;
-   |
 
 error[E0275]: overflow evaluating the requirement `A: Tr`
   --> tests/ui/structural_impl_fn_self_arg.rs:17:9
    |
 17 |         A: Tr,
    |         ^^^^^
-   |
-   = help: see issue #48214

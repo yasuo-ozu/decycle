@@ -12,6 +12,13 @@
 //! rejects it up-front for both. Handles associated fns + every `self`-receiver shape, method generics,
 //! APIT, associated items, multiple traits per cycle, and multiroot SCCs; emits a forwarding assertion
 //! when a wrapped container predicate (`Box<Stmt>: Tr`) is stripped.
+//!
+//! Method generics are supported *except* when a bound mentions `Self` (`fn apply<F: Fn(&Self)>`):
+//! this engine emits the method twice, once with `Self` = the terminator and once with `Self` = the
+//! natural type, and one caller-supplied `F` cannot satisfy both. Such a bound is rejected with an
+//! explanation pointing at `fn(&Self)` / `&dyn Fn(&Self)`, which the layout cast CAN carry across.
+//! An impl is free to spell any `Self` position with the concrete self type (`&A` for a declared
+//! `&Self`); the signature is canonicalized against the trait's declaration before codegen.
 
 use proc_macro2::{Span, TokenStream};
 use template_quote::{quote, ToTokens};

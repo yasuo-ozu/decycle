@@ -44,14 +44,37 @@ pub(crate) struct ImplBlock {
 pub(crate) struct Model {
     pub adts: BTreeMap<String, Adt>,
     pub impls: Vec<ImplBlock>,
+    /// Traits **declared in this module**, keyed the same way an impl is (`impl_trait_key`).
+    ///
+    /// A declaration is what makes an impl's signature interpretable: the trait says which positions
+    /// are `Self`, and an impl is free to spell those with the concrete self type instead (legal
+    /// Rust). The terminator impl is of the SAME trait for a different self type, so those positions
+    /// must be re-spelled `Self` before codegen — see [`canonicalize_method_sig`]. Only the
+    /// declaration can drive that rewrite: a trait that genuinely declares a concrete `&A` parameter
+    /// must be left alone.
+    pub traits: BTreeMap<String, syn::ItemTrait>,
     /// Per-expansion nonce suffixed onto every generated identifier for hygiene.
     pub nonce: u64,
 }
 
 impl Model {
+    /// The declaration of `name` in trait `trait_key`, when that trait is declared in this module.
+    pub fn trait_method_sig(&self, trait_key: &str, name: &Ident) -> Option<&syn::Signature> {
+        self.traits.get(trait_key)?.items.iter().find_map(|it| match it {
+            syn::TraitItem::Fn(f) if f.sig.ident == *name => Some(&f.sig),
+            _ => None,
+        })
+    }
+
+    /// Is this trait declared in the module (as opposed to `#[decycle] use`-imported)?
+    pub fn has_trait_decl(&self, trait_key: &str) -> bool {
+        self.traits.contains_key(trait_key)
+    }
+
     pub fn collect(items: &[Item], nonce: u64) -> syn::Result<Self> {
         let mut adts = BTreeMap::new();
         let mut impls = Vec::new();
+        let mut traits = BTreeMap::new();
         for it in items {
             match it {
                 Item::Struct(ItemStruct {
@@ -78,6 +101,9 @@ impl Model {
                         },
                     );
                 }
+                Item::Trait(t) => {
+                    traits.insert(t.ident.to_string(), t.clone());
+                }
                 Item::Impl(im) if im.trait_.is_some() => {
                     if let (Some(key), Some(self_id)) = (impl_trait_key(im), impl_self_ident(im)) {
                         impls.push(ImplBlock {
@@ -94,6 +120,7 @@ impl Model {
         Ok(Model {
             adts,
             impls,
+            traits,
             nonce,
         })
     }

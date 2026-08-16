@@ -1,0 +1,46 @@
+error: #[decycle] takes no arguments on an item inside a #[decycle] module
+
+         = help: engine options (`structural`, `recurse_level`, `support_infinite_cycle`) belong on the enclosing `#[decycle] mod`; trait options (`marker`, `alter_macro_name`, `allowed_paths`) apply only to a `#[decycle]` trait declared outside such a module
+
+  --> tests/ui/inner_decycle_attr_args.rs:12:15
+   |
+12 |     #[decycle(structural, recurse_level = 0, marker = Nonexistent, bogus_keyword)]
+   |               ^^^^^^^^^^
+
+error: cannot find attribute `decycle` in this scope
+  --> tests/ui/inner_decycle_attr_args.rs:12:7
+   |
+12 |     #[decycle(structural, recurse_level = 0, marker = Nonexistent, bogus_keyword)]
+   |       ^^^^^^^
+   |
+   = note: `decycle` is in scope, but it is a crate, not an attribute
+
+error[E0275]: overflow evaluating the requirement `A: Tr`
+  --> tests/ui/inner_decycle_attr_args.rs:22:9
+   |
+22 |         B: Tr,
+   |         ^^^^^
+   |
+note: required for `B` to implement `Tr`
+  --> tests/ui/inner_decycle_attr_args.rs:29:10
+   |
+29 |     impl Tr for B
+   |          ^^     ^
+30 |     where
+31 |         A: Tr,
+   |            -- unsatisfied trait bound introduced here
+
+error[E0275]: overflow evaluating the requirement `B: Tr`
+  --> tests/ui/inner_decycle_attr_args.rs:31:9
+   |
+31 |         A: Tr,
+   |         ^^^^^
+   |
+note: required for `A` to implement `Tr`
+  --> tests/ui/inner_decycle_attr_args.rs:20:10
+   |
+20 |     impl Tr for A
+   |          ^^     ^
+21 |     where
+22 |         B: Tr,
+   |            -- unsatisfied trait bound introduced here

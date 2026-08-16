@@ -1,0 +1,38 @@
+error: decycle: a `use super::…;` / `use self::…;` inside a #[decycle] impl body is not supported
+
+         = help: decycle re-emits this impl inside a generated helper module, where the import would silently resolve against a different module. Use a `crate::`-rooted import instead, or move it out to the module level.
+
+  --> tests/ui/super_use_in_impl_body.rs:36:17
+   |
+36 |             use super::helper;
+   |                 ^^^^^
+
+error[E0275]: overflow evaluating the requirement `A: Tr`
+  --> tests/ui/super_use_in_impl_body.rs:33:9
+   |
+33 |         B: Tr,
+   |         ^^^^^
+   |
+note: required for `B` to implement `Tr`
+  --> tests/ui/super_use_in_impl_body.rs:41:10
+   |
+41 |     impl Tr for B
+   |          ^^     ^
+42 |     where
+43 |         A: Tr,
+   |            -- unsatisfied trait bound introduced here
+
+error[E0275]: overflow evaluating the requirement `B: Tr`
+  --> tests/ui/super_use_in_impl_body.rs:43:9
+   |
+43 |         A: Tr,
+   |         ^^^^^
+   |
+note: required for `A` to implement `Tr`
+  --> tests/ui/super_use_in_impl_body.rs:31:10
+   |
+31 |     impl Tr for A
+   |          ^^     ^
+32 |     where
+33 |         B: Tr,
+   |            -- unsatisfied trait bound introduced here

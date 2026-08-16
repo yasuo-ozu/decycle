@@ -1,0 +1,19 @@
+error: #[decycle(structural)]: only `&dyn Fn(..)` trait objects mentioning `Self` can be forwarded. `FnMut`/`FnOnce`, additional bounds such as `+ Send`, and user traits mentioning `Self` would need a vtable for a trait that does not exist after `Self` is substituted. Take a `&dyn Fn(&Self)` (rebuilt by coercion) or a `fn(&Self)` pointer instead — a method-level generic parameter does NOT work here, because its bound would mention `Self` and this engine emits the method on two different `Self` types. (The ranked engine, `#[decycle]`, supports the generic form.)
+  --> tests/ui/structural_dyn_fnmut_self_arg.rs:23:29
+   |
+23 |         fn apply(&self, _f: &dyn FnMut(&Self)) -> i64 {
+   |                             ^
+
+error: cannot find attribute `decycle` in this scope
+  --> tests/ui/structural_dyn_fnmut_self_arg.rs:14:7
+   |
+14 |     #[decycle]
+   |       ^^^^^^^
+   |
+   = note: `decycle` is in scope, but it is a crate, not an attribute
+
+error[E0275]: overflow evaluating the requirement `A: Vis`
+  --> tests/ui/structural_dyn_fnmut_self_arg.rs:21:9
+   |
+21 |         A: Vis,
+   |         ^^^^^^

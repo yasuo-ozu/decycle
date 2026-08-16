@@ -1,0 +1,38 @@
+error: decycle: a `super::`/`self::`-rooted path inside a macro invocation is not supported in a #[decycle] impl body
+
+         = help: decycle re-emits this impl inside a generated helper module, where the path would silently name a different item — and a macro's tokens cannot be rewritten safely. Use a `crate::`-rooted path instead, or bind the item to a name outside the macro first.
+
+  --> tests/ui/super_path_in_macro.rs:37:24
+   |
+37 |             assert_eq!(super::helper(), 100);
+   |                        ^^^^^
+
+error[E0275]: overflow evaluating the requirement `A: Tr`
+  --> tests/ui/super_path_in_macro.rs:34:9
+   |
+34 |         B: Tr,
+   |         ^^^^^
+   |
+note: required for `B` to implement `Tr`
+  --> tests/ui/super_path_in_macro.rs:42:10
+   |
+42 |     impl Tr for B
+   |          ^^     ^
+43 |     where
+44 |         A: Tr,
+   |            -- unsatisfied trait bound introduced here
+
+error[E0275]: overflow evaluating the requirement `B: Tr`
+  --> tests/ui/super_path_in_macro.rs:44:9
+   |
+44 |         A: Tr,
+   |         ^^^^^
+   |
+note: required for `A` to implement `Tr`
+  --> tests/ui/super_path_in_macro.rs:32:10
+   |
+32 |     impl Tr for A
+   |          ^^     ^
+33 |     where
+34 |         B: Tr,
+   |            -- unsatisfied trait bound introduced here

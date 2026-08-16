@@ -19,14 +19,6 @@ error: cannot find attribute `decycle` in this scope
    |       ^^^^^^^
    |
    = note: `decycle` is in scope, but it is a crate, not an attribute
-help: consider importing one of these attribute macros
-   |
-30 +     use crate::decycle;
-   |
-30 +     use decycle::decycle;
-   |
-30 +     use decycle_macro::decycle;
-   |
 
 error[E0275]: overflow evaluating the requirement `A: Eval`
   --> tests/ui/value_generic_growth_structural.rs:42:9
@@ -42,7 +34,6 @@ note: required for `B` to implement `Eval`
 53 |     where
 54 |         A: Eval,
    |            ---- unsatisfied trait bound introduced here
-   = help: see issue #48214
 
 error[E0275]: overflow evaluating the requirement `B: Eval`
   --> tests/ui/value_generic_growth_structural.rs:54:9
@@ -58,4 +49,3 @@ note: required for `A` to implement `Eval`
 41 |     where
 42 |         B: Eval,
    |            ---- unsatisfied trait bound introduced here
-   = help: see issue #48214

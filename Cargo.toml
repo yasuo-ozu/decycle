@@ -9,6 +9,11 @@ repository = "https://github.com/yasuo-ozu/decycle"
 keywords = ["macro", "trait", "recursive", "circular", "obligation"]
 categories = ["rust-patterns", "development-tools::procedural-macro-helpers"]
 authors = ["Yasuo Ozu <yasuo@ozu.email>"]
+# Without this the published tarball is ~815 KB, of which ~729 KB is the logo — which is never read
+# at build time, since the crate docs link it by URL. The test suite and CI config are likewise not
+# something a consumer compiles. (`tests/*` holds path dev-dependencies; cargo strips path-only
+# dev-deps from the published manifest, so leaving their sources out is fine.)
+exclude = ["decycle.png", "tests/", ".github/"]
 
 [lib]
 path = "lib.rs"
@@ -32,6 +37,8 @@ traitdef = { path = "tests/traitdef" }
 typedef = { path = "tests/typedef" }
 alsorank_bridge = { path = "tests/alsorank_bridge" }
 graph_bridge = { path = "tests/graph_bridge" }
+# Counts its own expansions, so a test can pin that a method attribute macro runs exactly once.
+attrcount = { path = "tests/attrcount" }
 trybuild = "1.0"
 [dev-dependencies.syn]
 version = "2.0"
@@ -47,5 +54,11 @@ members = [
   "tests/traitdef",
   "tests/typedef",
   "tests/alsorank_bridge",
+  "tests/graph_bridge",
+  "tests/attrcount",
 ]
+# Built explicitly by the `no_std` CI job, never as part of this workspace: cargo unifies features
+# across members, so as a member it would receive the very default features it exists to build
+# without.
+exclude = ["tests/nostd_consumer"]
 resolver = "2"

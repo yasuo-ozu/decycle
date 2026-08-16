@@ -4,8 +4,12 @@ error[E0277]: the trait bound `Vec<other::Stmt>: m::Tr` is not satisfied
 28 |         Vec<crate::other::Stmt>: Tr,
    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `m::Tr` is not implemented for `Vec<other::Stmt>`
    |
-   = help: the trait `m::Tr` is implemented for `m::Stmt`
-   = help: see issue #48214
+help: the trait `m::Tr` is implemented for `m::Stmt`
+  --> tests/ui/peel_foreign_last_segment.rs:17:1
+   |
+17 | #[decycle]
+   | ^^^^^^^^^^
+   = note: this error originates in the attribute macro `decycle` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0277]: the trait bound `Vec<other::Stmt>: m::Tr` is not satisfied
   --> tests/ui/peel_foreign_last_segment.rs:17:1
@@ -13,6 +17,9 @@ error[E0277]: the trait bound `Vec<other::Stmt>: m::Tr` is not satisfied
 17 | #[decycle]
    | ^^^^^^^^^^ the trait `m::Tr` is not implemented for `Vec<other::Stmt>`
    |
-   = help: the trait `m::Tr` is implemented for `m::Stmt`
-   = help: see issue #48214
+help: the trait `m::Tr` is implemented for `m::Stmt`
+  --> tests/ui/peel_foreign_last_segment.rs:17:1
+   |
+17 | #[decycle]
+   | ^^^^^^^^^^
    = note: this error originates in the attribute macro `decycle` (in Nightly builds, run with -Z macro-backtrace for more info)

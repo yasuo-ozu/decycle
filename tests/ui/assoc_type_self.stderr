@@ -41,4 +41,3 @@ note: required for `S` to implement `Foo`
 14 |     where
 15 |         S: Bar,
    |            --- unsatisfied trait bound introduced here
-   = help: see issue #48214

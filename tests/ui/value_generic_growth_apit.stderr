@@ -28,7 +28,6 @@ note: required for `m::Stmt` to implement `m::Parse`
 80 |     where
 81 |         Expr: Parse,
    |               ----- unsatisfied trait bound introduced here
-   = help: see issue #48214
 
 error[E0275]: overflow evaluating the requirement `m::Stmt: m::Parse`
   --> tests/ui/value_generic_growth_apit.rs:81:9
@@ -44,4 +43,3 @@ note: required for `m::Expr` to implement `m::Parse`
 67 |     where
 68 |         Stmt: Parse,
    |               ----- unsatisfied trait bound introduced here
-   = help: see issue #48214

@@ -4,9 +4,14 @@ error[E0277]: the trait bound `std::boxed::Box<__DecycleElem>: Tr` is not satisf
 20 |         Box<Stmt>: Tr,
    |         ^^^^^^^^^ the trait `Tr` is not implemented for `std::boxed::Box<__DecycleElem>`
    |
-   = help: the following other types implement trait `Tr`:
-             __StmtTerm_bcdf6e40a9057a6e
-             ast::Stmt
+help: the following other types implement trait `Tr`
+  --> tests/ui/wrapped_bound_not_forwarded.rs:8:1
+   |
+ 8 | #[decycle(structural)]
+   | ^^^^^^^^^^^^^^^^^^^^^^
+   | |
+   | `__StmtTerm_bcdf6e40a9057a6e`
+   | `ast::Stmt`
 note: required by a bound in `stripped_wrapped_bound_needs_its_container_to_forward_the_trait`
   --> tests/ui/wrapped_bound_not_forwarded.rs:20:20
    |
@@ -15,3 +20,4 @@ note: required by a bound in `stripped_wrapped_bound_needs_its_container_to_forw
 ...
 20 |         Box<Stmt>: Tr,
    |                    ^^ required by this bound in `stripped_wrapped_bound_needs_its_container_to_forward_the_trait`
+   = note: this error originates in the attribute macro `decycle` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -46,8 +46,13 @@ use syn::{Item, ItemImpl, ItemMod, Path, TraitBound, Type, TypeParamBound, UseTr
 pub enum EdgeKind {
     /// The bound names the participant directly: `Stmt: Tr` — its head *is* the target.
     Direct,
-    /// The bound names a type that *contains* the participant: `Vec<Box<Stmt>>: Tr`. The head
-    /// (`Vec`) is not itself a participant, so reaching `Stmt` means looking inside the arguments.
+    /// The bound names a type that *contains* the participant: `Vec<Box<Stmt>>: Tr` — reaching
+    /// `Stmt` means looking inside the arguments.
+    ///
+    /// The two kinds are per *endpoint*, not per bound: one predicate can yield both. When the head
+    /// is itself a participant (`Wrap<Stmt>: Tr`, with `Wrap` implementing the trait too) the bound
+    /// is a [`EdgeKind::Direct`] edge to `Wrap` **and** a `Peeled` edge to `Stmt`, because the
+    /// obligation on `Expr` really does travel through both.
     Peeled,
 }
 
@@ -61,11 +66,29 @@ pub enum EdgeKind {
 /// first segment is used, to recognise `#[<crate>::decycle]` alongside the bare `#[decycle]`. A
 /// path with no segments names no crate, so nothing is routed and the graph is empty.
 ///
+/// A bound reaches **every** participant it names: `Wrap<Stmt>: Tr`, with `Wrap` implementing the
+/// trait too, is a `Direct` edge to `Wrap` *and* a `Peeled` edge to `Stmt`.
+///
 /// Not represented, deliberately:
 /// - bounds whose target is `Self` or one of the impl's own type parameters — those name no other
 ///   participant, so there is no second endpoint to draw an edge to;
+/// - bounds whose target is a FOREIGN type that merely shares its last path segment with a
+///   participant (`crate::other::Stmt: Tr`): a different item, and no engine treats it as a cycle
+///   edge either (`ranked::peel::cycle_types_within`). Only the bare and the no-op `self::`
+///   spellings name a participant;
 /// - the trait each edge came from. Two impls of different routed traits relating the same pair the
 ///   same way yield **one** edge, since the question this graph answers is about types.
+///
+/// Two known imprecisions, both kept on purpose so the graph keeps describing what the engines
+/// actually do:
+/// - a NODE is still the last path segment of the impl's self type, so `impl Tr for
+///   ::other::Stmt` contributes the node `Stmt`. That is exactly the engines' own
+///   `cycle_self_heads`, and the node set is what [`crate::ranked::process_module_with_graph`]
+///   substitutes for it — dropping such a head here would desynchronise the graph from the
+///   expansion it is meant to reproduce (a graph over idents cannot spell a foreign path anyway);
+/// - a glob `#[decycle] use path::*;` routes no trait, because a glob names none. A module whose
+///   only marker is a glob therefore yields the empty graph — the ranked engine rejects that module
+///   outright ("glob is not supported in #[decycle] use"), so there is no expansion to describe.
 pub fn analyze_module(module: &ItemMod, decycle: &Path) -> VecGraph<Ident, EdgeKind> {
     let Some((_, items)) = module.content.as_ref() else {
         return VecGraph::default();
@@ -176,10 +199,15 @@ fn routed_traits(items: &[Item], decycle_crate: &Ident) -> HashSet<Ident> {
     out
 }
 
+/// The PATH-only predicate, on purpose: reading a module must not diagnose it. An argument list on
+/// an inner `#[decycle]` is a hard error in both engines (`crate::is_decycle_attribute`), but that
+/// rejection goes through `abort!`, which panics outside a proc-macro entry point — and this
+/// function is a plain library call. So the marker is honoured here whatever it carries, and the
+/// engine the caller goes on to invoke is the one that reports it.
 fn has_decycle_attr(attrs: &[syn::Attribute], decycle_crate: &Ident) -> bool {
     attrs
         .iter()
-        .any(|a| crate::is_decycle_attribute(a, decycle_crate))
+        .any(|a| crate::names_decycle_attribute(a, decycle_crate))
 }
 
 fn collect_use_idents(tree: &UseTree, out: &mut HashSet<Ident>) {
@@ -192,6 +220,9 @@ fn collect_use_idents(tree: &UseTree, out: &mut HashSet<Ident>) {
             out.insert(r.rename.clone());
         }
         UseTree::Group(g) => g.items.iter().for_each(|t| collect_use_idents(t, out)),
+        // A glob names no trait, so it routes none — see the caveat on `analyze_module`. The ranked
+        // engine rejects `#[decycle] use path::*;` outright, so a module relying on one has no
+        // expansion for this graph to describe.
         UseTree::Glob(_) => {}
     }
 }
@@ -270,16 +301,25 @@ fn bound_edges(
                 continue;
             }
         }
-        match type_head_ident(&pt.bounded_ty) {
-            // The head is itself a participant — the bound names it outright.
-            Some(head) if participants.contains(&head) => out.push((head, EdgeKind::Direct)),
-            // Otherwise look inside: a container may still be carrying one.
-            _ => out.extend(
-                nested_participants(&pt.bounded_ty, participants)
-                    .into_iter()
-                    .map(|t| (t, EdgeKind::Peeled)),
-            ),
+        // A bound reaches EVERY participant it names, and the head being one of them does not stop
+        // the search: `Wrap<Stmt>: Tr` — where `Wrap` implements the trait as well — is a `Direct`
+        // edge to `Wrap` *and* a `Peeled` edge to `Stmt`. Treating the two as alternatives dropped
+        // the nested endpoints of any bound wrapped in a participating container, which is enough
+        // to turn a fully cyclic module (`Expr: Tr <= Wrap<Stmt>: Tr <= Stmt: Tr <= Wrap<Expr>:
+        // Tr`) into an acyclic graph — `cyclic_subgraph` then reported NO participants at all, and
+        // an engine fed that answer left the module un-decycled.
+        let head = local_participant_head(&pt.bounded_ty, participants);
+        if let Some(head) = &head {
+            out.push((head.clone(), EdgeKind::Direct));
         }
+        // `nested_participants` walks the whole type, head included; the head already has its
+        // `Direct` edge, so it must not also be reported as reached-from-inside.
+        out.extend(
+            nested_participants(&pt.bounded_ty, participants)
+                .into_iter()
+                .filter(|t| head.as_ref() != Some(t))
+                .map(|t| (t, EdgeKind::Peeled)),
+        );
     }
     out
 }
@@ -289,6 +329,36 @@ fn is_routed_bound(bound: &TypeParamBound, routed: &HashSet<Ident>, how: Spellin
         return false;
     };
     path_names_routed(path, routed, how)
+}
+
+/// The participant `path` names — but only when the path can actually *denote* one: a bare ident,
+/// or its no-op `self::`-qualified form.
+///
+/// A path rooted anywhere else (`crate::other::Stmt`, `super::Stmt`, `::dep::Stmt`) reaches a
+/// DIFFERENT item that merely shares its last segment with a participant, so a bound on it is an
+/// ordinary outer premise and no edge at all. This is the rule the engine already applies when it
+/// decides what a bound may be peeled to (`ranked::peel::cycle_types_within`) and when a
+/// graph-supplied participant set is spelled back onto the impls (`ranked::contract`); matching the
+/// last segment instead made `impl Tr for Expr where ::other::Stmt: Tr` report a cycle
+/// `{Expr, Stmt}` over the LOCAL `Stmt` that no engine would ever break.
+///
+/// The returned ident is cloned from the source, never rebuilt, so a raw identifier survives.
+fn local_participant(path: &Path, participants: &HashSet<Ident>) -> Option<Ident> {
+    if !crate::helper::path_names_local_ident(path, participants) {
+        return None;
+    }
+    let mut probe = path.clone();
+    strip_leading_self(&mut probe);
+    probe.segments.last().map(|s| s.ident.clone())
+}
+
+/// [`local_participant`] applied to the *head* of `ty` — `None` for a non-path type (`&Stmt`,
+/// `(A, B)`) or a `<T as Tr>::X` qself, as [`type_head_ident`] has it.
+fn local_participant_head(ty: &Type, participants: &HashSet<Ident>) -> Option<Ident> {
+    match ty {
+        Type::Path(syn::TypePath { qself: None, path }) => local_participant(path, participants),
+        _ => None,
+    }
 }
 
 /// Participant idents appearing anywhere inside `ty`, outermost first, without repeats.
@@ -301,14 +371,14 @@ fn nested_participants(ty: &Type, participants: &HashSet<Ident>) -> Vec<Ident> {
     impl Visit<'_> for V<'_> {
         fn visit_type_path(&mut self, tp: &syn::TypePath) {
             if tp.qself.is_none() {
-                if let Some(seg) = tp.path.segments.last() {
-                    if self.participants.contains(&seg.ident)
-                        && self.seen.insert(seg.ident.to_string())
-                    {
-                        self.out.push(seg.ident.clone());
+                if let Some(ident) = local_participant(&tp.path, self.participants) {
+                    if self.seen.insert(ident.to_string()) {
+                        self.out.push(ident);
                     }
                 }
             }
+            // A foreign wrapper still has its arguments visited: `crate::other::Wrap<Stmt>`
+            // reaches the local `Stmt`.
             syn::visit::visit_type_path(self, tp);
         }
     }

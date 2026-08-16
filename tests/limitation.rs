@@ -76,6 +76,13 @@ impl Name for X {
 // floor with no prior same-instantiation frame) must NOT poison the registry — the map is
 // thread-local and the lookup releases its borrow before panicking, so every other cycle keeps
 // working on the same thread and on fresh threads.
+//
+// `residual_trigger` below is no longer one of those floors: a cross edge to a generic method is
+// now registered from the prologue of the method that CAN name its instantiation (here the
+// caller's own `M`), so this cycle runs. It is kept as the positive control for that fix; the
+// still-fail-closed shape — a generic method reached from a NON-generic caller, whose type
+// argument is chosen inside the user's body and which therefore nothing in scope can name — is
+// `rankeater` below, and it is what drives the no-poison assertions now.
 // ---------------------------------------------------------------------------------------------
 
 #[decycle(recurse_level = 1)]
@@ -115,9 +122,15 @@ mod residual_trigger {
 #[test]
 fn residual_panic_is_isolated() {
     use mutual_l1::Ca;
+    use rankeater::TrA;
     use residual_trigger::Gn;
     assert_eq!(mutual_l1::A.ca(500), 500);
-    let e = std::panic::catch_unwind(|| residual_trigger::P.gn(X, 5)).unwrap_err();
+    // A generic method reached across a cross edge from a caller that names its instantiation is
+    // registered now — this used to be a fail-closed floor.
+    assert_eq!(residual_trigger::P.gn(X, 5), "X");
+    // The residual shape: `bg::<u8>` is reached from the NON-generic `a`, so no scope on the way
+    // down can spell its type argument and its floor still fails closed.
+    let e = std::panic::catch_unwind(|| rankeater::A0.a(5)).unwrap_err();
     assert!(
         panic_msg(e).contains("re-entry fn not registered"),
         "expected the actionable not-registered panic"

@@ -50,56 +50,77 @@ pub fn process_trait(
     let mut renamer =
         crate::randomize_impl_generics(&mut modified_trait_item.generics, random_suffix);
     renamer.visit_item_trait_mut(&mut modified_trait_item);
-    let output0 = quote! {
-        #trait_item
+    // The carrier is built from `modified_trait_item`, which the interning rewrite below still has
+    // to mutate — so it is a closure, called twice. Building it once up front (the old shape) meant
+    // the final output re-used a stream captured BEFORE the rewrite: every interned type stayed
+    // spelled as the caller wrote it, and the definition that travelled through the macro named
+    // types that do not exist at the use site (`error[E0412]: cannot find type MyTy in this
+    // scope`). The early call is only for `set_dummy`, so an abort in between still has a valid
+    // fallback expansion.
+    let carrier = |modified: &ItemTrait| {
+        quote! {
+            #trait_item
 
-        #[allow(unused_macros, unused_imports, dead_code, non_local_definitions)]
-        #[doc(hidden)]
-        #[macro_export]
-        macro_rules! #temporal_mac_name {
-            (#crate_identity #crate_version [$_:path, $wl1:path $(,$wl:path)* $(,)?] {$($trait_defs:tt)*} $($t:tt)*) => {
-                $wl1! {
-                    #crate_identity
-                    #crate_version
-                    [$wl1 $(,$wl)*]
-                    {
-                        #(for attr in &modified_trait_item.attrs) { #attr }
-                        #{&modified_trait_item.vis}
-                        #{&modified_trait_item.unsafety}
-                        #{&modified_trait_item.auto_token}
-                        #{&modified_trait_item.trait_token}
-                        #{&modified_trait_item.ident}
-                        #{&modified_trait_item.generics}
-                        #{&modified_trait_item.colon_token}
-                        #{&modified_trait_item.supertraits}
+            #[allow(unused_macros, unused_imports, dead_code, non_local_definitions)]
+            #[doc(hidden)]
+            #[macro_export]
+            macro_rules! #temporal_mac_name {
+                (#crate_identity #crate_version [$_:path, $wl1:path $(,$wl:path)* $(,)?] {$($trait_defs:tt)*} $($t:tt)*) => {
+                    $wl1! {
+                        #crate_identity
+                        #crate_version
+                        [$wl1 $(,$wl)*]
                         {
-                            #(for item in &modified_trait_item.items) { #item }
-                        },
-                        $($trait_defs)*
+                            #(for attr in &modified.attrs) { #attr }
+                            #{&modified.vis}
+                            #{&modified.unsafety}
+                            #{&modified.auto_token}
+                            #{&modified.trait_token}
+                            #{&modified.ident}
+                            #{&modified.generics}
+                            #{&modified.colon_token}
+                            #{&modified.supertraits}
+                            {
+                                #(for item in &modified.items) { #item }
+                            },
+                            $($trait_defs)*
+                        }
+                        $($t)*
                     }
-                    $($t)*
-                }
-            };
-        }
+                };
+            }
 
-        #(if alter_macro_name.is_none()) {
-            #[doc(hidden)]
-            #[allow(unused_imports, unused_macros, dead_code)]
-            #{&trait_item.vis} use #temporal_mac_name as #{&trait_item.ident};
-        } #(else) {
-            #[doc(hidden)]
-            #[allow(unused_imports, unused_macros, dead_code)]
-            pub use #temporal_mac_name;
+            #(if alter_macro_name.is_none()) {
+                #[doc(hidden)]
+                #[allow(unused_imports, unused_macros, dead_code)]
+                #{&trait_item.vis} use #temporal_mac_name as #{&trait_item.ident};
+            } #(else) {
+                #[doc(hidden)]
+                #[allow(unused_imports, unused_macros, dead_code)]
+                pub use #temporal_mac_name;
+            }
         }
     };
-    proc_macro_error::set_dummy(output0.clone());
+    proc_macro_error::set_dummy(carrier(&modified_trait_item));
 
     let mut leaker = Leaker::from_config(leaker_config);
     leaker
         .intern_with(&trait_item.generics, |v| {
             v.visit_item_trait(trait_item);
         })
-        .unwrap_or_else(|type_leak::NotInternableError(span)| abort!(span, "use absolute path"));
+        .unwrap_or_else(|type_leak::NotInternableError(span)| {
+            abort!(
+                span,
+                "decycle: this path cannot be carried through the #[decycle] trait's generated macro";
+                help = "a #[decycle] trait definition is re-quoted into whatever module or crate routes it, where a relative path resolves differently (or not at all). Spell it absolutely (`::core::…`, `crate::…`), or add its root to `#[decycle(allowed_paths = [..])]` if it is always in scope at the use site."
+            )
+        });
+    // `intern_with` only records pending graph operations; `reduce_roots` is what turns them into
+    // the reachable-type set that `finish` reads. Without this call `finish` always returned an
+    // EMPTY referrer, so nothing was ever interned, no `Repeater` impls were emitted, and the
+    // `marker` argument was accepted and silently ignored (its "specify 'marker' arg" abort below
+    // was unreachable) — the whole interning path was dead.
+    leaker.reduce_roots();
     let referrer = leaker.finish();
 
     let typeref_impls = if !referrer.is_empty() {
@@ -133,6 +154,10 @@ pub fn process_trait(
     } else {
         quote!()
     };
+
+    // Built AFTER the interning rewrite, so the definition that travels through the macro is the
+    // rewritten one.
+    let output0 = carrier(&modified_trait_item);
 
     quote! {
         #output0

@@ -34,7 +34,6 @@ note: required for `B` to implement `m::Loop`
 27 |             where
 28 |                 A: Loop,
    |                    ---- unsatisfied trait bound introduced here
-   = help: see issue #48214
 
 error[E0275]: overflow evaluating the requirement `B: m::Loop`
   --> tests/ui/super_super_path.rs:28:17
@@ -50,4 +49,3 @@ note: required for `A` to implement `m::Loop`
 15 |             where
 16 |                 B: Loop,
    |                    ---- unsatisfied trait bound introduced here
-   = help: see issue #48214

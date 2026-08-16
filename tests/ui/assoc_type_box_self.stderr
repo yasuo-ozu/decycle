@@ -13,9 +13,18 @@ error[E0277]: the trait bound `std::boxed::Box<A>: m::Loop` is not satisfied
 19 |         type Assoc = Box<Self>;
    |                      ^^^^^^^^^ the trait `m::Loop` is not implemented for `std::boxed::Box<A>`
    |
-   = help: the following other types implement trait `m::Loop`:
-             A
-             B
+help: the following other types implement trait `m::Loop`
+  --> tests/ui/assoc_type_box_self.rs:15:5
+   |
+15 | /     impl Loop for A
+16 | |     where
+17 | |         B: Loop,
+   | |________________^ `A`
+...
+29 | /     impl Loop for B
+30 | |     where
+31 | |         A: Loop,
+   | |________________^ `B`
 note: required by a bound in `m::Loop::Assoc`
   --> tests/ui/assoc_type_box_self.rs:8:21
    |
@@ -36,7 +45,6 @@ note: required for `B` to implement `m::Loop`
 30 |     where
 31 |         A: Loop,
    |            ---- unsatisfied trait bound introduced here
-   = help: see issue #48214
 
 error[E0275]: overflow evaluating the requirement `A: m::Loop`
   --> tests/ui/assoc_type_box_self.rs:33:22

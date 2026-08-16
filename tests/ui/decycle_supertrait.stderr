@@ -18,7 +18,6 @@ note: required for `B` to implement `Base`
 28 |     where
 29 |         A: Base,
    |            ---- unsatisfied trait bound introduced here
-   = help: see issue #48214
 
 error[E0275]: overflow evaluating the requirement `B: Base`
   --> tests/ui/decycle_supertrait.rs:29:9
@@ -34,7 +33,6 @@ note: required for `A` to implement `Base`
 20 |     where
 21 |         B: Base,
    |            ---- unsatisfied trait bound introduced here
-   = help: see issue #48214
 
 error[E0275]: overflow evaluating the requirement `A: Derived`
   --> tests/ui/decycle_supertrait.rs:37:9
@@ -50,7 +48,6 @@ note: required for `B` to implement `Derived`
 44 |     where
 45 |         A: Derived,
    |            ------- unsatisfied trait bound introduced here
-   = help: see issue #48214
 
 error[E0275]: overflow evaluating the requirement `B: Derived`
   --> tests/ui/decycle_supertrait.rs:45:9
@@ -66,4 +63,3 @@ note: required for `A` to implement `Derived`
 36 |     where
 37 |         B: Derived,
    |            ------- unsatisfied trait bound introduced here
-   = help: see issue #48214

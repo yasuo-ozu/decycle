@@ -6,6 +6,16 @@
 //!    already consults the impl's param idents.
 //! 2. A raw-identifier participant (`struct r#loop`) must not panic `analyze_module` — the
 //!    node idents are cloned from the source, never re-created via `Ident::new`.
+//!
+//! …and the 2026-08-14 pass:
+//!
+//! 3. A bound wrapped in a container that is ITSELF a participant (`Wrap<Stmt>: Tr`, `Wrap`
+//!    implementing the trait too) must report both endpoints. Emitting only the head edge made
+//!    `cyclic_subgraph` answer "no participants" for a fully cyclic module, and an engine fed that
+//!    answer left the module un-decycled.
+//! 4. A bound whose target is a FOREIGN type sharing its last path segment with a participant
+//!    (`::other::Stmt: Tr`) is no edge at all — the same bare-or-`self::` rule the engine's own
+//!    `peel::cycle_types_within` / `ranked::contract` apply.
 
 use decycle_impl::analysis::{analyze_module, cyclic_subgraph, EdgeKind};
 use decycle_impl::safegraph::graph::Graph;
@@ -155,6 +165,179 @@ fn cyclic_subgraph_keeps_same_named_nodes_distinct() {
         vec![
             ("A".into(), EdgeKind::Direct, "B".into()),
             ("B".into(), EdgeKind::Direct, "A".into()),
+        ]
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Defect 3: a participating container must not swallow the participants nested inside it
+// ---------------------------------------------------------------------------------------------
+
+/// `Expr: Tr` needs `Wrap<Stmt>: Tr`, which needs `Stmt: Tr`, which needs `Wrap<Expr>: Tr`, which
+/// needs `Expr: Tr` — a genuine cycle (E0275 without decycle), and one `#[decycle(structural)]`
+/// breaks. Kept character-for-character identical to the module in
+/// `tests/nested_participant_cycle.rs`, which compiles and runs it.
+fn wrapped_cycle_module() -> syn::ItemMod {
+    parse_quote! {
+        mod structural {
+            #[decycle]
+            pub trait Tr {
+                fn depth(&self) -> u32;
+            }
+
+            pub struct Wrap<T>(pub T);
+
+            pub enum Expr {
+                Lit,
+                Nest(Box<Stmt>),
+            }
+            pub enum Stmt {
+                E(Box<Expr>),
+            }
+
+            impl<T: Tr> Tr for Wrap<T> {
+                fn depth(&self) -> u32 {
+                    self.0.depth()
+                }
+            }
+
+            impl Tr for Expr
+            where
+                Wrap<Stmt>: Tr,
+            {
+                fn depth(&self) -> u32 {
+                    match self {
+                        Expr::Lit => 0,
+                        Expr::Nest(s) => s.depth() + 1,
+                    }
+                }
+            }
+
+            impl Tr for Stmt
+            where
+                Wrap<Expr>: Tr,
+            {
+                fn depth(&self) -> u32 {
+                    match self {
+                        Stmt::E(e) => e.depth(),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The head of `Wrap<Stmt>` is a participant, so the bound is a `Direct` edge to `Wrap` — and that
+/// used to be ALL of it: the nested `Stmt` was dropped, both back-edges with it, and the graph came
+/// out acyclic. Both endpoints are now reported.
+#[test]
+fn a_participating_container_does_not_swallow_its_nested_participants() {
+    let m = wrapped_cycle_module();
+    assert_eq!(
+        edges(&m),
+        vec![
+            ("Expr".into(), EdgeKind::Direct, "Wrap".into()),
+            ("Expr".into(), EdgeKind::Peeled, "Stmt".into()),
+            ("Stmt".into(), EdgeKind::Direct, "Wrap".into()),
+            ("Stmt".into(), EdgeKind::Peeled, "Expr".into()),
+        ],
+        "`Wrap<Stmt>: Tr` reaches Wrap directly AND Stmt inside it"
+    );
+
+    let cyc = cyclic_subgraph(&analyze_module(&m, &parse_quote!(::decycle)));
+    let mut n: Vec<String> = cyc.nodes().map(|n| n.to_string()).collect();
+    n.sort();
+    assert_eq!(
+        n,
+        vec!["Expr", "Stmt"],
+        "Expr <-> Stmt recurse through Wrap; Wrap itself only forwards its own parameter"
+    );
+    assert_eq!(
+        edges_of(&cyc),
+        vec![
+            ("Expr".into(), EdgeKind::Peeled, "Stmt".into()),
+            ("Stmt".into(), EdgeKind::Peeled, "Expr".into()),
+        ]
+    );
+}
+
+/// The documented workflow end to end: analyze -> `cyclic_subgraph` -> engine. The graph-fed
+/// structural run must emit the very terminators the deriving run does — it used to be handed an
+/// empty node set and emit nothing at all, silently leaving the module un-decycled (E0275 at the
+/// use site).
+#[test]
+fn the_graph_fed_structural_run_emits_terminators_for_a_wrapped_cycle() {
+    let p: syn::Path = parse_quote!(::decycle);
+    let m = wrapped_cycle_module();
+    let cyc = cyclic_subgraph(&analyze_module(&m, &p));
+
+    let fed = decycle_impl::structural::process_module_with_graph(m.clone(), &cyc, &p).to_string();
+    assert!(
+        fed.contains("__ExprTerm_") && fed.contains("__StmtTerm_"),
+        "both cycle members must get a terminator: {fed}"
+    );
+    assert!(
+        !fed.contains("__WrapTerm_"),
+        "Wrap is not on the cycle, so it needs none"
+    );
+
+    // Strongest available statement of "this works": the graph-fed expansion is byte-identical to
+    // the deriving one, which `tests/nested_participant_cycle.rs` compiles and runs.
+    let derived = decycle_impl::structural::process_module(m, &p).to_string();
+    assert_eq!(derived, fed);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Defect 4: a foreign bound target is not an edge to the local type of the same name
+// ---------------------------------------------------------------------------------------------
+
+/// `::other::Stmt` / `crate::other::Stmt` are different items from the module's own `Stmt`. Matching
+/// on the last path segment fabricated a cycle `{Expr, Stmt}` that does not exist.
+#[test]
+fn a_foreign_bound_target_is_not_an_edge_to_the_local_type_of_that_name() {
+    let m: syn::ItemMod = parse_quote! {
+        mod ast {
+            #[decycle]
+            pub trait Tr { fn f(&self); }
+            pub struct Expr;
+            pub struct Stmt;
+            impl Tr for Expr
+            where
+                ::other::Stmt: Tr,              // direct, foreign  -> no edge
+                Box<crate::other::Stmt>: Tr,    // nested, foreign  -> no edge
+            { fn f(&self) {} }
+            impl Tr for Stmt where Expr: Tr { fn f(&self) {} }
+        }
+    };
+    assert_eq!(
+        edges(&m),
+        vec![("Stmt".into(), EdgeKind::Direct, "Expr".into())],
+        "only the local `Expr: Tr` bound is an edge"
+    );
+    let cyc = cyclic_subgraph(&analyze_module(&m, &parse_quote!(::decycle)));
+    let n: Vec<String> = cyc.nodes().map(|n| n.to_string()).collect();
+    assert!(n.is_empty(), "no cycle exists: {n:?}");
+}
+
+/// Control: the bare and the no-op `self::` spellings still name the local participant, and a local
+/// participant nested inside a FOREIGN container is still reached.
+#[test]
+fn local_spellings_and_foreign_containers_still_reach_the_participant() {
+    let m: syn::ItemMod = parse_quote! {
+        mod ast {
+            #[decycle]
+            pub trait Tr { fn f(&self); }
+            pub struct Expr;
+            pub struct Stmt;
+            impl Tr for Expr where self::Stmt: Tr { fn f(&self) {} }
+            impl Tr for Stmt where ::other::Wrap<Expr>: Tr { fn f(&self) {} }
+        }
+    };
+    assert_eq!(
+        edges(&m),
+        vec![
+            ("Expr".into(), EdgeKind::Direct, "Stmt".into()),
+            ("Stmt".into(), EdgeKind::Peeled, "Expr".into()),
         ]
     );
 }

@@ -16,17 +16,9 @@ error: cannot find attribute `decycle` in this scope
   |       ^^^^^^^
   |
   = note: `decycle` is in scope, but it is a crate, not an attribute
-help: consider importing one of these attribute macros
-  |
-5 +     use decycle::decycle;
-  |
-5 +     use decycle_macro::decycle;
-  |
 
 error[E0275]: overflow evaluating the requirement `X: A`
   --> tests/ui/recurse_level_zero.rs:12:9
    |
 12 |         X: A,
    |         ^^^^
-   |
-   = help: see issue #48214

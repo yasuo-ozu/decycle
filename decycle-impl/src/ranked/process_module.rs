@@ -235,8 +235,13 @@ fn validate_impl_where_bounds(
                 // (the resulting E0207 there is not fixable by decycle). Callers achieve this by
                 // putting such leaf bounds on a supertrait alias whose own ident is not a decycle
                 // trait, so they pass through the cyclic-bound sweep untouched.
-                let head_ok =
-                    type_head_ident(bounded_ty).is_some_and(|h| cycle_self_heads.contains(&h));
+                //
+                // Matched by the BARE (or `self::`-qualified) spelling: `crate::other::Stmt` is a
+                // different item from the local `Stmt`, and reading it as rank-lowerable skipped
+                // the abort below and let `finalize` rank-lower a foreign type — a wall of
+                // unprovable `TrRanked<…>` errors in place of one legible rejection.
+                let head_ok = crate::helper::local_type_head_ident(bounded_ty)
+                    .is_some_and(|h| cycle_self_heads.contains(&h));
                 // F6: the earlier wording ("...on non-local type") described what the check
                 // rejects, but the check doesn't actually key on locality — a bound on a
                 // module-LOCAL struct/enum (anything other than `Self` or one of this impl's
@@ -347,7 +352,15 @@ fn sharing_sources(members: &[&ItemImpl], trait_ident: &Ident) -> Vec<Vec<usize>
             }
             // Peeling already ran, so a surviving cyclic bound's own head names the member it
             // obligates (or the bound is local, handled above).
-            let Some(head) = type_head_ident(&pt.bounded_ty) else {
+            //
+            // `local_type_head_ident`, NOT `type_head_ident`: a member is named by a bare (or
+            // `self::`-qualified) ident only. Keying on the last segment made a premise on a
+            // FOREIGN type (`crate::other::B: Tr`) fabricate the edge `A -> B` against the local
+            // member that merely shares that name, and predicate sharing then unioned the
+            // sibling's own leaf premises into `A` — `A<NotClone>: Tr` stopped holding, while
+            // renaming the foreign type made the identical program compile. Same rule as
+            // `peel::cycle_types_within` and `contract::reaches_participant`.
+            let Some(head) = crate::helper::local_type_head_ident(&pt.bounded_ty) else {
                 continue;
             };
             let head = head.to_string();

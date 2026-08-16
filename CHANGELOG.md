@@ -5,9 +5,88 @@ Notable changes, following [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
-> **Release status (2026-08).** 0.5.0 is on crates.io and is what `cargo add decycle`
-> resolves to; no release has been yanked. Everything in this section ships with 0.5.1
-> (the version the workspace now carries).
+> **Release status (2026-08-15).** **0.5.1** is the newest release on crates.io and is what
+> `cargo add decycle` resolves to; no release has been yanked, and there is no 0.4.x.
+>
+> Entries in this section are **not all released yet.** 0.5.1 was published on 2026-08-08 from
+> commit `a085766`; anything committed after that is in this section but *not* in 0.5.1 — namely
+> the doubled `?Sized` relaxation fix, the `__DecycleBody` where-predicate restatement, and the
+> value-level instantiation-growth rejection. The workspace version is bumped when a release is
+> cut, so `version` matching a version already on crates.io means the tree is ahead of the last
+> publish rather than that these changes shipped.
+
+### Fixed — correctness (2026-08-15 audit)
+
+Three of these were **silent** rather than an error, which is the class this section is most
+concerned with: `super::` resolving to the wrong item, the obligation-graph API reporting no
+cycle for a cyclic module, and `#[decycle(structural)]` on an inner item selecting the ranked
+engine. The rest are valid programs that failed to compile, or diagnostics that misdirected.
+
+- **`super::` in expression position resolved to the wrong item (ranked).** `LiftRelative`
+  lifted `super::` paths in type, trait-bound and qself position but left plain value paths
+  "to resolve normally" — except adopted impls are re-emitted one or two modules deeper, so
+  `super::` then named the shadowing module instead of the intended parent. The path still
+  resolved, to a *different* item: a body calling `super::helper()` silently got the module's
+  own `helper` (1) instead of the crate root's (100), with no error or warning. Value paths
+  are now lifted through the same `__DecycleRelMod_*` alias (struct literals and patterns
+  included); the two shapes that cannot be lifted — a relative path inside a macro invocation,
+  and a `use super::…;` in a method body — are rejected rather than left wrong.
+- **The growth check rejected valid programs.** Call sites were matched on method *name*
+  alone, with arguments mapped by position in the caller's own signature, so a same-named
+  method on an unrelated trait taking its parameter by reference was reported as "reborrows
+  its own by-value generic parameter". The code compiled and ran fine without `#[decycle]`,
+  and there was no escape hatch short of renaming the other trait's method. A flagged call
+  must now resolve to the cycle's own trait method. Fixing the argument offset also exposed a
+  true positive the old mapping had been hiding (UFCS calls were off by one).
+- **A foreign type sharing a cycle head's last path segment injected a sibling's premises.**
+  `crate::other::B: Tr` was read as the local member `B`, so an unrelated impl's `where`
+  bounds were unioned into the cycle's impl — renaming the foreign type made the identical
+  program compile. Bound targets are now matched with the bare-or-`self::` rule the peel and
+  contract passes already used. The same root cause turned one intended abort into a
+  138-line `TrRanked` wall.
+- **The obligation-graph API dropped nested participants** when a bound's head was itself a
+  participant, so `cyclic_subgraph` returned an *empty* cycle set for a fully cyclic module and
+  the documented analyze → subgraph → process workflow silently emitted no terminators.
+- **A cross edge to a generic cyclic method is now registered** instead of always failing
+  closed at the floor. A generic method reached from a non-generic caller — where nothing in
+  scope can name the type argument — still fails closed, as documented.
+- **`where Self: OtherTrait` lost its cross-edge registration**, because the target stayed a
+  literal `Self` and never unified. It is now resolved to the impl's own self type, which also
+  removes a latent `E0411` in the generated register-once fn.
+- **`size_of::<Self>()` was folded into the re-entry key unconditionally**, so an
+  `impl<T: ?Sized>` failed with an `E0277` spanned at the attribute, citing a std internal and
+  advising the user to remove `?Sized` from their own API. The fold is now gated on a real
+  sizedness check.
+- **Raw identifiers panicked the macro.** `struct r#loop` or `mod r#match` produced
+  `"__DecycleNat_r#loop_m" is not a valid identifier`.
+- **The `marker` / type-interning path for a standalone `#[decycle]` trait was dead.**
+  `reduce_roots()` was never called, so nothing was ever interned, `marker` was accepted and
+  ignored, and its own "specify `marker`" abort was unreachable; the emitted trait was also
+  snapshotted before the interning rewrite. A trait naming a crate-local type now works.
+  Consequently `marker` is now genuinely *required* where the docs already said it was.
+- **Prelude trait bounds were rejected on a standalone `#[decycle]` trait** with a bare
+  "use absolute path": the leaker config never allowed the std prelude. `T: Clone` works now.
+  (Bounds with arguments, e.g. `Into<usize>`, must still be spelled absolutely — that
+  comparison lives in `type-leak`.)
+
+Structural engine:
+
+- **Associated consts were ambiguous inside a cyclic body** (`E0034`), despite being listed as
+  supported: `__DecycleBody` declared them alongside the real trait. Only associated *types*
+  are declared there now — and those turn out to be load-bearing, not merely harmless.
+- **An impl spelling the concrete self type where the trait says `Self`** — legal Rust — failed
+  with `E0053` whose "help" told the user to write `__ATerm_<nonce>`. Such signatures are now
+  canonicalised against the trait declaration, and where the declaration is not available
+  (a `use`-imported trait) the error names the actual fix.
+- **A method generic whose bound mentions `Self`** (`F: Fn(&Self)`) could never compile, and
+  two of the engine's own diagnostics recommended it. It is rejected with a clear message and
+  those diagnostics now point at `fn(&Self)` / `&dyn Fn(&Self)`.
+- **Method attribute macros expanded twice**, contradicting the documented contract:
+  `#[tracing::instrument]`-style attributes produced two nested spans per call, and an
+  attribute emitting a named item failed outright with `E0407`.
+- **`#[decycle(...)]` arguments on an item *inside* a `#[decycle]` module were silently
+  discarded** — including `structural`, so a user who annotated the inner trait instead of the
+  module silently got the ranked engine. They are now rejected.
 
 ### Fixed — soundness (2026-08-04 audit)
 
@@ -275,5 +354,4 @@ Pinned by `tests/ui/value_generic_growth_{ranked,structural,apit}.rs` and
   latest `syn` / `quote` / `unicode-ident`. Down from a would-be 1.87 by switching to
   `type-leak 0.7` (backed by `safegraph`, MSRV 1.56) from `type-leak 0.6` (backed by
   `gotgraph`, empirical MSRV 1.87), and by dropping the `toml` dependency (renamed-crate
-  detection no longer parses the consumer's `Cargo.toml`). `docs/` excluded from the
-  published crate.
+  detection no longer parses the consumer's `Cargo.toml`).

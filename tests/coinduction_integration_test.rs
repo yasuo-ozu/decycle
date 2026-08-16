@@ -59,7 +59,9 @@ fn test_circular_coinduction_minimal() {
             name: "beta".to_string(),
             child_b: Some(Box::new(node_b)),
         };
-        assert!(node_a2.test_method().contains("NodeA:beta"));
+        // Exact, not `contains`: the recursive part is the `:16` suffix, so a `contains("NodeA:beta")`
+        // assertion passes even when the cycle contributes nothing at all.
+        assert_eq!(node_a2.test_method(), "NodeA:beta:16");
     });
 }
 
@@ -74,6 +76,7 @@ fn test_circular_coinduction_sizes() {
             count: 5,
             child_a: Some(Box::new(node_a)),
         };
-        assert!(node_b.local_method() >= 5);
+        // Exact: `count` alone is 5, so `>= 5` held even if the cross-crate cycle never recursed.
+        assert_eq!(node_b.local_method(), 18);
     });
 }

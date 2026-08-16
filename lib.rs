@@ -424,9 +424,10 @@ pub mod __reentry {
             found.expect(
                 "decycle: re-entry fn not registered before the floor was reached. This floor's \
                  key had no same-instantiation frame run on this thread's descent first — e.g. a \
-                 generic method's first descent at cycle width > recurse_level (including \
-                 self-recursion consuming ranks before the first generic cross-edge call), or an \
-                 impl whose cyclic bound targets a bare type parameter. Increase recurse_level. \
+                 generic method reached from a NON-generic caller, so no scope on the way down \
+                 could name its type argument (a cross edge from a caller declaring the same \
+                 generics is registered from that caller's prologue, and does not land here), or \
+                 an impl whose cyclic bound targets a bare type parameter. Increase recurse_level. \
                  (This can also fire when the call runs from a thread-local destructor, after the \
                  registry for this thread has already been torn down.)",
             )

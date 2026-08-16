@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Toolchain drift is invisible to a push-only trigger: the `ui` snapshots and the floating-stable
+  # clippy job both depend on whatever rustc ships next, so without a timer a break only surfaces on
+  # whichever unlucky PR comes after the release.
+  schedule:
+    - cron: "0 6 * * 1"
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,26 +22,55 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Full workspace suite: unit tests, integration tests, and doctests.
-      # `--skip ui` excludes the trybuild snapshot test (`fn ui` in tests/trybuild.rs
-      # is the only `#[test]` named `ui` in the workspace) so channel-sensitive
-      # .stderr drift can never fail this required step; trybuild runs separately below.
-      - name: cargo test (skip trybuild snapshots)
-        run: cargo test --workspace -- --skip ui
-      # The trybuild UI .stderr snapshots are blessed on stable rustc and are
-      # channel/version-sensitive. A future rustc release can legitimately drift them,
-      # which is expected occasionally, so this step is allowed to fail without failing
-      # the job. To re-bless the snapshots: TRYBUILD=overwrite cargo test --test trybuild
-      - name: cargo test --test trybuild (UI snapshots, may drift)
-        run: cargo test --test trybuild
-        continue-on-error: true
+      #
+      # The snapshot half of the trybuild suite is `#[ignore]`d (see tests/trybuild.rs) so it is
+      # skipped here without a name filter and runs in the `ui` job below instead. The old spelling
+      # was `-- --skip ui`, which is a SUBSTRING match: it happened to catch only `fn ui`, but any
+      # later test whose name contained "ui" would have been silently dropped from the required job.
+      # `tests/ui/pass/*` still runs here, because a must-compile case has no snapshot and therefore
+      # cannot drift — a failure there is always a real regression.
+      - name: cargo test
+        run: cargo test --workspace
+
+  # The `.stderr` snapshots are compared against rustc's exact diagnostics, so they are version
+  # sensitive and must run on a PINNED toolchain — on a floating `stable` a new release silently
+  # invalidates them. This job is REQUIRED. It used to be a `continue-on-error: true` step, which
+  # meant every diagnostic the crate pins — the `async fn` rejection, the RPITIT and trait-object
+  # rejections, `recurse_level = 0`, the growth checks, ~40 others — could regress with CI green.
+  # (When this was audited on 2026-08-15 the snapshots were in fact broken: 25 of 39 cases
+  # mismatched on a then-current stable, and nobody had noticed.)
+  #
+  # To re-bless after an intentional diagnostic change, use the SAME toolchain:
+  #   TRYBUILD=overwrite cargo +1.96.0 test --test trybuild -- --ignored
+  # Bumping the pin is a deliberate act: change it here and re-bless in the same commit.
+  ui:
+    name: ui snapshots (pinned 1.96.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --test trybuild -- --ignored
 
   msrv:
     name: build (1.71.0 MSRV)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - uses: dtolnay/rust-toolchain@1.71.0
       - uses: Swatinem/rust-cache@v2
+      # Resolve with a MODERN cargo, then build with the old one.
+      #
+      # cargo 1.71 predates MSRV-aware resolution, so left to itself it takes the newest
+      # semver-compatible version of everything. Today `syn`/`quote`/`proc-macro2` all still declare
+      # 1.71, but the day any of them bumps to 1.72 this job turns red for a reason that has nothing
+      # to do with this crate's floor. A current cargo asked to prefer MSRV-compatible versions picks
+      # a set 1.71 can actually build, and `--locked` then holds the old cargo to that choice.
+      - name: resolve dependencies with an MSRV-aware cargo
+        env:
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
+        run: cargo +stable generate-lockfile
       # The declared MSRV covers *building the published library*, not the test suite: the
       # dev-dependency `trybuild` needs a newer rustc, so `cargo test` cannot run on this floor.
       #
@@ -44,9 +78,9 @@ jobs:
       # `default-features = false`. Its default `matrix` feature pulls `sprs`, which declares
       # rustc 1.88 and dragged the whole crate's floor up with it; nothing here needs the matrix
       # backend. `type-leak` already depends on `safegraph` with default features off, so that
-      # second path never contributed. Cargo.lock is gitignored, so this job resolves fresh.
+      # second path never contributed. Cargo.lock is gitignored, so the step above resolves fresh.
       - name: cargo build (decycle + macro + impl)
-        run: cargo build -p decycle -p decycle-macro -p decycle-impl
+        run: cargo +1.71.0 build -p decycle -p decycle-macro -p decycle-impl --locked
 
   clippy:
     name: clippy (stable)
@@ -97,6 +131,17 @@ jobs:
       - run: cargo miri test --test structural_sig
       - run: cargo miri test --test reentry_bridge
       - run: cargo miri test --test bareparam_reentry
+      # Added 2026-08-15. Both post-date the original list and exercise `unsafe` shapes none of the
+      # targets above reach, which is exactly the rule this job's comment states:
+      #   * maybe_sized_method_generic — the only target where the re-entry fn pointer carries WIDE
+      #     (fat) pointer arguments across the floor transmute: `?Sized` method generics
+      #     instantiated at `[u8]` and at `dyn Stream<Atom = u8>`. Measured 56 s; its recursion
+      #     depth drops to 60 under `cfg(miri)` (see DEPTH in that file), since the shape is what
+      #     matters here, not the depth.
+      #   * structural_body_trait_where — structural casts on GENERIC trait impls whose argument
+      #     and return types are associated-type projections over Box-bearing self types. 0.3 s.
+      - run: cargo miri test --test maybe_sized_method_generic
+      - run: cargo miri test --test structural_body_trait_where
 
   # The `no_std` claim is only worth making if it is checked: the facade must build for a target
   # with no std at all, with default features off. `x86_64-unknown-none` is a core-only target, so
@@ -115,3 +160,12 @@ jobs:
       - run: cargo build -p decycle --no-default-features
       - run: cargo build -p decycle --no-default-features --features std
       - run: cargo build -p decycle --no-default-features --features api
+      # The steps above build only the FACADE, which contains no expansions — so on their own they
+      # say nothing about the code the macro emits. This fixture actually runs `#[decycle]` with
+      # default features off, covering the two combinations documented as supported without `std`
+      # (structural, and ranked with `support_infinite_cycle = false`). It is outside the workspace
+      # on purpose; see the root manifest.
+      - name: build a real no_std consumer (expands the macro)
+        run: cargo build --manifest-path tests/nostd_consumer/Cargo.toml --target x86_64-unknown-none
+      - name: build the same consumer for the host
+        run: cargo build --manifest-path tests/nostd_consumer/Cargo.toml

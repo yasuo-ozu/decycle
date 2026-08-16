@@ -19,6 +19,18 @@
 
 use decycle::decycle;
 
+/// How deep these tests drive the cycle past the rank floor.
+///
+/// The value under test is the *shape* — a re-entry fn pointer whose arguments are wide pointers
+/// (`[u8]`, `dyn Stream<Atom = u8>`) crossing the floor transmute — not the depth. Miri is ~100x
+/// slower, so it gets a depth that still crosses the floor many times over while staying inside a
+/// CI budget; this target is on the miri job's list precisely because no other target exercises a
+/// fat-pointer argument through that transmute.
+#[cfg(not(miri))]
+const DEPTH: usize = 2000;
+#[cfg(miri)]
+const DEPTH: usize = 60;
+
 pub trait Stream {
     type Atom;
     fn next(&mut self) -> Option<Self::Atom>;
@@ -142,9 +154,9 @@ fn depth_sized(a: &sized::A) -> usize {
 #[test]
 fn maybe_sized_method_generic_is_unbounded() {
     use relaxed::Parse;
-    let mut src = Src(vec![1u8; 2000].into_iter());
+    let mut src = Src(vec![1u8; DEPTH].into_iter());
     let a = <relaxed::A as Parse<u8>>::parse_stream(&mut src).unwrap();
-    assert_eq!(depth_relaxed(&a), 2000);
+    assert_eq!(depth_relaxed(&a), DEPTH);
 }
 
 /// `?Sized` is load-bearing: the same cycle driven through a trait object.
@@ -160,9 +172,9 @@ fn maybe_sized_method_generic_accepts_a_trait_object() {
 #[test]
 fn sized_method_generic_still_works() {
     use sized::Parse;
-    let mut src = Src(vec![1u8; 2000].into_iter());
+    let mut src = Src(vec![1u8; DEPTH].into_iter());
     let a = <sized::A as Parse<u8>>::parse_stream(&mut src).unwrap();
-    assert_eq!(depth_sized(&a), 2000);
+    assert_eq!(depth_sized(&a), DEPTH);
 }
 
 // ── neighbouring shapes ───────────────────────────────────────────────────────────────────────
@@ -319,37 +331,37 @@ mod where_clause {
 fn relaxation_as_the_only_bound_is_unbounded() {
     use only_bound::Walk;
     let src: &[u8] = b"unsized"; // `S = [u8]`: the relaxation is doing real work
-    let a = <only_bound::A as Walk>::walk(src, 2000).unwrap();
+    let a = <only_bound::A as Walk>::walk(src, DEPTH).unwrap();
     let (mut d, mut cur) = (0usize, &*a.0);
     while let Some(inner) = &cur.0 {
         d += 1;
         cur = &*inner.0;
     }
-    assert_eq!(d, 2000);
+    assert_eq!(d, DEPTH);
 }
 
 #[test]
 fn a_second_unrelaxed_method_generic_is_undisturbed() {
     use two_generics::Parse;
-    let mut src = Src(vec![1u8; 2000].into_iter());
+    let mut src = Src(vec![1u8; DEPTH].into_iter());
     let a = <two_generics::A as Parse<u8>>::parse_stream(&mut src, "carried").unwrap();
     let (mut d, mut cur) = (0usize, &*a.0);
     while let Some(inner) = &cur.0 {
         d += 1;
         cur = &*inner.0;
     }
-    assert_eq!(d, 2000);
+    assert_eq!(d, DEPTH);
 }
 
 #[test]
 fn the_where_clause_spelling_also_works() {
     use where_clause::Parse;
-    let mut src = Src(vec![1u8; 2000].into_iter());
+    let mut src = Src(vec![1u8; DEPTH].into_iter());
     let a = <where_clause::A as Parse<u8>>::parse_stream(&mut src).unwrap();
     let (mut d, mut cur) = (0usize, &*a.0);
     while let Some(inner) = &cur.0 {
         d += 1;
         cur = &*inner.0;
     }
-    assert_eq!(d, 2000);
+    assert_eq!(d, DEPTH);
 }

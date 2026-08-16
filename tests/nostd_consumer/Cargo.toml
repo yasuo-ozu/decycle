@@ -1,0 +1,14 @@
+# Deliberately NOT a workspace member (see the root manifest's `[workspace] exclude`).
+# Cargo unifies features across a workspace, so a member asking for `default-features = false`
+# would still receive the defaults every other member pulls in — silently defeating the point of
+# this fixture. Its own empty `[workspace]` table keeps it a standalone crate.
+[package]
+name = "nostd_consumer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+decycle = { path = "../..", default-features = false }
+
+[workspace]

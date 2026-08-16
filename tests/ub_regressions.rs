@@ -4,10 +4,15 @@
 //!
 //! | test | catches |
 //! |---|---|
-//! | `registry_key_collision_calls_wrong_fn`      | an unencodable (closure) re-entry key is refused |
-//! | `registry_stale_entry_defeats_fail_closed`   | same, reached via a leftover from a panicked descent |
+//! | `colliding_closure_key_never_dispatches_the_wrong_fn` | an unencodable (closure) re-entry key is refused |
+//! | `leftover_closure_entry_never_dispatches_the_wrong_fn` | same, reached via a leftover from a panicked descent |
 //! | `floor_crossing_preserves_fn_pointer_provenance` | miri only: provenance through the floor |
 //! | `dyn_fn_self_arg_keeps_a_valid_vtable`       | miri only: `&dyn Fn(&Self)` vtable validity |
+//!
+//! Note what the first two do **not** cover. Both instantiate with closures, so today they always
+//! take the `assert_key_encodable` rejection branch and never reach a floor, a registry lookup, or
+//! the scoping machinery. That machinery is pinned by `tests/scope_guard_pin.rs` instead, which
+//! uses named block-local types to build a colliding key the closure rejection does not filter.
 //!
 //! The last two are invisible natively — run them under miri:
 //!
@@ -137,7 +142,7 @@ where
 }
 
 #[test]
-fn registry_key_collision_calls_wrong_fn() {
+fn colliding_closure_key_never_dispatches_the_wrong_fn() {
     use collide::Fold;
     // `c_add` and `c_mul` share a `type_name` and a layout, so they map to one registry slot.
     // The body's callback starts a nested descent with `c_mul` in the middle of `c_add`'s, which
@@ -217,16 +222,26 @@ mod stale {
 ///
 /// The leftover is harmless when it is the right fn (that is the healing case) and harmful only
 /// when a colliding key makes it the wrong one. So the root cause here is the KEY, not the
-/// lifetime: `type_name` collapses all closures in a function to `..::{{closure}}` and the
-/// fingerprint folds only size+align. A real fix needs a key that separates two same-layout
-/// closures; the obvious candidates fail (`TypeId` needs `'static`; a per-monomorphization fn
-/// address can be merged by LLVM's identical-code folding).
+/// lifetime.
+///
+/// **The `{{closure}}` filter does not close this class** (2026-08-15 audit). `type_name` is not
+/// injective for *named* types either — two `struct S` declared in different blocks of one
+/// function both render `<crate>::<fn>::S`, and so do two semver-incompatible versions of one
+/// crate — while the fingerprint folds only size+align. `key_is_nameable` therefore waves such a
+/// key through, and because a *created* (as opposed to displaced) registration deliberately
+/// survives its scope, a persisted entry under a colliding key still dispatches the wrong fn.
+/// That was reproduced at the DEFAULT `recurse_level`, via the documented bare-param "prime once"
+/// shape, yielding both a wrong result and a SIGSEGV from safe code. A real fix needs a key that
+/// actually identifies a monomorphisation; the obvious candidates fail (`TypeId` needs `'static`;
+/// a per-monomorphization fn address can be merged by LLVM's identical-code folding), so the
+/// realistic options are verifying the entry on lookup, threading the re-entry fn down the rank
+/// chain as an argument, or option (b) below.
 ///
 /// The choice is therefore: (a) keep prime-once/healing and accept this residual wrong-fn window,
 /// or (b) drop them, remove entries on frame exit, and take the fail-closed panic instead — safe,
 /// but a breaking behavior change for the bare-param pattern.
 #[test]
-fn registry_stale_entry_defeats_fail_closed() {
+fn leftover_closure_entry_never_dispatches_the_wrong_fn() {
     use stale::Fold;
     // Same collision reached the other way: `c_mul`'s descent registers the shared slot and then
     // hits the documented fail-closed panic, leaving its entry behind. A later, unrelated call

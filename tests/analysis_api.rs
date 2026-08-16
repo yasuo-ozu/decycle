@@ -33,5 +33,17 @@ fn reachable_and_accepted_by_both_engines() {
     // The same graph is accepted by an engine's graph-taking entry point. Only `structural` can be
     // called from here — `ranked` reports through `proc_macro_error`, which panics outside a
     // proc-macro entry point, so it is covered by `tests/graph_bridge` instead.
-    let _structural = decycle::structural::process_module_with_graph(m, &g, &p);
+    //
+    // The result has to be inspected, not discarded: on rejection this entry point *returns*
+    // `quote! { #compile_error #module }` rather than panicking, so binding it to `_` made the
+    // "accepted" half of this test's name unverifiable.
+    let structural = decycle::structural::process_module_with_graph(m, &g, &p).to_string();
+    assert!(
+        !structural.contains("compile_error"),
+        "structural rejected the analysed graph: {structural}"
+    );
+    assert!(
+        structural.contains("__DecycleBody"),
+        "structural accepted the graph but emitted no terminator machinery: {structural}"
+    );
 }

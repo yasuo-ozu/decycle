@@ -23,6 +23,28 @@ traits with circular dependencies that would otherwise fail to compile.
 decycle = "0.5.1"
 ```
 
+### Cargo features
+
+Both are on by default; a normal `std` user needs neither flag.
+
+| feature | default | what turning it **off** does |
+| --- | --- | --- |
+| `std` | on | Drops the re-entry registry, which is a `thread_local!` map. The ranked engine then requires `support_infinite_cycle = false`; asking for unbounded re-entry without `std` is a compile error naming `UnboundedReentryRequiresTheDecycleStdFeature`. The structural engine is unaffected — it emits no runtime machinery at all. |
+| `api` | on | Drops the programmatic surface (`decycle::{analysis, ranked, structural, safegraph}`). This is what keeps `decycle-impl` out of your *target* graph, and is therefore required for `no_std`. |
+
+**`no_std` needs `default-features = false`.** With the defaults on, `api` pulls `decycle-impl`
+(and `proc-macro2`) into the target graph, so a core-only target fails to build. The working
+spelling is:
+
+```toml
+[dependencies]
+decycle = { version = "0.5.1", default-features = false }
+```
+
+Note that turning `api` off does **not** shrink a normal native build: `decycle-macro` depends on
+`decycle-impl` unconditionally, so it is compiled for the host either way. The feature exists to
+keep it off the *target*, which is what makes cross-compiling to a core-only target work.
+
 ## Why Decycle?
 
 Without decycle, circular trait obligations cause compilation errors. Here's
@@ -173,7 +195,8 @@ mod cycle {
 | Deep-recursion **runtime cost** | not zero-cost | **zero-cost** |
 | **Unbounded depth** | only when `support_infinite_cycle = true` | always |
 | Re-entry across **several instantiations** of a generic method | **✓** | ✗ |
-| **`no_std`** | only when `support_infinite_cycle = false` | **✓** |
+| **`no_std`** | only when `support_infinite_cycle = false` *and* `default-features = false` | **✓** with `default-features = false` |
+| **`#[track_caller]`** on a cyclic method | only when `support_infinite_cycle = false` (the fn-pointer indirection loses the caller location past the floor) | **✓** |
 | Arg mentioning `Self`: **`impl Fn(&Self)`** (APIT) | **✓** — but see the row below | ✗ (use generics) |
 | Generic arg instantiated with an **anonymous type** (closure, `async` block, `-> impl Trait` value) | ✗ in unbounded mode — see the closure note below | **✓** |
 | Arg mentioning `Self`: **`fn(&Self)`** / **`&dyn Fn(&Self)`** | ✗ | **✓** |
@@ -326,7 +349,10 @@ actionable panic that cannot corrupt or poison other cycles or threads:
 - a method instantiated with a **closure** or `async` block (see the closure note under
   *Two algorithms*);
 - a **generic method** whose floor is reached before any frame of that instantiation ran on
-  this thread — e.g. a first descent at cycle width greater than `recurse_level`;
+  this thread, *and* whose instantiation no frame on the way down can name. A cross edge from a
+  caller that declares the same generics is registered from that caller's prologue, so it works;
+  what still fails closed is a generic method reached from a **non-generic** caller, where the
+  type argument is chosen inside the body and nothing in scope can spell it;
 - an impl whose cyclic bound targets a **bare type parameter**
   (`impl<T: Cb> Ca for Wrap<T>`), or a heterogeneous side-bound cycle whose registering impl
   does not syntactically cover what a reachable sibling needs. Such a cycle is still unbounded
@@ -453,7 +479,9 @@ mod ast {
 ```
 
 **Supported.** Self-, multi-type, multiroot and **cross-trait** cycles; every receiver
-shape (`&self`, `&mut self`, owned `self`, `self: Box<Self>`); method generics;
+shape (`&self`, `&mut self`, owned `self`, `self: Box<Self>`); method generics (but a method
+generic whose *bound* mentions `Self`, such as `F: Fn(&Self)`, is rejected — use `fn(&Self)` or
+`&dyn Fn(&Self)`, or the ranked engine);
 argument-position `impl Trait`; destructured parameters; associated types/consts;
 multiple `#[decycle]` traits on one type; `unsafe` traits (emitted as `unsafe impl`);
 any third-party trait brought in with `#[decycle] use` and implemented for your own types;

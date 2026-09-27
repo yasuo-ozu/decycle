@@ -1,6 +1,6 @@
 [package]
 name = "decycle"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 rust-version = "1.71"
 description = "Solve circular trait obligation"
@@ -19,8 +19,8 @@ exclude = ["decycle.png", "tests/", ".github/"]
 path = "lib.rs"
 
 [dependencies]
-decycle-macro = { path = "macro", version = "0.5.2" }
-decycle-impl = { path = "decycle-impl", version = "0.5.2", optional = true }
+decycle-macro = { path = "macro", version = "0.5.3" }
+decycle-impl = { path = "decycle-impl", version = "0.5.3", optional = true }
 
 [features]
 default = ["std", "api"]

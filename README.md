@@ -20,7 +20,7 @@ traits with circular dependencies that would otherwise fail to compile.
 
 ```toml
 [dependencies]
-decycle = "0.5.2"
+decycle = "0.5.3"
 ```
 
 ### Cargo features
@@ -38,7 +38,7 @@ spelling is:
 
 ```toml
 [dependencies]
-decycle = { version = "0.5.2", default-features = false }
+decycle = { version = "0.5.3", default-features = false }
 ```
 
 Note that turning `api` off does **not** shrink a normal native build: `decycle-macro` depends on

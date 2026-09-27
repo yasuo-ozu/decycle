@@ -3,6 +3,16 @@
 Notable changes, following [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **A `macro_rules!` definition inside a ranked `#[decycle]` module is now accepted** and re-emitted
+  in place, instead of being rejected with "macro is not supported in #[decycle] module". It is
+  emitted ahead of the helper modules that carry the rewritten impls, so the macro remains usable
+  inside cyclic impl bodies. (The structural engine already passed it through.) An item-position
+  macro *call* is still rejected, since it may expand to impls decycle cannot see.
+
 ## [0.5.2] — 2026-08-16
 
 > **Release status.** This section spans several releases, because the workspace version is

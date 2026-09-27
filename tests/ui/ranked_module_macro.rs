@@ -1,5 +1,6 @@
 //! A macro invocation in item position inside a `#[decycle]` module is opaque to the rewrite (decycle
-//! can't see what it expands to) — reject it clearly.
+//! can't see what it expands to) — reject it clearly. (A `macro_rules!` *definition* is accepted; see
+//! `tests/macro_rules_in_module.rs`.)
 use decycle::decycle;
 
 #[decycle]

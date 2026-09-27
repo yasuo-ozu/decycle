@@ -1,11 +1,11 @@
 error: macro is not supported in #[decycle] module
-  --> tests/ui/ranked_module_macro.rs:18:5
+  --> tests/ui/ranked_module_macro.rs:19:5
    |
-18 |     stray_macro!();
+19 |     stray_macro!();
    |     ^^^^^^^^^^^^^^^
 
 error: cannot find macro `stray_macro` in this scope
-  --> tests/ui/ranked_module_macro.rs:18:5
+  --> tests/ui/ranked_module_macro.rs:19:5
    |
-18 |     stray_macro!();
+19 |     stray_macro!();
    |     ^^^^^^^^^^^

@@ -545,6 +545,11 @@ fn process_module_inner(
             Item::Mod(item_mod) => {
                 check_submodule(item_mod, decycle_crate);
             }
+            // A `macro_rules!` DEFINITION is transparent: it introduces no item the rewrite has to
+            // see, and it is re-emitted in place among the raw contents — ahead of the nested helper
+            // modules that carry the adopted impls, so its textual scope still covers their bodies.
+            // Any other item-position macro call may expand to impls or traits decycle can't see.
+            Item::Macro(m) if m.mac.path.is_ident("macro_rules") => (),
             Item::Macro(_) => abort!(&item, "macro is not supported in #[decycle] module"),
             _ => (),
         }

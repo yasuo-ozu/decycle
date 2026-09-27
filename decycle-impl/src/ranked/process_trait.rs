@@ -37,7 +37,7 @@ pub fn process_trait(
         syn::Ident::new(
             &format!(
                 "__{}_temporal_{}_{}",
-                &trait_item.ident, random_suffix, discriminant
+                trait_item.ident, random_suffix, discriminant
             ),
             trait_item.ident.span(),
         )

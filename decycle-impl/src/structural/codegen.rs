@@ -40,7 +40,7 @@ pub(crate) fn subst_self(ty: &Type, replacement: &Type) -> Type {
             // reaches this substitution no unresolvable projection remains — this arm is
             // belt-and-braces for the resolvable leftovers.)
             if let Some(q) = &mut tp.qself {
-                q.ty = Box::new(subst_self(&q.ty, replacement));
+                *q.ty = subst_self(&q.ty, replacement);
             }
             for seg in tp.path.segments.iter_mut() {
                 subst_self_in_args(&mut seg.arguments, replacement);
@@ -88,7 +88,7 @@ pub(crate) fn subst_self(ty: &Type, replacement: &Type) -> Type {
                 input.ty = subst_self(&input.ty, replacement);
             }
             if let syn::ReturnType::Type(_, t) = &mut bf.output {
-                *t = Box::new(subst_self(t, replacement));
+                **t = subst_self(t, replacement);
             }
             Type::BareFn(bf)
         }
@@ -121,7 +121,7 @@ fn subst_self_in_args(args: &mut PathArguments, replacement: &Type) {
                 *t = subst_self(t, replacement);
             }
             if let syn::ReturnType::Type(_, t) = &mut p.output {
-                *t = Box::new(subst_self(t, replacement));
+                **t = subst_self(t, replacement);
             }
         }
         PathArguments::None => {}
@@ -371,7 +371,7 @@ fn canonicalize_method_sig(
         (out.sig.inputs.first_mut(), decl.inputs.first())
     {
         if r.colon_token.is_some() {
-            r.ty = Box::new(canon_self(&r.ty, &dr.ty, self_ty));
+            *r.ty = canon_self(&r.ty, &dr.ty, self_ty);
         }
     }
     // Typed parameters, matched by position against the declaration's own typed parameters.
@@ -387,13 +387,13 @@ fn canonicalize_method_sig(
     for input in out.sig.inputs.iter_mut() {
         if let syn::FnArg::Typed(pt) = input {
             if let Some(d) = decl_typed.get(ix) {
-                pt.ty = Box::new(canon_self(&pt.ty, &d.ty, self_ty));
+                *pt.ty = canon_self(&pt.ty, &d.ty, self_ty);
             }
             ix += 1;
         }
     }
     if let (ReturnType::Type(_, t), ReturnType::Type(_, d)) = (&mut out.sig.output, &decl.output) {
-        *t = Box::new(canon_self(t, d, self_ty));
+        **t = canon_self(t, d, self_ty);
     }
     out
 }
@@ -471,7 +471,7 @@ fn canon_self(impl_ty: &Type, decl_ty: &Type, self_ty: &Type) -> Type {
             if let (syn::ReturnType::Type(_, t), syn::ReturnType::Type(_, dt)) =
                 (&mut i.output, &d.output)
             {
-                *t = Box::new(canon_self(t, dt, self_ty));
+                **t = canon_self(t, dt, self_ty);
             }
             Type::BareFn(i)
         }
@@ -523,7 +523,7 @@ fn canon_self_args(
             if let (syn::ReturnType::Type(_, t), syn::ReturnType::Type(_, dt)) =
                 (&mut i.output, &d.output)
             {
-                *t = Box::new(canon_self(t, dt, self_ty));
+                **t = canon_self(t, dt, self_ty);
             }
             PathArguments::Parenthesized(i)
         }
@@ -781,11 +781,11 @@ fn rec_method(
     run_sig.ident = run.clone();
     for input in run_sig.inputs.iter_mut() {
         if let syn::FnArg::Typed(pt) = input {
-            pt.ty = Box::new(normalize_projections(&pt.ty, &ctx, 0)?);
+            *pt.ty = normalize_projections(&pt.ty, &ctx, 0)?;
         }
     }
     if let ReturnType::Type(_, t) = &mut run_sig.output {
-        *t = Box::new(normalize_projections(t, &ctx, 0)?);
+        **t = normalize_projections(t, &ctx, 0)?;
     }
     // The body-holding impl fn carries the user's `mut self` back (stripped from the decl above) so
     // the body's mutation of `self` still compiles; a by-value receiver's binding mode is free to
@@ -1196,7 +1196,7 @@ fn normalize_sig(
                     let fresh = arg_ident(i, nonce);
                     let orig = (*pt.pat).clone();
                     rebinds.push(quote! { let #orig = #fresh; });
-                    pt.pat = Box::new(parse_quote!(#fresh));
+                    *pt.pat = parse_quote!(#fresh);
                 }
             }
             _ => {}
@@ -1417,7 +1417,7 @@ fn normalize_projections(ty: &Type, ctx: &ProjCtx, depth: u8) -> syn::Result<Typ
                 }
                 // Self-free base: keep the projection, normalizing base + segment arguments.
                 let mut tp2 = tp.clone();
-                tp2.qself.as_mut().unwrap().ty = Box::new(base);
+                *tp2.qself.as_mut().unwrap().ty = base;
                 for seg in tp2.path.segments.iter_mut() {
                     normalize_in_args(&mut seg.arguments, ctx, depth)?;
                 }
@@ -1473,7 +1473,7 @@ fn normalize_projections(ty: &Type, ctx: &ProjCtx, depth: u8) -> syn::Result<Typ
                 input.ty = normalize_projections(&input.ty, ctx, depth)?;
             }
             if let syn::ReturnType::Type(_, t) = &mut bf.output {
-                *t = Box::new(normalize_projections(t, ctx, depth)?);
+                **t = normalize_projections(t, ctx, depth)?;
             }
             Ok(Type::BareFn(bf))
         }
@@ -1509,7 +1509,7 @@ fn normalize_in_args(args: &mut PathArguments, ctx: &ProjCtx, depth: u8) -> syn:
                 *t = normalize_projections(t, ctx, depth)?;
             }
             if let syn::ReturnType::Type(_, t) = &mut p.output {
-                *t = Box::new(normalize_projections(t, ctx, depth)?);
+                **t = normalize_projections(t, ctx, depth)?;
             }
         }
         PathArguments::None => {}

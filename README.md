@@ -230,13 +230,13 @@ mod cycle {
 >     }
 > }
 >
-> fn main() {
->     use fold_m::Fold;
->     // Rejected at runtime (panic: "... anonymous type ..."): a closure.
->     // fold_m::A.fold(|v| v + 7, 25);
->     // Works, at any depth.
->     assert_eq!(fold_m::A.fold((|v| v + 7) as fn(usize) -> usize, 25), 32);
-> }
+> # fn main() {
+> use fold_m::Fold;
+> // Rejected at runtime (panic: "... anonymous type ..."): a closure.
+> // fold_m::A.fold(|v| v + 7, 25);
+> // Works, at any depth.
+> assert_eq!(fold_m::A.fold((|v| v + 7) as fn(usize) -> usize, 25), 32);
+> # }
 > ```
 >
 > A closure that *captures* cannot be coerced to a `fn` pointer — pass its captures as ordinary

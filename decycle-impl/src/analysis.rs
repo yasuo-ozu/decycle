@@ -399,14 +399,16 @@ fn nested_participants(ty: &Type, participants: &HashSet<Ident>) -> Vec<Ident> {
 /// do it here and hand out owned data.
 fn decompose(graph: &VecGraph<Ident, EdgeKind>) -> (Vec<Ident>, Vec<(usize, usize, EdgeKind)>) {
     graph.scope(|ctx| {
-        let order: Vec<_> = ctx.node_indices().collect();
+        let order: Vec<_> = ctx.node_indices().map(|ix| ix.to_ix()).collect();
         let pos: HashMap<_, usize> = order.iter().enumerate().map(|(i, ix)| (*ix, i)).collect();
         let nodes: Vec<Ident> = order.iter().map(|ix| ctx.node(*ix).clone()).collect();
         let edges = ctx
             .edge_indices()
             .map(|e| {
-                let [a, b] = ctx.endpoints(e);
-                (pos[&a], pos[&b], *ctx.edge(e))
+                let e = e.to_ix();
+                let mut ends = ctx.endpoints(e).map(|n| pos[&n.to_ix()]);
+                let (a, b) = (ends.next().unwrap(), ends.next().unwrap());
+                (a, b, *ctx.edge(e))
             })
             .collect();
         (nodes, edges)
@@ -449,14 +451,16 @@ pub fn cyclic_subgraph(graph: &VecGraph<Ident, EdgeKind>) -> VecGraph<Ident, Edg
     // Everything is computed inside ONE scope, keyed by node position rather than by name, so a
     // caller-built graph with two same-named nodes keeps them distinct throughout.
     let (nodes, edges, cyclic) = graph.scope(|ctx| {
-        let order: Vec<_> = ctx.node_indices().collect();
+        let order: Vec<_> = ctx.node_indices().map(|ix| ix.to_ix()).collect();
         let pos: HashMap<_, usize> = order.iter().enumerate().map(|(i, ix)| (*ix, i)).collect();
         let nodes: Vec<Ident> = order.iter().map(|ix| ctx.node(*ix).clone()).collect();
         let edges: Vec<(usize, usize, EdgeKind)> = ctx
             .edge_indices()
             .map(|e| {
-                let [a, b] = ctx.endpoints(e);
-                (pos[&a], pos[&b], *ctx.edge(e))
+                let e = e.to_ix();
+                let mut ends = ctx.endpoints(e).map(|n| pos[&n.to_ix()]);
+                let (a, b) = (ends.next().unwrap(), ends.next().unwrap());
+                (a, b, *ctx.edge(e))
             })
             .collect();
         let self_looped: HashSet<usize> = edges

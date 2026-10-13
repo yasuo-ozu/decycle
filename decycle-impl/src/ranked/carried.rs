@@ -18,11 +18,23 @@ use syn::*;
 /// An entry announced with a `repeater` is rejected: decycle does not read the repeater table, so
 /// a relative type in the trait would reach the module unresolved.
 ///
-/// An entry with a `mock(path)` META (a stand-in announced with `#[announce(mock = path)]`, such as
-/// announce-std's) is the real trait at `path`: its ident
-/// becomes `path`'s last segment, so the module's `impl RealTrait for X` is matched, and an
-/// absolute `path` is recorded (see [`MOCK_ATTR`]) for the places that name the trait itself.
-pub(crate) fn receive_carried_trait(entry: &announce::helper::Entry) -> ItemTrait {
+/// The module's `impl Tr for X` is matched against the carried trait by NAME, so the carried trait's
+/// ident becomes the name the module spells it by:
+///
+/// - `#[decycle] use path::Tr;` names it by the trampoline's name, which must be the trait's own
+///   (the name of the item, or, for an entry with a `mock(path)` META — a stand-in announced with
+///   `#[announce(mock = path)]`, such as announce-std's — `path`'s last segment: the stand-in is the
+///   real trait). A trampoline named otherwise (`macro_name = N`, or a stand-in with a name of its
+///   own) is an error unless it is renamed;
+/// - `#[decycle] use path::N as Local;` names it `Local` (`renames`: `(original, local)` pairs), and
+///   then `Local` is what the module's impls spell, whatever the trait is called.
+///
+/// An entry with a `mock(path)` META also records an absolute `path` (see [`MOCK_ATTR`]) for the
+/// places that name the trait itself.
+pub(crate) fn receive_carried_trait(
+    entry: &announce::helper::Entry,
+    renames: &[(Ident, Ident)],
+) -> ItemTrait {
     let mut trait_item: ItemTrait = match syn::parse2::<Item>(entry.item.clone()) {
         Ok(Item::Trait(t)) => t,
         _ => abort!(
@@ -41,12 +53,47 @@ pub(crate) fn receive_carried_trait(entry: &announce::helper::Entry) -> ItemTrai
     }
     let mut renamer = crate::randomize_impl_generics(&mut trait_item.generics, crate::get_random());
     renamer.visit_item_trait_mut(&mut trait_item);
-    if let Some(path) = entry.mock() {
-        let real = path
+    let mock = entry.mock();
+    // The trait's own name: what the module's impls spell, when the trampoline is used as it is.
+    let own = match &mock {
+        Some(path) => path
             .segments
             .last()
-            .unwrap_or_else(|| abort!(path, "decycle: empty `mock` path"));
-        trait_item.ident = real.ident.clone();
+            .unwrap_or_else(|| abort!(path, "decycle: empty `mock` path"))
+            .ident
+            .clone(),
+        None => trait_item.ident.clone(),
+    };
+    // The trampoline's name in the module: the local name of the `#[decycle] use` (its alias, if it
+    // has an `as`), which is what the continuation list holds.
+    if let Some(used) = entry.key.path().segments.last().map(|seg| seg.ident.clone()) {
+        trait_item.ident = match renames.iter().find(|(_, local)| *local == used) {
+            // `use path::N as Local;`: the module spells the trait `Local`.
+            Some((_, local)) => local.clone(),
+            None if used == own => own,
+            None => {
+                let (what, keep) = if mock.is_some() {
+                    (
+                        format!("the stand-in `{}` is named differently from the trait `{}` it stands in for", used, own),
+                        format!("keep the real trait `{}` in scope", own),
+                    )
+                } else {
+                    (
+                        format!("the trampoline `{}` is named differently from the trait `{}` it carries (`macro_name = {}`)", used, own, used),
+                        format!("also `use` the trait `{}` itself, which the trampoline's name does not import", own),
+                    )
+                };
+                abort!(
+                    entry.key.span(),
+                    "#[decycle] use: {}, and is not renamed", what;
+                    help = "the module's `impl {} for ..` is matched to the trait by name, so give the `use` that name: `#[decycle] use path::to::{} as {};`, and {}", own, used, own, keep
+                )
+            }
+        };
+    } else {
+        trait_item.ident = own;
+    }
+    if let Some(path) = mock {
         if is_absolute(&path) {
             let attr = Ident::new(MOCK_ATTR, Span::call_site());
             trait_item.attrs.push(parse_quote!(#[#attr(#path)]));

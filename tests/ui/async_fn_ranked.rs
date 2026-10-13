@@ -1,6 +1,6 @@
-//! `async fn` in a `#[decycle]` (ranked) cycle is rejected up-front — its opaque `impl Future` return
-//! can't be threaded through the rank rewrite (the raw symptom was a confusing `E0308`). Fail closed
-//! with an actionable message pointing at the boxed-future workaround.
+//! `async fn` in a `#[decycle]` (ranked) trait is rejected up-front, at the trait's own method — its opaque
+//! `impl Future` return can't be threaded through the rank rewrite (the raw symptom was a confusing
+//! `E0308`). Fail closed with an actionable message pointing at the boxed-future workaround.
 use decycle::decycle;
 
 #[decycle]

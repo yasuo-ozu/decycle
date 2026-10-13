@@ -2,13 +2,14 @@
 
 use decycle_impl::proc_macro_error::*;
 use proc_macro::{Span, TokenStream};
+use syn::parse::discouraged::Speculative;
 use syn::parse::{Parse, ParseStream};
 use syn::*;
 use template_quote::quote;
 
 use decycle_impl::process_module;
 use decycle_impl::process_module_structural;
-use decycle_impl::check_trait;
+use decycle_impl::{check_trait, check_trait_structural};
 
 struct Args {
     decycle: Option<Path>,
@@ -35,6 +36,12 @@ impl Args {
     }
 
     /// Record an option of the removed trait-side `#[decycle]`, skipping its `= value`.
+    ///
+    /// The value is read as a type (then an expression) before anything else, because a comma inside
+    /// it does not end the option: `marker = M<u8, u16>`. Stopping at the first top-level comma
+    /// would leave `u16>` behind and replace the "removed in 0.6" help with a generic parse error.
+    /// If it is neither, the rest of the arguments is dropped: the module or trait is rejected for
+    /// this option anyway.
     fn note_removed(
         &mut self,
         input: ParseStream,
@@ -45,6 +52,20 @@ impl Args {
             self.removed = Some((span, name));
         }
         if input.parse::<Option<Token![=]>>()?.is_some() {
+            let fork = input.fork();
+            if fork.parse::<Type>().is_ok() {
+                input.advance_to(&fork);
+            } else {
+                let fork = input.fork();
+                if fork.parse::<Expr>().is_ok() {
+                    input.advance_to(&fork);
+                } else {
+                    while !input.is_empty() {
+                        input.parse::<proc_macro2::TokenTree>()?;
+                    }
+                }
+            }
+            // Anything left of the value, up to the next argument.
             while !input.is_empty() && !input.peek(Token![,]) {
                 input.parse::<proc_macro2::TokenTree>()?;
             }
@@ -138,7 +159,7 @@ impl Parse for Args {
 fn abort_removed_option(span: proc_macro2::Span, name: &str) -> ! {
     let help = match name {
         "mock" => "announce the trait with `#[::decycle::announce::announce(crate = ::decycle::announce, mock = path::to::RealTrait)]`",
-        "alter_macro_name" => "announce the trait with `#[::decycle::announce::announce(crate = ::decycle::announce, macro_name = Name)]` to rename its trampoline, or with `mock = path::to::RealTrait` to declare a stand-in for another trait",
+        "alter_macro_name" => "announce the trait with `#[::decycle::announce::announce(crate = ::decycle::announce, macro_name = Name)]` to rename its trampoline (a `#[decycle] mod` then needs `use path::to::Trait;` and `#[decycle] use path::to::Name as Trait;`), or with `mock = path::to::RealTrait` to declare a stand-in for another trait",
         _ => "nothing replaces it: `#[announce]` requires every path in the trait to resolve outside the defining module, so spell them absolutely (`crate::..`, `::krate::..`)",
     };
     abort!(
@@ -284,24 +305,47 @@ pub fn __finalize(input: TokenStream) -> TokenStream {
 }
 
 /// The implementation of `decycle::check`: validates a trait at its definition (see the docs of
-/// `decycle::check`). Run by `#[announce(.., decycle::check)]` as `check! { (), TRAIT }`.
+/// `decycle::check`). Run by `#[announce(.., decycle::check)]` as `check! { (), TRAIT }`, and by
+/// `#[announce(.., decycle::check(structural))]` as `check! { (structural), TRAIT }`.
 #[proc_macro_error]
 #[proc_macro]
 pub fn check(input: TokenStream) -> TokenStream {
-    announce::helper::check(input.into(), &[], |c| match &c.item {
-        Item::Trait(item_trait) => {
-            check_trait(item_trait);
-            Ok(proc_macro2::TokenStream::new())
+    announce::helper::check(input.into(), &[], |c| {
+        let structural = parse_check_args(&c.args)?;
+        match &c.item {
+            Item::Trait(item_trait) => {
+                if structural {
+                    check_trait_structural(item_trait);
+                } else {
+                    check_trait(item_trait);
+                }
+                Ok(proc_macro2::TokenStream::new())
+            }
+            other => Err(Error::new(
+                // The first token of the item (a single token, so that the position does not depend
+                // on whether the compiler can join spans).
+                template_quote::ToTokens::to_token_stream(other)
+                    .into_iter()
+                    .next()
+                    .map_or_else(proc_macro2::Span::call_site, |t| t.span()),
+                "`decycle::check` applies to a trait definition",
+            )),
         }
-        other => Err(Error::new(
-            // The first token of the item (a single token, so that the position does not depend on
-            // whether the compiler can join spans).
-            template_quote::ToTokens::to_token_stream(other)
-                .into_iter()
-                .next()
-                .map_or_else(proc_macro2::Span::call_site, |t| t.span()),
-            "`decycle::check` applies to a trait definition",
-        )),
     })
     .into()
+}
+
+/// The arguments of `decycle::check(..)`: nothing (the rules of the default ranked engine), or
+/// `structural` (the rules of `#[decycle(structural)]`). Returns whether it was `structural`.
+fn parse_check_args(args: &proc_macro2::TokenStream) -> Result<bool> {
+    if args.is_empty() {
+        return Ok(false);
+    }
+    syn::custom_keyword!(structural);
+    syn::parse2::<structural>(args.clone()).map(|_| true).map_err(|e| {
+        Error::new(
+            e.span(),
+            "`decycle::check` takes no argument, or `structural` (`decycle::check(structural)`)",
+        )
+    })
 }

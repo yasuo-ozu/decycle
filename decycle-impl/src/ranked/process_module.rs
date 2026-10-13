@@ -394,6 +394,7 @@ fn sharing_sources(members: &[&ItemImpl], trait_ident: &Ident) -> Vec<Vec<usize>
     });
     let reach: std::collections::HashMap<String, HashSet<String>> = graph.scope(|ctx| {
         ctx.node_indices()
+            .map(|ix| ix.to_ix())
             .map(|ix| {
                 let set: HashSet<String> = Dfs::new(ctx, ix).map(|n| ctx.node(n).clone()).collect();
                 (ctx.node(ix).clone(), set)

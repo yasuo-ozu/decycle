@@ -183,3 +183,50 @@ fn announce_std_mock() {
     let a = std_mock::A(Some(Box::new(std_mock::B(Some(Box::new(std_mock::A(None)))))));
     assert_eq!(a.to_string(), "A(B(A))");
 }
+
+// A stand-in with its own name, `#[decycle] use`d under a THIRD name: the module spells the real trait
+// by that alias (`use .. as Cnt`), and the impls are matched under it.
+mod local_named {
+    pub mod stand {
+        #[decycle::announce::announce(crate = ::decycle::announce, mock = crate::local::Count)]
+        pub trait Tally {
+            fn count(&self, depth: usize) -> usize;
+        }
+    }
+}
+
+#[decycle::decycle]
+mod aliased {
+    use crate::local::Count as Cnt;
+    #[decycle]
+    use crate::local_named::stand::Tally as Cnt;
+
+    pub struct A(pub Option<Box<B>>);
+    pub struct B(pub Option<Box<A>>);
+
+    impl Cnt for A
+    where
+        B: Cnt,
+    {
+        fn count(&self, depth: usize) -> usize {
+            self.0.as_ref().map_or(depth, |b| b.count(depth + 1))
+        }
+    }
+
+    impl Cnt for B
+    where
+        A: Cnt,
+    {
+        fn count(&self, depth: usize) -> usize {
+            self.0.as_ref().map_or(depth, |a| a.count(depth + 1) + 10)
+        }
+    }
+}
+
+#[test]
+fn stand_in_under_a_third_name() {
+    use local::Count;
+    let a = aliased::A(Some(Box::new(aliased::B(Some(Box::new(aliased::A(None)))))));
+    // inner A at depth 2: 2; B: 2 + 10 = 12; outer A: 12
+    assert_eq!(a.count(0), 12);
+}

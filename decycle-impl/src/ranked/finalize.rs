@@ -3107,18 +3107,19 @@ impl Parse for FinalizeArgs {
     fn parse(input: ParseStream) -> Result<Self> {
         let announce_input: announce::helper::Input = input.parse()?;
         let working_list: Vec<Path> = announce_input.list.0.iter().map(|c| c.path()).collect();
-        // Newest first, ahead of the module's own traits — the order the old carrier chain,
-        // which prepended each definition, produced.
-        let mut traits: Vec<ItemTrait> = announce_input
-            .entries
-            .iter()
-            .map(crate::ranked::carried::receive_carried_trait)
-            .collect();
         let rest = announce_input.rest;
         let mut args = syn::parse::Parser::parse2(
             |input: ParseStream| -> Result<FinalizeArgs> { parse_rest(input) },
             rest,
         )?;
+        // Newest first, ahead of the module's own traits — the order the old carrier chain,
+        // which prepended each definition, produced. (Read after the REST, whose `renames` name a
+        // stand-in's local alias.)
+        let mut traits: Vec<ItemTrait> = announce_input
+            .entries
+            .iter()
+            .map(|entry| crate::ranked::carried::receive_carried_trait(entry, &args.renames))
+            .collect();
         traits.append(&mut args.traits);
         args.traits = traits;
         args.working_list = working_list;
@@ -3512,13 +3513,21 @@ fn check_no_defaulted_generics_of(trait_: &ItemTrait) {
     }
 }
 
-/// Return-position `impl Trait` (RPITIT) in a trait method is rejected, by both engines, in every
-/// mode: the ranked re-entry fn-pointer type `fn(..) -> impl Trait` is not nameable (E0562), and
-/// the structural layout cast can't reinterpret an opaque return type. An associated type is the
+/// Return-position `impl Trait` (RPITIT) and `async fn` in a trait method are rejected, by both
+/// engines, in every mode. The ranked re-entry fn-pointer type `fn(..) -> impl Trait` is not nameable
+/// (E0562), and the structural layout cast can't reinterpret an opaque return type; an `async fn`
+/// returns exactly such an opaque `impl Future`. An associated type (or a boxed future) is the
 /// portable escape hatch — it names the return type, so both engines can carry it.
 pub(crate) fn check_no_impl_trait_output_in(trait_: &ItemTrait) {
     for item in &trait_.items {
         if let TraitItem::Fn(tf) = item {
+            if let Some(a) = &tf.sig.asyncness {
+                abort!(
+                    a,
+                    "decycle: `async fn` in method `{}` of #[decycle] trait `{}` is not supported — its `impl Future` return is an opaque type, like a return-position `impl Trait`", tf.sig.ident, trait_.ident;
+                    help = "return a boxed future (`-> Pin<Box<dyn Future<Output = ..>>>`), or declare an associated type on the trait and return it"
+                );
+            }
             if sig_has_impl_trait_output(&tf.sig) {
                 abort!(
                     &tf.sig.output,
@@ -3535,9 +3544,22 @@ pub(crate) fn check_no_impl_trait_output_in(trait_: &ItemTrait) {
 /// `#[decycle] use` receives the trait; this runs them early, so that the error appears at the
 /// trait. It aborts (through `proc_macro_error`) at the first violation.
 ///
+/// These are the rules of the default **ranked** engine, the stricter of the two. A trait meant
+/// for `#[decycle(structural)]` only is checked with [`check_trait_structural`].
+///
 /// Behind `decycle::check`, which an announced trait lists among the options of `#[announce]`.
 pub fn check_trait(trait_: &ItemTrait) {
     check_no_defaulted_generics_of(trait_);
+    check_no_impl_trait_output_in(trait_);
+}
+
+/// [`check_trait`] for a trait used with `#[decycle(structural)]`: the rules both engines share
+/// (no `async fn`, no return-position `impl Trait`). A default on a generic parameter is a ranked
+/// engine rule only — the structural engine emits no rank argument, so a use site may leave a
+/// defaulted parameter out.
+///
+/// Behind `decycle::check(structural)`.
+pub fn check_trait_structural(trait_: &ItemTrait) {
     check_no_impl_trait_output_in(trait_);
 }
 

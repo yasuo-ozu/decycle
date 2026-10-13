@@ -10,6 +10,10 @@
 //!   * the ranked engine with `support_infinite_cycle = false`, which needs no re-entry registry
 //!     (the registry is a `thread_local!`, hence `std`-only).
 //!
+//! It also announces a trait (`#[announce]` with `decycle::check`, through the `announce` feature)
+//! and brings it into a module of each kind with `#[decycle] use`: the announcing side builds for a
+//! core-only target too.
+//!
 //! Unbounded ranked without `std` is *expected* to fail, with a diagnostic naming
 //! `UnboundedReentryRequiresTheDecycleStdFeature`. That case is pinned by a trybuild snapshot
 //! rather than here, since this crate has to build.
@@ -74,6 +78,74 @@ pub mod ranked_bounded {
     {
         fn walk(&self) -> u32 {
             self.0
+        }
+    }
+}
+
+/// A trait announced with `decycle::check`, in a `no_std` crate. `announce` is built here without its
+/// `proc-macro-api` feature, so this exercises `#[announce]` and the check on a core-only target.
+#[decycle::announce::announce(crate = ::decycle::announce, decycle::check)]
+pub trait Announced {
+    fn depth(&self) -> u32;
+}
+
+/// The same trait, announced for the structural engine (`decycle::check(structural)`).
+#[decycle::announce::announce(crate = ::decycle::announce, decycle::check(structural))]
+pub trait AnnouncedStructural<T = u32> {
+    fn depth(&self, t: T) -> u32;
+}
+
+/// `#[decycle] use` of announced traits, in both engines.
+#[decycle(support_infinite_cycle = false)]
+pub mod ranked_announced {
+    #[decycle]
+    use super::Announced;
+
+    pub struct A(pub u32);
+    pub struct B(pub u32);
+
+    impl Announced for A
+    where
+        B: Announced,
+    {
+        fn depth(&self) -> u32 {
+            self.0
+        }
+    }
+
+    impl Announced for B
+    where
+        A: Announced,
+    {
+        fn depth(&self) -> u32 {
+            self.0
+        }
+    }
+}
+
+#[decycle(structural)]
+pub mod structural_announced {
+    #[decycle]
+    use super::AnnouncedStructural;
+
+    pub struct A(pub u32);
+    pub struct B(pub u32);
+
+    impl AnnouncedStructural for A
+    where
+        B: AnnouncedStructural,
+    {
+        fn depth(&self, t: u32) -> u32 {
+            self.0 + t
+        }
+    }
+
+    impl AnnouncedStructural for B
+    where
+        A: AnnouncedStructural,
+    {
+        fn depth(&self, t: u32) -> u32 {
+            self.0 + t
         }
     }
 }

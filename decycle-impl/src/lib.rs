@@ -16,7 +16,7 @@ pub(crate) use ranked::helper;
 #[doc(hidden)]
 pub use ranked::process_module;
 #[doc(hidden)]
-pub use ranked::check_trait;
+pub use ranked::{check_trait, check_trait_structural};
 
 // ===== Structural unroll (`#[decycle(structural)]`) =====
 pub mod structural;

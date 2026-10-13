@@ -1,0 +1,8 @@
+error: decycle: `async fn` in method `go` of #[decycle] trait `Fut` is not supported — its `impl Future` return is an opaque type, like a return-position `impl Trait`
+
+         = help: return a boxed future (`-> Pin<Box<dyn Future<Output = ..>>>`), or declare an associated type on the trait and return it
+
+ --> tests/ui/check_async_fn.rs:7:5
+  |
+7 |     async fn go(&self) -> usize;
+  |     ^^^^^

@@ -16,7 +16,7 @@ path = "lib.rs"
 
 [dependencies]
 decycle-impl = { path = "../decycle-impl", version = "0.6.0" }
-announce = "0.1.0"
+announce = "0.1.1"
 proc-macro2 = "1.0"
 proc-macro-error = { version = "1.0", default-features = false }
 template-quote = "0.4.0"

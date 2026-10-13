@@ -12,7 +12,8 @@ pub use decycle_macro::__finalize;
 /// traits for `#[decycle] use` without depending on `announce` itself:
 /// `#[decycle::announce::announce(crate = ::decycle::announce, decycle::check)]`. The option
 /// `crate = ..` tells `#[announce]` where its runtime is; it is optional for a crate that depends on
-/// `announce` directly. Needs the `announce` feature (on by default). See [`check`].
+/// `announce` directly. Needs the `announce` feature (on by default); it is built without `std`, so a
+/// `#![no_std]` crate can announce a trait. See [`check`].
 #[cfg(feature = "announce")]
 pub use announce;
 
@@ -142,12 +143,23 @@ pub use decycle_impl::safegraph;
 /// | 0.5 `#[decycle(..)]` on a trait | now |
 /// | --- | --- |
 /// | `#[decycle]` | `#[announce(crate = ::decycle::announce)]` |
-/// | `mock = path` (0.6 only) | `#[announce(.., mock = path)]` |
-/// | `alter_macro_name = N` | `#[announce(.., macro_name = N)]`, or `mock = path` |
+/// | `alter_macro_name = N` | `#[announce(.., macro_name = N)]`, or `mock = path`. A module then writes both `use path::Trait;` and `#[decycle] use path::N as Trait;` (below) |
 /// | `decycle = path` | none; the trait no longer names decycle (`crate = ::my_rename::announce` if you renamed it) |
 /// | `marker = path` | none; announce checks the trait's paths at its definition: write them absolutely (`crate::..`, `::krate::..`) |
 /// | `allowed_paths = [..]` | none; `allow_std_prelude = true` accepts the bare std prelude names (`Clone`, `Vec<u8>`) |
 /// | (checks at use) | `decycle::check`, see [`check`] |
+///
+/// A trait announced with `macro_name = N` has a trampoline `N!` that is not named like the trait (so
+/// that a derive or attribute macro can keep the trait's name). The module's `impl Trait for ..` is
+/// matched to the trait by name, so the `#[decycle] use` gives the trampoline the trait's name with an
+/// `as`, and the trait itself is a plain `use` (the two live in different namespaces):
+///
+/// ```text
+/// use super::d::Walk;                          // the trait
+/// #[decycle] use super::d::WalkMac as Walk;    // its trampoline, named like the trait
+/// ```
+///
+/// Without the `as`, the `#[decycle] use` is an error that says so.
 ///
 /// ### Stand-ins for traits you do not own
 /// `#[announce(mock = path::to::RealTrait)]` on a trait declares it a copy of the real trait at
@@ -155,8 +167,9 @@ pub use decycle_impl::safegraph;
 /// the stand-in as a trait in place: it only emits its trampoline macro, named after the stand-in,
 /// at the stand-in's path and visibility. `#[decycle] use path::to::Stand;` then brings in the copy
 /// as the **real** trait, so the module's impls implement `RealTrait`. Name the stand-in like the
-/// real trait (or `#[decycle] use path::to::Stand as RealTrait;`), keep the real trait in scope
-/// under that name, and spell `mock = ..` absolutely (`crate::..`, `::krate::..`).
+/// real trait, or `#[decycle] use path::to::Stand as RealTrait;` when its name differs (a stand-in
+/// `use`d under another name without the `as` is an error), keep the real trait in scope under that
+/// name, and spell `mock = ..` absolutely (`crate::..`, `::krate::..`).
 /// [`announce-std`](https://docs.rs/announce-std) provides such copies for the traits of `std`.
 ///
 /// ```rust
@@ -361,20 +374,57 @@ pub use decycle_macro::decycle;
 /// use decycle::announce::announce;
 /// #[announce(crate = ::decycle::announce, decycle::check)]
 /// pub trait Bad {
-///     fn items(&self) -> impl Iterator<Item = u8>; // return-position `impl Trait`
+///     fn items(&self) -> impl ::core::iter::Iterator<Item = u8>; // return-position `impl Trait`
 /// }
 /// ```
 ///
 /// The rules that depend on the trait alone are checked:
 ///
+/// - no return-position `impl Trait` in a method (`-> impl Iterator<..>`): it has no nameable type
+///   for the re-entry. Declare an associated type and return it instead;
+/// - no `async fn` in a method: its `impl Future` return is such a type. Return a boxed future
+///   (`-> Pin<Box<dyn Future<Output = ..>>>`) instead;
 /// - no default on a generic parameter (`trait Tr<T = u8>`, `trait Tr<const N: usize = 4>`): every
 ///   use of the trait is re-spelled with a rank argument, so each use site has to write every
-///   parameter;
-/// - no return-position `impl Trait` in a method (`-> impl Iterator<..>`): it has no nameable
-///   type for the re-entry. Declare an associated type and return it instead.
+///   parameter. This is a rule of the **ranked** engine only.
 ///
-/// Whatever depends on the impls (a where-clause bound, an `async fn` impl, a `#[track_caller]`)
-/// can only be checked when the module is expanded.
+/// `decycle::check` enforces the rules of the default ranked engine, the stricter of the two. The
+/// structural engine (`#[decycle(structural)]`) shares the first two and accepts a default on a
+/// generic parameter, so a trait that is only meant for it is checked with `decycle::check(structural)`,
+/// which skips the third rule:
+///
+/// ```
+/// use decycle::{announce::announce, decycle};
+///
+/// #[announce(crate = ::decycle::announce, decycle::check(structural))]
+/// pub trait Weigh<T = u8> {
+///     fn weigh(&self, t: T) -> usize;
+/// }
+///
+/// #[decycle(structural)]
+/// mod m {
+///     #[decycle]
+///     pub use super::Weigh;
+///
+///     pub struct A(pub Option<Box<A>>);
+///
+///     // The defaulted argument may be left out under the structural engine.
+///     impl Weigh for A where A: Weigh {
+///         fn weigh(&self, t: u8) -> usize {
+///             self.0.as_ref().map_or(t as usize, |a| a.weigh(t) + 1)
+///         }
+///     }
+/// }
+/// # fn main() {
+/// use m::Weigh as _;
+/// assert_eq!(m::A(Some(Box::new(m::A(None)))).weigh(5), 6);
+/// # }
+/// ```
+///
+/// The trait is the same either way: `check` only decides which engine's rules are enforced at its
+/// definition, and a trait checked with `(structural)` still fails in a ranked `#[decycle]` module
+/// if it has a default. Whatever depends on the impls (a where-clause bound, an `async fn` impl,
+/// a `#[track_caller]`) can only be checked when the module is expanded.
 pub use decycle_macro::check;
 
 /// Runtime fn-pointer registry backing unbounded `support_infinite_cycle` re-entry.

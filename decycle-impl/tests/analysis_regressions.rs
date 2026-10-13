@@ -26,7 +26,9 @@ fn edges_of(g: &decycle_impl::safegraph::VecGraph<proc_macro2::Ident, EdgeKind>)
     let mut out = g.scope(|ctx| {
         ctx.edge_indices()
             .map(|e| {
-                let [a, b] = ctx.endpoints(e);
+                let e = e.to_ix();
+                let mut ends = ctx.endpoints(e).map(|n| n.to_ix());
+                let (a, b) = (ends.next().unwrap(), ends.next().unwrap());
                 (
                     ctx.node(a).to_string(),
                     *ctx.edge(e),

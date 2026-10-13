@@ -11,4 +11,4 @@ pub(crate) mod process_module;
 mod carried;
 
 pub use process_module::{process_module, process_module_with_graph};
-pub use finalize::check_trait;
+pub use finalize::{check_trait, check_trait_structural};

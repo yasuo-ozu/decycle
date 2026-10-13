@@ -1,10 +1,10 @@
-error: decycle: `async fn` in method `ev` of a #[decycle] cycle is not supported — its `impl Future` return can't be threaded through the rank rewrite
+error: decycle: `async fn` in method `ev` of #[decycle] trait `Ev` is not supported — its `impl Future` return is an opaque type, like a return-position `impl Trait`
 
-         = help: return a boxed future (`-> Pin<Box<dyn Future<Output = ..>>>`) instead
+         = help: return a boxed future (`-> Pin<Box<dyn Future<Output = ..>>>`), or declare an associated type on the trait and return it
 
-  --> tests/ui/async_fn_ranked.rs:18:9
+  --> tests/ui/async_fn_ranked.rs:10:9
    |
-18 |         async fn ev(&self, depth: u64) -> u64 {
+10 |         async fn ev(&self, depth: u64) -> u64;
    |         ^^^^^
 
 error[E0275]: overflow evaluating the requirement `A: Ev`

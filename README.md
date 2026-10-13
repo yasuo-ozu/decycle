@@ -31,15 +31,17 @@ All are on by default; a normal `std` user needs none of these flags.
 | --- | --- | --- |
 | `std` | on | Drops the re-entry registry, which is a `thread_local!` map. The ranked engine then requires `support_infinite_cycle = false`; asking for unbounded re-entry without `std` is a compile error naming `UnboundedReentryRequiresTheDecycleStdFeature`. The structural engine is unaffected — it emits no runtime machinery at all. |
 | `api` | on | Drops the programmatic surface (`decycle::{analysis, ranked, structural, safegraph}`). This is what keeps `decycle-impl` out of your *target* graph, and is therefore required for `no_std`. |
-| `announce` | on | Drops the [announce](https://docs.rs/announce) crate from your *target* graph, and with it the re-export `decycle::announce`, through which a trait **outside** a `#[decycle]` module is announced for other crates to `#[decycle] use` (`#[decycle::announce::announce(crate = ::decycle::announce)]`). Required for `no_std`, because announce cannot be built for a core-only target. `#[decycle] use` of an announced trait, `decycle::check` and everything inside a `#[decycle]` module need no feature. |
+| `announce` | on | Drops the [announce](https://docs.rs/announce) crate from your *target* graph, and with it the re-export `decycle::announce`, through which a trait **outside** a `#[decycle]` module is announced for other crates to `#[decycle] use` (`#[decycle::announce::announce(crate = ::decycle::announce)]`). Unlike `api` it builds for a core-only target (announce is taken without its `proc-macro-api` feature), so a `no_std` crate that announces traits keeps it on. `#[decycle] use` of an announced trait, `decycle::check` and everything inside a `#[decycle]` module need no feature. |
 
 **`no_std` needs `default-features = false`.** With the defaults on, `api` pulls `decycle-impl`
-(and `proc-macro2`) and `announce` into the target graph, so a core-only target fails to build.
-The working spelling is:
+(and `proc-macro2`, and announce's `proc-macro-api`) into the target graph, so a core-only target
+fails to build. The working spelling is:
 
 ```toml
 [dependencies]
 decycle = { version = "0.6.0", default-features = false }
+# ... or, to announce traits too (`#[announce]`, `decycle::check`) from the `no_std` crate:
+# decycle = { version = "0.6.0", default-features = false, features = ["announce"] }
 ```
 
 Note that turning `api` off does **not** shrink a normal native build: `decycle-macro` depends on
@@ -555,9 +557,12 @@ mod cycle {
 # fn main() {}
 ```
 
-`decycle::check` is optional. It validates the trait at its definition (no default on a generic
-parameter, no return-position `impl Trait`), so that the error appears at the trait instead of
-where a module receives it.
+`decycle::check` is optional. It validates the trait at its definition, so that the error appears at
+the trait instead of where a module receives it. It rejects a return-position `impl Trait` and an
+`async fn` in a method (neither engine can carry the opaque return type through a cycle), and a
+default on a generic parameter (`trait Tr<T = u8>`). The last is a rule of the default **ranked**
+engine only, and `decycle::check` enforces the ranked engine's rules; for a trait that is only meant
+for `#[decycle(structural)]`, which accepts a default, write `decycle::check(structural)` to skip it.
 
 `#[announce]` checks that every path in the trait means the same thing in another crate, and
 rejects a path relative to the defining module (`Local`, `super::X`, `std::fmt::Debug`) at the
@@ -573,21 +578,33 @@ options map to:
 | 0.5 `#[decycle(..)]` on a trait | now |
 | --- | --- |
 | `#[decycle]` | `#[announce(crate = ::decycle::announce)]` |
-| `mock = path` (unreleased 0.6 form) | `#[announce(.., mock = path)]` |
-| `alter_macro_name = N` | `#[announce(.., macro_name = N)]`, or `mock = path` |
+| `alter_macro_name = N` | `#[announce(.., macro_name = N)]`, or `mock = path`; a module then writes both `use super::d::Walk;` and `#[decycle] use super::d::WalkMac as Walk;` (below) |
 | `decycle = path` | none: the trait no longer names decycle (pass `crate = ::renamed::announce` if you renamed the dependency) |
 | `marker = path` | none: write the paths of the trait absolutely (`crate::..`, `::krate::..`); announce reports the ones that do not resolve |
 | `allowed_paths = [..]` | none: `allow_std_prelude = true` accepts the bare std prelude names |
-| (new) | `decycle::check`: validate the trait at its definition |
+| (new) | `decycle::check` (`decycle::check(structural)`): validate the trait at its definition |
+
+A trait announced with `macro_name = N` has a trampoline `N!` that is not named like the trait (so
+that a derive or attribute macro can keep the trait's name). The module's `impl Trait for ..` is
+matched to the trait by name, so the `#[decycle] use` gives the trampoline the trait's name with an
+`as`, and the trait itself is a plain `use` (the two live in different namespaces):
+
+```text
+use super::d::Walk;                          // the trait
+#[decycle] use super::d::WalkMac as Walk;    // its trampoline, named like the trait
+```
+
+Without the `as`, the `#[decycle] use` is an error that says so.
 
 ### Stand-ins for traits you do not own
 
 `#[announce(mock = path::to::RealTrait)]` declares a trait a *stand-in* for the real trait at
 `path` (e.g. one you do not own). Only its trampoline macro is emitted, at the stand-in's path;
 `#[decycle] use` sites treat the carried copy as the real trait, so their impls implement `path`.
-Name the stand-in like the real trait (or `#[decycle] use stand::X as Real;`) and keep the real
-trait in scope. [announce-std](https://docs.rs/announce-std) provides such copies for the traits of
-`std`, and they work with `#[decycle] use` as they are.
+Name the stand-in like the real trait, or `#[decycle] use stand::X as Real;` when its name differs
+(a stand-in `use`d under another name without the `as` is an error), and keep the real trait in
+scope. [announce-std](https://docs.rs/announce-std) provides such copies for the traits of `std`,
+and they work with `#[decycle] use` as they are.
 
 ## Contributing
 

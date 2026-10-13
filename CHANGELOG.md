@@ -18,13 +18,13 @@ Notable changes, following [Keep a Changelog](https://keepachangelog.com/) and
   | was | now |
   | --- | --- |
   | `#[decycle]` | `#[announce(crate = ::decycle::announce)]` |
-  | `mock = path` (unreleased 0.6 form) | `#[announce(.., mock = path)]` |
-  | `alter_macro_name = N` | `#[announce(.., macro_name = N)]`, or `mock = path` |
+  | `alter_macro_name = N` | `#[announce(.., macro_name = N)]`, or `mock = path`; a module then writes both `use super::d::Walk;` and `#[decycle] use super::d::WalkMac as Walk;` (the trampoline under the trait's name; the two live in different namespaces) |
   | `decycle = path` | none (pass `crate = ::renamed::announce` if you renamed the dependency) |
   | `marker = path` | none: write the trait's paths absolutely (`crate::..`, `::krate::..`) |
   | `allowed_paths = [..]` | none: `allow_std_prelude = true` accepts the bare std prelude names |
 
-  Writing one of these options is an error that names its replacement.
+  Writing one of these options is an error that names its replacement, whatever its value
+  (`marker = M<u8, u16>` included).
 - **`type-leak` is no longer a dependency** of `decycle`, `decycle-macro` or `decycle-impl` (it
   remains in the graph only as a dependency of `announce`). The relative-type interning it did for
   `#[decycle] trait` (`marker`, `allowed_paths`, the hidden `Repeater` trait) is gone with that form:
@@ -36,22 +36,42 @@ Notable changes, following [Keep a Changelog](https://keepachangelog.com/) and
 - Removed from the public surface: `decycle::type_leak`, `decycle_impl::type_leak`,
   `decycle_impl::process_trait` (nothing remains for it to do) and the hidden
   `decycle::Repeater`.
-- **New default feature `announce`.** It gates the `decycle::announce` re-export. announce cannot be
-  built for a core-only target (it depends on `proc-macro2`/`syn`), so `default-features = false`
-  leaves it out; everything else (`#[decycle] mod`, `#[decycle] use`, `decycle::check`) needs no
-  feature.
+- **New default feature `announce`.** It gates the `decycle::announce` re-export; everything else
+  (`#[decycle] mod`, `#[decycle] use`, `decycle::check`) needs no feature. It is taken from announce
+  0.1.1 without that crate's `proc-macro-api` feature (`proc-macro2`/`syn`, `announce::helper`), so it
+  does build for a core-only target: a `#![no_std]` crate with
+  `decycle = { default-features = false, features = ["announce"] }` can announce a trait
+  (`#[announce]`, `decycle::check`) and use `#[decycle]` (CI builds such a consumer for
+  `x86_64-unknown-none`). `api` is what stays off for `no_std`, as before.
 - The trampoline's wire format changed: `FinalizeArgs` now parses an announce input
   `[list] ENTRY* REST`, and its `ToTokens` writes `[list] REST`; `FinalizeArgs::cont_list` and
-  `FinalizeArgs::rest_tokens` are new. Traits defined with decycle 0.5 cannot be used from 0.6 and
-  vice versa (as before, definer and user must run the same decycle version).
+  `FinalizeArgs::rest_tokens` are new. A trait defined with decycle 0.5 is not announced and cannot
+  be `#[decycle] use`d from 0.6. An announced trait depends on announce 0.1 and not on decycle at all,
+  so the crate that defines it does not have to run the same decycle version as the one that uses it.
+- **`decycle-impl` uses `safegraph` 0.3** (was 0.2), the version `type-leak` 0.8 uses through
+  announce, so one copy of safegraph builds instead of two. `decycle::safegraph` (the re-export) and
+  the `VecGraph` that `analysis::analyze_module` returns follow: in 0.3 a scope hands out
+  `NodeIxRef`/`EdgeIxRef` handles (`ctx.node_indices()`, `ctx.edge_indices()`), turned into the
+  copyable `NodeIx`/`EdgeIx` with `.to_ix()`, and `ctx.endpoints(e)` is an iterator rather than an
+  array.
+- **`#[decycle] use` checks the trampoline's name.** The module's `impl Tr for ..` is matched to the
+  trait by name, so a trampoline named differently from its trait — a `macro_name = N` trait, or a
+  `mock = path` stand-in with a name of its own — has to be renamed with `as`
+  (`#[decycle] use path::WalkMac as Walk;`, `#[decycle] use stand::Sz as Size;`). Left unrenamed, the
+  impls would not be matched to the trait and the module would fail with an unrelated `E0275`, so
+  it is an error that names the `as` to write. The alias is the name the impls spell, so a stand-in
+  `use`d `as` a third name (`use real::Size as Cnt; #[decycle] use stand::Sz as Cnt;`) works too.
 
 ### Added
 
 - `decycle::announce`, the re-export of the announce crate (feature `announce`), and
   `decycle::check` (`decycle_impl::check_trait` for the programmatic API): list it among the options
-  of `#[announce]` to validate a trait at its definition. It rejects a default on a generic parameter
-  and a return-position `impl Trait` in a method, the two rules that depend on the trait alone, with
-  the error a `#[decycle]` module would give when it receives the trait.
+  of `#[announce]` to validate a trait at its definition. It rejects a default on a generic parameter,
+  a return-position `impl Trait` in a method and an `async fn` in a method, the rules that depend on
+  the trait alone, with the error a `#[decycle]` module would give when it receives the trait.
+  The default-parameter rule belongs to the ranked engine only, and `decycle::check` enforces the
+  ranked engine's rules; `decycle::check(structural)` (`decycle_impl::check_trait_structural`) skips
+  it for a trait meant for `#[decycle(structural)]`, which accepts a default.
 - A plain `#[announce]` trait can be brought in with `#[decycle] use`, including an
   `#[announce(mock = ..)]` copy such as `announce_std::fmt::Display` (treated as the real trait).
   `#[announce(mock = path)]` declares a stand-in for the real trait at `path`: only its trampoline

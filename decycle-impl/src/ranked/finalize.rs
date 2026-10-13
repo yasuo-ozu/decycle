@@ -491,8 +491,8 @@ fn emit_impl_items_leaf(
                         let s_ident = name!("DclSelf");
                         let s_ty: Type = parse_quote!(#s_ident);
                         let trait_args = trait_.generics.ty_generics();
-                        let trait_path_full: Path =
-                            parse_quote!(super::super::#trait_ident #trait_args);
+                        let trait_base = original_trait_path(trait_);
+                        let trait_path_full: Path = parse_quote!(#trait_base #trait_args);
                         let norm = normalize_reentry_sig(tf, &s_ty, &trait_path_full);
                         reentry_used_mask(trait_, &norm, &s_ident)
                     };
@@ -2209,6 +2209,15 @@ fn used_lifetime_idents(norm: &NormSig) -> std::collections::HashSet<String> {
     used.0
 }
 
+/// How the re-entry machinery (inside `ranked_traits`) names the ORIGINAL trait: through the
+/// `#[decycle] mod`'s scope (`super::super::T`), or — for a carried stand-in
+/// (`#[decycle(mock = path)]`, `#[announce(mock = path)]`) — by the real trait's absolute path.
+fn original_trait_path(trait_: &ItemTrait) -> Path {
+    let trait_ident = &trait_.ident;
+    crate::ranked::process_trait::mock_path(trait_)
+        .unwrap_or_else(|| parse_quote!(super::super::#trait_ident))
+}
+
 /// Per trait × method: the `type_name` key marker ZST, the explicit fn-pointer type alias
 /// (the only transmute target the floor is allowed to name), and the full-height re-entry
 /// fn whose body calls the *original* trait method. Emitted inside `ranked_traits`, where
@@ -2220,7 +2229,8 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize, _decycle: &Path) -> T
     let s_ident = name!("DclSelf");
     let s_ty: Type = parse_quote!(#s_ident);
     let trait_args = trait_.generics.ty_generics();
-    let trait_path_full: Path = parse_quote!(super::super::#trait_ident #trait_args);
+    let trait_base = original_trait_path(trait_);
+    let trait_path_full: Path = parse_quote!(#trait_base #trait_args);
     // The `#fa` alias's body is a bare `fn(...) -> ...` type: a `Self::Assoc` return/param
     // (normalized to `<S as Trait>::Assoc` by `SelfSubst`) is a PROJECTION, which — unlike a
     // `where`-clause requirement — must be resolved the moment the alias is NAMED with a
@@ -2530,7 +2540,7 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize, _decycle: &Path) -> T
                 #(for (pat, ty) in &norm.params), { #pat: #ty }
             ) #out_tokens
             where
-                #s_ident: super::super::#trait_ident #trait_args,
+                #s_ident: #trait_base #trait_args,
                 #(for w in &trait_where) { #w, }
                 #(for w in &m_where) { #w, }
             {
@@ -2538,13 +2548,13 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize, _decycle: &Path) -> T
                 // present `{ ... }` when there's no `unsafe` to scope it for.
                 #(if unsafety.is_some()) {
                     unsafe {
-                        <#s_ident as super::super::#trait_ident #trait_args>::#m_ident
+                        <#s_ident as #trait_base #trait_args>::#m_ident
                         #(if do_turbofish) { ::<#(#orig_margs),*> }
                         (#(#param_pats),*)
                     }
                 }
                 #(if unsafety.is_none()) {
-                    <#s_ident as super::super::#trait_ident #trait_args>::#m_ident
+                    <#s_ident as #trait_base #trait_args>::#m_ident
                     #(if do_turbofish) { ::<#(#orig_margs),*> }
                     (#(#param_pats),*)
                 }
@@ -3090,7 +3100,33 @@ pub struct FinalizeArgs {
 }
 
 impl Parse for FinalizeArgs {
+    /// The wire form `__finalize!` receives: an announce trampoline input
+    /// `[decycle::__finalize!] ENTRY* REST`. Each ENTRY is one foreign `#[decycle]` trait,
+    /// newest first; REST is decycle's own header
+    /// `"decycle" "VERSION" { traits, } { impls, } LEVEL BOOL [renames] {also_rank}?`.
     fn parse(input: ParseStream) -> Result<Self> {
+        let announce_input: announce::helper::Input = input.parse()?;
+        let working_list: Vec<Path> = announce_input.list.0.iter().map(|c| c.path()).collect();
+        // Newest first, ahead of the module's own traits — the order the old carrier chain,
+        // which prepended each definition, produced.
+        let mut traits: Vec<ItemTrait> = announce_input
+            .entries
+            .iter()
+            .map(crate::ranked::process_trait::receive_carried_trait)
+            .collect();
+        let rest = announce_input.rest;
+        let mut args = syn::parse::Parser::parse2(
+            |input: ParseStream| -> Result<FinalizeArgs> { parse_rest(input) },
+            rest,
+        )?;
+        traits.append(&mut args.traits);
+        args.traits = traits;
+        args.working_list = working_list;
+        Ok(args)
+    }
+}
+
+fn parse_rest(input: ParseStream) -> Result<FinalizeArgs> {
         let _crate_identity: LitStr = input.parse()?;
         let crate_version: LitStr = input.parse()?;
         let expected_version = env!("CARGO_PKG_VERSION");
@@ -3102,10 +3138,6 @@ impl Parse for FinalizeArgs {
                 crate_version.value()
             )
         }
-
-        let working_list_content;
-        bracketed!(working_list_content in input);
-        let working_list = parse_comma_separated(&working_list_content)?;
 
         let traits_content;
         braced!(traits_content in input);
@@ -3147,7 +3179,7 @@ impl Parse for FinalizeArgs {
         };
 
         Ok(FinalizeArgs {
-            working_list,
+            working_list: Vec::new(),
             traits,
             contents,
             recurse_level,
@@ -3158,14 +3190,23 @@ impl Parse for FinalizeArgs {
             // programmatic caller of `finalize` sets it.
             decycle_path: None,
         })
-    }
 }
 
-impl template_quote::ToTokens for FinalizeArgs {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
+impl FinalizeArgs {
+    /// The continuation list the trampoline walks: every `#[decycle] use`d trait's announce macro,
+    /// then `__finalize` (`working_list`, each as `path!`).
+    pub fn cont_list(&self) -> announce::helper::ContList {
+        self.working_list
+            .iter()
+            .cloned()
+            .map(announce::helper::Cont::bang)
+            .collect()
+    }
+
+    /// Decycle's own header: the REST of the trampoline input, which announce never touches.
+    pub fn rest_tokens(&self) -> TokenStream {
         let crate_identity = LitStr::new(&crate::get_crate_identity(), Span::call_site());
         let crate_version = env!("CARGO_PKG_VERSION");
-        let working_list = &self.working_list;
         let traits = &self.traits;
         let contents = &self.contents;
 
@@ -3181,10 +3222,9 @@ impl template_quote::ToTokens for FinalizeArgs {
             .collect();
         let also_rank = &self.also_rank;
 
-        tokens.extend(quote! {
+        quote! {
             #crate_identity
             #crate_version
-            [ #(#working_list),* ]
             { #(#traits),* }
             { #(#contents),* }
             #recurse_level
@@ -3193,7 +3233,16 @@ impl template_quote::ToTokens for FinalizeArgs {
             #(if !also_rank.is_empty()) {
                 { #(#also_rank),* }
             }
-        });
+        }
+    }
+}
+
+impl template_quote::ToTokens for FinalizeArgs {
+    /// `[list] REST` — a trampoline input with no entries yet.
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        let list = self.cont_list();
+        let rest = self.rest_tokens();
+        tokens.extend(quote! { #list #rest });
     }
 }
 
@@ -3671,8 +3720,8 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
 
     // The decycle crate path. D1: an explicit programmatic override (`args.decycle_path`)
     // wins; otherwise recover it from the working list exactly as before: `process_module`
-    // always appends `#decycle::__finalize` as the final element (and the carrier-macro chain
-    // only ever pops from the front), so stripping the last segment yields the caller's
+    // always appends `#decycle::__finalize` as the final element (and the announce trampoline
+    // chain only ever drops its head), so stripping the last segment yields the caller's
     // `decycle = path` override verbatim. The carrier path always leaves `decycle_path: None`,
     // so this is byte-identical to today for every existing (attribute + carrier) caller.
     let decycle_path: Path = args.decycle_path.clone().unwrap_or_else(|| {

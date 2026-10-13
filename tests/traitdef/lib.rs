@@ -146,3 +146,90 @@ where
         hasher.finish().is_multiple_of(2)
     }
 }
+
+// A foreign `#[decycle]` trait whose default method body holds a `macro_rules!` using `$crate`
+// (AUDIT decycle #1), and one whose default body holds a `$(..)*` repetition (AUDIT decycle #2).
+pub fn dollar_crate_helper() -> usize {
+    7
+}
+
+#[decycle::decycle]
+pub trait DollarCrateDefault {
+    fn base(&self) -> usize;
+    fn with_helper(&self) -> usize {
+        macro_rules! helper {
+            () => {
+                $crate::dollar_crate_helper()
+            };
+        }
+        self.base() + helper!()
+    }
+}
+
+#[decycle::decycle]
+pub trait RepetitionDefault {
+    fn base2(&self) -> usize;
+    fn summed(&self) -> usize {
+        macro_rules! sum {
+            ($($x:expr),*) => { 0 $(+ $x)* };
+        }
+        sum!(self.base2(), 1, 2)
+    }
+}
+
+// `mock = path`: a stand-in for a real trait that is not itself `#[decycle]` (here a plain trait
+// of this crate; it could be any crate's). The stand-in is not emitted as a trait — only its
+// trampoline, at the item's path (`traitdef::stand::Weigh!`), carrying a copy that `#[decycle]
+// use` sites treat as `crate::real::Weigh`.
+pub mod real {
+    pub trait Weigh {
+        fn weigh(&self, depth: usize) -> usize;
+        fn doubled(&self) -> usize {
+            self.weigh(0) * 2
+        }
+    }
+}
+
+pub mod stand {
+    #[decycle::decycle(mock = crate::real::Weigh)]
+    pub trait Weigh {
+        fn weigh(&self, depth: usize) -> usize;
+        fn doubled(&self) -> usize {
+            self.weigh(0) * 2
+        }
+    }
+}
+
+// A stand-in named differently from its real trait: `#[decycle] use` it `as` the real name.
+// Its copy keeps a relative path (`tys::Unit`, via `allowed_paths`): announce type-checks the
+// mock copy in a hidden module, where it must still resolve.
+pub mod stand_renamed {
+    use crate::tys;
+
+    #[decycle::decycle(mock = crate::real_unit::Measure, allowed_paths = [tys, usize])]
+    pub trait MeasureStandIn {
+        fn measure(&self, depth: usize) -> tys::Unit;
+    }
+}
+
+pub mod real_unit {
+    pub trait Measure {
+        fn measure(&self, depth: usize) -> crate::tys::Unit;
+    }
+}
+
+// `allowed_paths`: `tys` is not interned, it is promised to be in scope wherever the trait is
+// used. Announced through announce's module wrapper, so announce does not reject the relative
+// `tys::Unit` (AUDIT part 3, decycle #1).
+pub mod tys {
+    pub struct Unit(pub usize);
+}
+
+pub mod allowed {
+    use crate::tys;
+
+    #[decycle::decycle(allowed_paths = [tys, usize])]
+    pub trait FromTys {
+        fn unit(&self, depth: usize) -> tys::Unit;
+    }
+}

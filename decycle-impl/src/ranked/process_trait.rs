@@ -1,6 +1,7 @@
 use proc_macro2::Span;
 use proc_macro2::TokenStream as TokenStream2;
 use proc_macro_error::*;
+use syn::parse::Parse;
 use syn::spanned::Spanned;
 use syn::visit_mut::VisitMut;
 use syn::*;
@@ -11,40 +12,61 @@ use type_leak::Leaker;
 /// derive traits which should also be valid `#[decycle]` targets.
 ///
 /// `marker_path` supplies the interning marker required when the trait contains non-absolute type
-/// paths; `alter_macro_name` renames the generated carrier macro; `leaker_config` controls the
-/// allowed-path set for interning.
+/// paths; `leaker_config` controls the allowed-path set for interning.
+///
+/// `mock = Some(path)` declares the trait a *stand-in* for the real trait at `path` (announce's
+/// `mock`): the trait itself is not emitted, only its trampoline macro (named after the item, at
+/// the item's visibility). The carried copy is announced with `mock = path`, so announce
+/// type-checks it in a hidden module and lists `mock(path)` in the entry META; the `#[decycle]
+/// use` site then treats it as the real trait (its ident becomes `path`'s last segment, so
+/// `impl RealTrait for X` is matched). Spell `path` absolutely (`crate::..`, `::krate::..`).
+///
+/// The carrier is an [announce](https://docs.rs/announce) trampoline. The trait is emitted as written
+/// (unless it is a stand-in); the interning and generic renaming run here, at the definition site,
+/// and the rewritten copy is announced with `emit_item = false`, so announce evaluates its nested
+/// cfgs and the trampoline carries the rewritten trait.
 pub fn process_trait(
     trait_item: &ItemTrait,
     decycle_path: &Path,
     marker_path: Option<&Path>,
-    alter_macro_name: Option<&Ident>,
+    mock: Option<&Path>,
     leaker_config: type_leak::LeakerConfig,
 ) -> TokenStream2 {
     let random_suffix = crate::get_random();
-    let temporal_mac_name = alter_macro_name.cloned().unwrap_or_else(|| {
-        // `random_suffix` is deterministic (hashed from the fixed crate identity string), and
-        // `#[macro_export]` hoists this name to the crate root, so two `#[decycle] trait Foo`
-        // items in one crate would otherwise compute the same name and collide (E0428). Fold a
-        // per-invocation discriminant into THIS name only; `random_suffix` itself must stay
-        // untouched everywhere else, since it's the key the leaker's `Repeater` impls (built
-        // independently, elsewhere in this fn) are pinned to.
-        //
-        // The discriminant used to be a hash of the trait's own TOKENS, which cannot separate the
-        // very case it exists for: two token-identical traits in different modules hash the same.
-        // It is a fresh random value per invocation instead — see `fresh_invocation_id` for why
-        // that is both safe here and preferable to a counter under incremental compilation.
-        let discriminant = crate::fresh_invocation_id();
-        syn::Ident::new(
-            &format!(
-                "__{}_temporal_{}_{}",
-                trait_item.ident, random_suffix, discriminant
-            ),
-            trait_item.ident.span(),
-        )
-    });
+    let announce_path: Path = parse_quote!(#decycle_path::__private::announce);
     let crate_version = env!("CARGO_PKG_VERSION");
-    let crate_identity = LitStr::new(&crate::get_crate_identity(), Span::call_site());
+    // The rewritten copy is announced in announce's module-wrapper form: decycle makes its paths
+    // resolve itself (interning into `Repeater` projections, `allowed_paths`, the marker), so
+    // announce's own type-context check must not run on it. The wrapper is never emitted
+    // (`emit_item = false`); `receive_carried_trait` unwraps it.
+    //
+    // A stand-in (`mock`) is not emitted at all — only the trampoline, under the item's name and
+    // visibility. announce type-checks the mock copy inside a hidden module, where the wrapper is
+    // one module deeper than the item was written: the leading `use super::*;` keeps the copy's
+    // relative names (supertraits, the marker, `allowed_paths` roots) resolving there.
+    // `receive_carried_trait` skips it.
+    let wrapper_vis = &trait_item.vis;
+    let wrapper_ident = &trait_item.ident;
+    let carrier = |modified: &ItemTrait| {
+        quote! {
+            #(if mock.is_none()) { #trait_item }
 
+            #[#announce_path::announce(
+                crate = #announce_path,
+                emit_item = false,
+                #(if let Some(mock) = mock) { mock = #mock, }
+                meta = __trait_meta(#crate_version)
+            )]
+            #(if mock.is_some()) { #[allow(non_snake_case)] }
+            #wrapper_vis mod #wrapper_ident {
+                #(if mock.is_some()) {
+                    #[allow(unused_imports)]
+                    use super::*;
+                }
+                #modified
+            }
+        }
+    };
     let mut modified_trait_item = trait_item.clone();
     // Randomize Ident of GenericParam in modified_trait_item.generics
     let mut renamer =
@@ -57,50 +79,6 @@ pub fn process_trait(
     // types that do not exist at the use site (`error[E0412]: cannot find type MyTy in this
     // scope`). The early call is only for `set_dummy`, so an abort in between still has a valid
     // fallback expansion.
-    let carrier = |modified: &ItemTrait| {
-        quote! {
-            #trait_item
-
-            #[allow(unused_macros, unused_imports, dead_code, non_local_definitions)]
-            #[doc(hidden)]
-            #[macro_export]
-            macro_rules! #temporal_mac_name {
-                (#crate_identity #crate_version [$_:path, $wl1:path $(,$wl:path)* $(,)?] {$($trait_defs:tt)*} $($t:tt)*) => {
-                    $wl1! {
-                        #crate_identity
-                        #crate_version
-                        [$wl1 $(,$wl)*]
-                        {
-                            #(for attr in &modified.attrs) { #attr }
-                            #{&modified.vis}
-                            #{&modified.unsafety}
-                            #{&modified.auto_token}
-                            #{&modified.trait_token}
-                            #{&modified.ident}
-                            #{&modified.generics}
-                            #{&modified.colon_token}
-                            #{&modified.supertraits}
-                            {
-                                #(for item in &modified.items) { #item }
-                            },
-                            $($trait_defs)*
-                        }
-                        $($t)*
-                    }
-                };
-            }
-
-            #(if alter_macro_name.is_none()) {
-                #[doc(hidden)]
-                #[allow(unused_imports, unused_macros, dead_code)]
-                #{&trait_item.vis} use #temporal_mac_name as #{&trait_item.ident};
-            } #(else) {
-                #[doc(hidden)]
-                #[allow(unused_imports, unused_macros, dead_code)]
-                pub use #temporal_mac_name;
-            }
-        }
-    };
     proc_macro_error::set_dummy(carrier(&modified_trait_item));
 
     let mut leaker = Leaker::from_config(leaker_config);
@@ -155,13 +133,102 @@ pub fn process_trait(
         quote!()
     };
 
-    // Built AFTER the interning rewrite, so the definition that travels through the macro is the
-    // rewritten one.
-    let output0 = carrier(&modified_trait_item);
-
     quote! {
-        #output0
+        #{carrier(&modified_trait_item)}
 
         #typeref_impls
     }
+}
+
+/// Receive one trampoline entry at `__finalize`. A `#[decycle]` trait arrives already rewritten by
+/// [`process_trait`], wrapped in a same-named module; its `__trait_meta("VERSION")` must match this
+/// decycle. An entry without it
+/// (a plain `#[announce]` trait) only gets its generic parameters renamed.
+///
+/// An entry with a `mock(path)` META (a `#[decycle(mock = path)]` stand-in, or a plain
+/// `#[announce(mock = path)]` copy such as announce-std's) is the real trait at `path`: its ident
+/// becomes `path`'s last segment, so the module's `impl RealTrait for X` is matched, and an
+/// absolute `path` is recorded (see [`MOCK_ATTR`]) for the places that name the trait itself.
+pub(crate) fn receive_carried_trait(entry: &announce::helper::Entry) -> ItemTrait {
+    let not_a_trait = || -> ! {
+        abort!(
+            entry.item.span(),
+            "#[decycle] use: `{}` is not a trait",
+            template_quote::ToTokens::to_token_stream(&entry.key).to_string()
+        )
+    };
+    // `#[decycle]` announces `mod T { <rewritten trait> }` (announce's module wrapper); a plain
+    // `#[announce]` trait arrives as itself.
+    let mut trait_item: ItemTrait = match syn::parse2::<Item>(entry.item.clone()) {
+        Ok(Item::Trait(t)) => t,
+        Ok(Item::Mod(ItemMod {
+            content: Some((_, items)),
+            ..
+        })) => {
+            // Exactly one trait; a stand-in's wrapper also holds a leading `use super::*;`.
+            let mut items = items.into_iter().filter(|it| !matches!(it, Item::Use(_)));
+            match (items.next(), items.next()) {
+                (Some(Item::Trait(t)), None) => t,
+                _ => not_a_trait(),
+            }
+        }
+        _ => not_a_trait(),
+    };
+    match entry.find_meta("__trait_meta") {
+        Some(meta) => {
+            let version = meta
+                .parse_args_with(<LitStr as Parse>::parse)
+                .unwrap_or_else(|e| abort!(e.span(), "decycle: malformed trait metadata: {}", e));
+            let expected_version = env!("CARGO_PKG_VERSION");
+            if version.value() != expected_version {
+                abort!(
+                    Span::call_site(),
+                    "version mismatch: expected '{}', got '{}'",
+                    expected_version,
+                    version.value()
+                )
+            }
+        }
+        None => {
+            let mut renamer =
+                crate::randomize_impl_generics(&mut trait_item.generics, crate::get_random());
+            renamer.visit_item_trait_mut(&mut trait_item);
+        }
+    }
+    if let Some(path) = entry.mock() {
+        let real = path
+            .segments
+            .last()
+            .unwrap_or_else(|| abort!(path, "decycle: empty `mock` path"));
+        trait_item.ident = real.ident.clone();
+        if is_absolute(&path) {
+            let attr = Ident::new(MOCK_ATTR, Span::call_site());
+            trait_item.attrs.push(parse_quote!(#[#attr(#path)]));
+        }
+    }
+    trait_item
+}
+
+/// The name of the inert attribute [`receive_carried_trait`] puts on a carried stand-in trait to
+/// record its real trait's absolute path. Carried traits' own attributes are never re-emitted by
+/// `finalize`, so it only travels inside the `ItemTrait`; read it with [`mock_path`].
+pub(crate) const MOCK_ATTR: &str = "__decycle_mock";
+
+/// The real trait's absolute path of a carried stand-in trait (`mock(path)` META), if any.
+pub(crate) fn mock_path(trait_item: &ItemTrait) -> Option<Path> {
+    trait_item
+        .attrs
+        .iter()
+        .find(|a| a.path().is_ident(MOCK_ATTR))
+        .and_then(|a| a.parse_args::<Path>().ok())
+}
+
+/// `::a::b`, `crate::..` or `$crate::..` (what announce turns the definer's `crate::` into): a
+/// path that names the same item from any module.
+fn is_absolute(path: &Path) -> bool {
+    path.leading_colon.is_some()
+        || path
+            .segments
+            .first()
+            .is_some_and(|s| s.ident == "crate" || s.ident == "$crate")
 }

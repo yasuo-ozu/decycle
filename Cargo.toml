@@ -1,6 +1,6 @@
 [package]
 name = "decycle"
-version = "0.5.3"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.71"
 description = "Solve circular trait obligation"
@@ -19,11 +19,14 @@ exclude = ["decycle.png", "tests/", ".github/"]
 path = "lib.rs"
 
 [dependencies]
-decycle-macro = { path = "macro", version = "0.5.3" }
-decycle-impl = { path = "decycle-impl", version = "0.5.3", optional = true }
+decycle-macro = { path = "macro", version = "0.6.0" }
+decycle-impl = { path = "decycle-impl", version = "0.6.0", optional = true }
+# Definition-side trampoline carrying `#[decycle]` trait definitions to `#[decycle] use` sites.
+# Optional because it needs `std` (via proc-macro2/syn), which a bare-metal target does not have.
+announce = { version = "0.1.0", optional = true }
 
 [features]
-default = ["std", "api"]
+default = ["std", "api", "announce"]
 # The unbounded re-entry registry is a `thread_local!` map. Without it the ranked engine still
 # runs at a fixed depth (`support_infinite_cycle = false`), and the structural engine is
 # unaffected — it emits no runtime machinery at all.
@@ -31,6 +34,11 @@ std = []
 # The programmatic surface: both engines' entry points, the obligation-graph API, and safegraph.
 # Off, `decycle-impl` is not compiled for your target at all, which is what makes `no_std` work.
 api = ["dep:decycle-impl"]
+# A `#[decycle] trait` outside a `#[decycle] mod` is an announce trampoline, so that other crates can
+# `#[decycle] use` it. `announce` (like `decycle-impl`) is a host-style library that cannot be built
+# for a core-only target, hence the feature: leave it off for `no_std`, where such a trait is a
+# compile error that names the feature.
+announce = ["dep:announce"]
 
 [dev-dependencies]
 traitdef = { path = "tests/traitdef" }
@@ -40,6 +48,8 @@ graph_bridge = { path = "tests/graph_bridge" }
 # Counts its own expansions, so a test can pin that a method attribute macro runs exactly once.
 attrcount = { path = "tests/attrcount" }
 trybuild = "1.0"
+# A plain `#[announce(mock = ..)]` trait (`announce_std::fmt::Display`) used with `#[decycle] use`.
+announce-std = "0.1.0"
 [dev-dependencies.syn]
 version = "2.0"
 # `analysis::analyze_module` takes a `syn::ItemMod`, so the reachability test builds one; that is

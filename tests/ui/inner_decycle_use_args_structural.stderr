@@ -1,6 +1,6 @@
 error: #[decycle] takes no arguments on an item inside a #[decycle] module
 
-         = help: engine options (`structural`, `recurse_level`, `support_infinite_cycle`) belong on the enclosing `#[decycle] mod`; trait options (`marker`, `alter_macro_name`, `allowed_paths`) apply only to a `#[decycle]` trait declared outside such a module
+         = help: engine options (`structural`, `recurse_level`, `support_infinite_cycle`) belong on the enclosing `#[decycle] mod`; trait options (`marker`, `mock`, `allowed_paths`) apply only to a `#[decycle]` trait declared outside such a module
 
   --> tests/ui/inner_decycle_use_args_structural.rs:14:15
    |

@@ -160,6 +160,7 @@ jobs:
       - run: cargo build -p decycle --no-default-features
       - run: cargo build -p decycle --no-default-features --features std
       - run: cargo build -p decycle --no-default-features --features api
+      - run: cargo build -p decycle --no-default-features --features announce
       # The steps above build only the FACADE, which contains no expansions — so on their own they
       # say nothing about the code the macro emits. This fixture actually runs `#[decycle]` with
       # default features off, covering the two combinations documented as supported without `std`

@@ -781,8 +781,8 @@ fn process_module_inner(
 
             #(for raw_content in raw_contents) { #raw_content }
 
-            #(if let Some(first_path) = first_path) {
-                #first_path! { #args }
+            #(if first_path.is_some()) {
+                #{ args.cont_list().invoke(args.rest_tokens()) }
             }
             #(else) {
                 #{ crate::finalize::finalize(args) }

@@ -13,7 +13,7 @@ use decycle_impl::process_trait;
 struct Args {
     decycle: Option<Path>,
     marker: Option<Path>,
-    alter_macro_name: Option<Ident>,
+    mock: Option<Path>,
     allowed_paths: Option<Vec<Path>>,
     recurse_level: Option<usize>,
     support_infinite_cycle: Option<bool>,
@@ -39,7 +39,7 @@ impl Parse for Args {
         let mut args = Args {
             decycle: None,
             marker: None,
-            alter_macro_name: None,
+            mock: None,
             allowed_paths: None,
             recurse_level: None,
             support_infinite_cycle: None,
@@ -48,6 +48,7 @@ impl Parse for Args {
         };
         syn::custom_keyword!(decycle);
         syn::custom_keyword!(marker);
+        syn::custom_keyword!(mock);
         syn::custom_keyword!(alter_macro_name);
         syn::custom_keyword!(allowed_paths);
         syn::custom_keyword!(recurse_level);
@@ -79,15 +80,24 @@ impl Parse for Args {
                 } else {
                     args.marker = Some(value);
                 }
-            } else if lookahead.peek(alter_macro_name) {
-                let kw: alter_macro_name = input.parse()?;
+            } else if lookahead.peek(mock) {
+                let kw: mock = input.parse()?;
                 input.parse::<Token![=]>()?;
-                let value = input.parse()?;
-                if args.alter_macro_name.is_some() {
-                    args.note_duplicate(kw.span, "alter_macro_name");
+                // Mod-style, as announce's own `mock = path` parses it: no generic arguments.
+                let value = Path::parse_mod_style(input)?;
+                if args.mock.is_some() {
+                    args.note_duplicate(kw.span, "mock");
                 } else {
-                    args.alter_macro_name = Some(value);
+                    args.mock = Some(value);
                 }
+            } else if input.peek(alter_macro_name) {
+                // Removed in 0.6: the stand-in form `mock = path` replaced it.
+                let kw: alter_macro_name = input.parse()?;
+                abort!(
+                    kw.span,
+                    "`alter_macro_name` was replaced by `mock = path::to::RealTrait`";
+                    help = "declare the trait as a stand-in for the real trait: `#[decycle(mock = crate::path::RealTrait)] pub trait RealTrait`; its trampoline macro is named after the stand-in item, at the item's path"
+                )
             } else if lookahead.peek(allowed_paths) {
                 let kw: allowed_paths = input.parse()?;
                 input.parse::<Token![=]>()?;
@@ -120,7 +130,7 @@ impl Parse for Args {
             } else {
                 abort!(
                     input.span(),
-                    "keyword arguments should be one of 'decycle', 'marker', 'alter_macro_name', 'allowed_paths', 'recurse_level', 'support_infinite_cycle', 'structural'"
+                    "keyword arguments should be one of 'decycle', 'marker', 'mock', 'allowed_paths', 'recurse_level', 'support_infinite_cycle', 'structural'"
                 )
             }
             if input.parse::<Token![,]>().is_err() {
@@ -219,8 +229,8 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
         if let Some(marker) = &args.marker {
             abort!(marker, "unsupported argument 'marker'")
         }
-        if let Some(alter_macro_name) = &args.alter_macro_name {
-            abort!(alter_macro_name, "unsupported argument 'alter_macro_name'")
+        if let Some(mock) = &args.mock {
+            abort!(mock, "unsupported argument 'mock'")
         }
         if args.allowed_paths.is_some() {
             abort!(
@@ -242,7 +252,7 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
         } else {
             config.allow_crate();
             config.allow_primitive();
-            // The standard prelude is in scope wherever the carrier macro is expanded, so its
+            // The standard prelude is in scope wherever the announced trait is re-emitted, so its
             // names need no interning — and without them here, type-leak hard-errors on any
             // relative trait path, which `process_trait` turns into `use absolute path`. That
             // rejected `fn f<T: Clone>(..)` on a standalone `#[decycle]` trait, while the
@@ -254,7 +264,7 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
             &item,
             &decycle_path,
             args.marker.as_ref(),
-            args.alter_macro_name.as_ref(),
+            args.mock.as_ref(),
             config,
         );
         set_dummy(quote!(#ret));
@@ -308,4 +318,16 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
 pub fn __finalize(input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(input as decycle_impl::finalize::FinalizeArgs);
     decycle_impl::finalize::finalize(args).into()
+}
+
+/// What `#[::decycle::__private::announce::announce(..)]` resolves to when decycle's `announce`
+/// feature is off: a `#[decycle] trait` outside a `#[decycle] mod` needs it.
+#[doc(hidden)]
+#[proc_macro_attribute]
+pub fn __announce_disabled(_attr: TokenStream, _item: TokenStream) -> TokenStream {
+    quote!(::core::compile_error! {
+        "a `#[decycle]` trait outside a `#[decycle] mod` needs decycle's `announce` feature, which is on by default \
+         but off for `no_std` (the announce crate cannot be built for a core-only target)"
+    })
+    .into()
 }

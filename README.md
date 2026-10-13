@@ -20,25 +20,26 @@ traits with circular dependencies that would otherwise fail to compile.
 
 ```toml
 [dependencies]
-decycle = "0.5.3"
+decycle = "0.6.0"
 ```
 
 ### Cargo features
 
-Both are on by default; a normal `std` user needs neither flag.
+All are on by default; a normal `std` user needs none of these flags.
 
 | feature | default | what turning it **off** does |
 | --- | --- | --- |
 | `std` | on | Drops the re-entry registry, which is a `thread_local!` map. The ranked engine then requires `support_infinite_cycle = false`; asking for unbounded re-entry without `std` is a compile error naming `UnboundedReentryRequiresTheDecycleStdFeature`. The structural engine is unaffected — it emits no runtime machinery at all. |
 | `api` | on | Drops the programmatic surface (`decycle::{analysis, ranked, structural, safegraph}`). This is what keeps `decycle-impl` out of your *target* graph, and is therefore required for `no_std`. |
+| `announce` | on | Drops the [announce](https://docs.rs/announce) crate from your *target* graph, and with it `#[decycle]` on a trait **outside** a `#[decycle]` module (such a trait is an announce trampoline that other crates `#[decycle] use`; without the feature it is a compile error naming the feature). Required for `no_std`, because announce cannot be built for a core-only target. `#[decycle] use` of such a trait and everything inside a `#[decycle]` module need no feature. |
 
 **`no_std` needs `default-features = false`.** With the defaults on, `api` pulls `decycle-impl`
-(and `proc-macro2`) into the target graph, so a core-only target fails to build. The working
-spelling is:
+(and `proc-macro2`) and `announce` into the target graph, so a core-only target fails to build.
+The working spelling is:
 
 ```toml
 [dependencies]
-decycle = { version = "0.5.3", default-features = false }
+decycle = { version = "0.6.0", default-features = false }
 ```
 
 Note that turning `api` off does **not** shrink a normal native build: `decycle-macro` depends on
@@ -518,6 +519,12 @@ resolve in one pass.
 - **Trait**:
   - `#[decycle::decycle(marker = path, decycle = path)]`
   - `marker`: marker type used for internal references (required when reported)
+  - `mock = path`: declare the trait a *stand-in* for the real trait at `path` (e.g. one you do not
+    own). Only its trampoline macro is emitted, at the stand-in's path; `#[decycle] use` sites treat
+    the carried copy as the real trait, so their impls implement `path`. Name the stand-in like the
+    real trait (or `#[decycle] use stand::X as Real;`) and keep the real trait in scope. Replaces
+    0.5's `alter_macro_name` (now an error). Plain `#[announce(mock = ..)]` copies (announce-std)
+    work with `#[decycle] use` too.
   - `decycle`: override the path used to refer to this crate
   - `allowed_paths = [path, ...]`: overrides the type-leak allowed-path set (advanced; rarely needed)
 

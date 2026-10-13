@@ -8,6 +8,21 @@
 #[doc(hidden)]
 pub use decycle_macro::__finalize;
 
+/// Paths the generated code names; not a stable interface.
+#[doc(hidden)]
+pub mod __private {
+    /// A `#[decycle]` trait is carried to `#[decycle] use` sites by an announce trampoline;
+    /// `#[decycle]` emits `#[::decycle::__private::announce::announce(crate = ::decycle::__private::announce, ..)]`.
+    #[cfg(feature = "announce")]
+    pub use ::announce;
+
+    /// Without the `announce` feature the attribute above is a stand-in that only reports it.
+    #[cfg(not(feature = "announce"))]
+    pub mod announce {
+        pub use decycle_macro::__announce_disabled as announce;
+    }
+}
+
 /// The default **ranked** engine's programmatic API — hidden "Ranked" helper traits plus a
 /// thread-local re-entry registry. For macro authors and tooling built on decycle; most users want
 /// the [`macro@decycle`] attribute. See the module for its entry points.
@@ -120,7 +135,52 @@ pub use decycle_impl::safegraph;
 ///   - `marker`: marker type used for internal references. Required when the
 ///     trait definition contains non-absolute type paths so decycle can intern
 ///     them into a stable, globally reachable form.
+///   - `mock = path`: the trait is a *stand-in* for the real trait at `path` (see
+///     [Stand-ins](#stand-ins-for-traits-you-do-not-own)). Replaces 0.5's `alter_macro_name`.
+///   - `allowed_paths = [path, ..]`: overrides the interning allowed-path set (advanced)
 ///   - `decycle`: override the path used to refer to this crate
+///
+/// ### Stand-ins for traits you do not own
+/// `#[decycle(mock = path::to::RealTrait)]` on a trait declares it a copy of the real trait at
+/// that path (which need not be `#[decycle]`, and may live in another crate). decycle does not
+/// emit the stand-in as a trait: it only emits its trampoline macro, named after the stand-in, at
+/// the stand-in's path and visibility. `#[decycle] use path::to::Stand;` then brings in the copy
+/// as the **real** trait, so the module's impls implement `RealTrait`. Name the stand-in like the
+/// real trait (or `#[decycle] use path::to::Stand as RealTrait;`), keep the real trait in scope
+/// under that name, and spell `mock = ..` absolutely (`crate::..`, `::krate::..`). Plain
+/// `#[announce(mock = ..)]` copies, such as `announce_std`'s, work the same way.
+///
+/// ```rust
+/// pub mod real {
+///     pub trait Size { fn size(&self) -> usize; }
+/// }
+/// pub mod stand {
+///     #[decycle::decycle(mock = crate::real::Size)]
+///     pub trait Size { fn size(&self) -> usize; }
+/// }
+///
+/// #[decycle::decycle]
+/// mod tree {
+///     use crate::real::Size;
+///     #[decycle]
+///     use crate::stand::Size;
+///
+///     pub struct Node(pub Vec<Leaf>);
+///     pub struct Leaf(pub Option<Box<Node>>);
+///     impl Size for Node where Leaf: Size {
+///         fn size(&self) -> usize { 1 + self.0.iter().map(|l| l.size()).sum::<usize>() }
+///     }
+///     impl Size for Leaf where Node: Size {
+///         fn size(&self) -> usize { self.0.as_ref().map_or(1, |n| n.size()) }
+///     }
+/// }
+///
+/// fn main() {
+///     use real::Size;
+///     let t = tree::Node(vec![tree::Leaf(None), tree::Leaf(Some(Box::new(tree::Node(vec![]))))]);
+///     assert_eq!(t.size(), 3);
+/// }
+/// ```
 ///
 /// ### Impl where-clause bounds
 /// In `impl` blocks inside a `#[decycle]` module, avoid constraining

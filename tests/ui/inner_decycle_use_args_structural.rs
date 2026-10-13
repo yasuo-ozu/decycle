@@ -1,6 +1,7 @@
 //! The same rejection reaches the OTHER marker sites for free, because it lives on the predicate
 //! every engine matches with: here a `#[decycle] use` (not a trait) inside a `#[decycle(structural)]`
-//! module (not the ranked one). `marker` is a trait-only argument and was silently dropped.
+//! module (not the ranked one). `decycle = path` is read from the `mod`, so on the `use` it was
+//! silently dropped.
 use decycle::decycle;
 
 mod ext {
@@ -11,7 +12,7 @@ mod ext {
 
 #[decycle(structural)]
 mod m {
-    #[decycle(marker = ::nope::Marker)]
+    #[decycle(decycle = ::nope)]
     use crate::ext::Ev;
 
     pub struct A;

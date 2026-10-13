@@ -8,20 +8,13 @@
 #[doc(hidden)]
 pub use decycle_macro::__finalize;
 
-/// Paths the generated code names; not a stable interface.
-#[doc(hidden)]
-pub mod __private {
-    /// A `#[decycle]` trait is carried to `#[decycle] use` sites by an announce trampoline;
-    /// `#[decycle]` emits `#[::decycle::__private::announce::announce(crate = ::decycle::__private::announce, ..)]`.
-    #[cfg(feature = "announce")]
-    pub use ::announce;
-
-    /// Without the `announce` feature the attribute above is a stand-in that only reports it.
-    #[cfg(not(feature = "announce"))]
-    pub mod announce {
-        pub use decycle_macro::__announce_disabled as announce;
-    }
-}
+/// Re-export of the [`announce`](https://docs.rs/announce) crate, so that a crate can announce its
+/// traits for `#[decycle] use` without depending on `announce` itself:
+/// `#[decycle::announce::announce(crate = ::decycle::announce, decycle::check)]`. The option
+/// `crate = ..` tells `#[announce]` where its runtime is; it is optional for a crate that depends on
+/// `announce` directly. Needs the `announce` feature (on by default). See [`check`].
+#[cfg(feature = "announce")]
+pub use announce;
 
 /// The default **ranked** engine's programmatic API — hidden "Ranked" helper traits plus a
 /// thread-local re-entry registry. For macro authors and tooling built on decycle; most users want
@@ -54,8 +47,8 @@ pub use decycle_impl::analysis;
 /// [`analysis::analyze_module`] returns without depending on `safegraph` themselves.
 #[cfg(feature = "api")]
 pub use decycle_impl::safegraph;
-/// Attribute macro that expands a module or trait to break circular trait
-/// obligations within the annotated module. Also see module-level documentation.
+/// Attribute macro that expands a module to break circular trait obligations within it. Also see
+/// module-level documentation.
 ///
 /// # Two engines
 ///
@@ -71,13 +64,14 @@ pub use decycle_impl::safegraph;
 /// compile time; ranked can re-enter across several instantiations of a generic method, but a residual
 /// set of shapes fails closed at runtime). See the crate README's *Two algorithms* section for the full
 /// per-engine matrix. Both engines require the whole cycle in one *inline* `#[decycle]` module over
-/// traits **you** annotate — either `#[decycle]` on the trait definition, or a `#[decycle] use` of a
-/// trait defined elsewhere.
+/// traits **you** annotate — either `#[decycle]` on a trait defined in the module, or a
+/// `#[decycle] use` of a trait announced elsewhere (see
+/// [Traits outside the module](#traits-outside-the-module)).
 ///
 /// ```rust
 /// # use decycle::decycle;
-/// // This annotation is required to be used within #[decycle] module
-/// #[decycle]
+/// // A trait outside the module is announced, not annotated with `#[decycle]`.
+/// #[decycle::announce::announce(crate = ::decycle::announce)]
 /// trait A {
 ///     fn a(&self) -> ::core::primitive::usize;
 /// }
@@ -130,32 +124,47 @@ pub use decycle_impl::safegraph;
 ///
 ///   An empty `#[decycle]` module is rejected by both engines. A module with no `#[decycle]`-annotated
 ///   cycle is rejected by the ranked engine and treated as a silent no-op by the structural engine.
-/// - **Trait** (defined out of `#[decycle]` module):
-///   - `#[decycle::decycle(marker = path, decycle = path)]`
-///   - `marker`: marker type used for internal references. Required when the
-///     trait definition contains non-absolute type paths so decycle can intern
-///     them into a stable, globally reachable form.
-///   - `mock = path`: the trait is a *stand-in* for the real trait at `path` (see
-///     [Stand-ins](#stand-ins-for-traits-you-do-not-own)). Replaces 0.5's `alter_macro_name`.
-///   - `allowed_paths = [path, ..]`: overrides the interning allowed-path set (advanced)
-///   - `decycle`: override the path used to refer to this crate
+///
+/// ### Traits outside the module
+/// `#[decycle]` on a trait is only valid *inside* a `#[decycle]` module. A trait defined anywhere
+/// else is announced with [`#[announce]`](https://docs.rs/announce/latest/announce/attr.announce.html)
+/// (re-exported as `decycle::announce`): that makes its definition available to any crate, and
+/// `#[decycle] use path::to::Trait;` brings it into a module.
+///
+/// ```text
+/// #[decycle::announce::announce(crate = ::decycle::announce, decycle::check)]
+/// pub trait Trait { .. }
+/// ```
+///
+/// `#[decycle]` on a trait outside a module is a compile error that says so (it was the way to do
+/// this in 0.5). Its options map to:
+///
+/// | 0.5 `#[decycle(..)]` on a trait | now |
+/// | --- | --- |
+/// | `#[decycle]` | `#[announce(crate = ::decycle::announce)]` |
+/// | `mock = path` (0.6 only) | `#[announce(.., mock = path)]` |
+/// | `alter_macro_name = N` | `#[announce(.., macro_name = N)]`, or `mock = path` |
+/// | `decycle = path` | none; the trait no longer names decycle (`crate = ::my_rename::announce` if you renamed it) |
+/// | `marker = path` | none; announce checks the trait's paths at its definition: write them absolutely (`crate::..`, `::krate::..`) |
+/// | `allowed_paths = [..]` | none; `allow_std_prelude = true` accepts the bare std prelude names (`Clone`, `Vec<u8>`) |
+/// | (checks at use) | `decycle::check`, see [`check`] |
 ///
 /// ### Stand-ins for traits you do not own
-/// `#[decycle(mock = path::to::RealTrait)]` on a trait declares it a copy of the real trait at
-/// that path (which need not be `#[decycle]`, and may live in another crate). decycle does not
-/// emit the stand-in as a trait: it only emits its trampoline macro, named after the stand-in, at
-/// the stand-in's path and visibility. `#[decycle] use path::to::Stand;` then brings in the copy
+/// `#[announce(mock = path::to::RealTrait)]` on a trait declares it a copy of the real trait at
+/// that path (which need not be announced, and may live in another crate). announce does not emit
+/// the stand-in as a trait in place: it only emits its trampoline macro, named after the stand-in,
+/// at the stand-in's path and visibility. `#[decycle] use path::to::Stand;` then brings in the copy
 /// as the **real** trait, so the module's impls implement `RealTrait`. Name the stand-in like the
 /// real trait (or `#[decycle] use path::to::Stand as RealTrait;`), keep the real trait in scope
-/// under that name, and spell `mock = ..` absolutely (`crate::..`, `::krate::..`). Plain
-/// `#[announce(mock = ..)]` copies, such as `announce_std`'s, work the same way.
+/// under that name, and spell `mock = ..` absolutely (`crate::..`, `::krate::..`).
+/// [`announce-std`](https://docs.rs/announce-std) provides such copies for the traits of `std`.
 ///
 /// ```rust
 /// pub mod real {
 ///     pub trait Size { fn size(&self) -> usize; }
 /// }
 /// pub mod stand {
-///     #[decycle::decycle(mock = crate::real::Size)]
+///     #[decycle::announce::announce(crate = ::decycle::announce, mock = crate::real::Size)]
 ///     pub trait Size { fn size(&self) -> usize; }
 /// }
 ///
@@ -189,7 +198,7 @@ pub use decycle_impl::safegraph;
 ///
 /// ```rust,compile_fail
 /// # use decycle::decycle;
-/// #[decycle]
+/// #[decycle::announce::announce(crate = ::decycle::announce)]
 /// pub trait MyTrait<'a> {
 ///     type Assoc;
 /// }
@@ -280,27 +289,93 @@ pub use decycle_impl::safegraph;
 /// (`fn(&Self)` / `dyn` / `impl Fn(&Self)`), and more — see the crate README's *Two algorithms*
 /// section.
 ///
-/// ## Example with markers
-/// Use `marker` when the trait contains non-absolute paths (e.g. `super::Type`,
-/// `crate::Type`, or local aliases) so decycle can intern those references.
-/// The path given with `marker = <path>` argument should be practically absolute and accessible from anywhere
-/// where the defined trait is used.
+/// ## Paths in an announced trait
+/// `#[announce]` hands the trait to other crates, and checks at its definition that every path in
+/// it means the same thing there. Spell the paths of the trait absolutely: `crate::Base`,
+/// `::core::fmt::Debug`, `crate::Local`. A path relative to the defining module (`Local`,
+/// `super::X`, `std::fmt::Debug` without the leading `::`) is an error that names it. Primitive
+/// types need nothing, and `allow_std_prelude = true` accepts the bare std prelude names
+/// (`Clone`, `String`, `Vec<u8>`, `Option<T>`). The error also suggests announce's `repeater`;
+/// `#[decycle] use` does not read it and rejects a trait announced with one, so write the path
+/// absolutely. The same trait defined inside a `#[decycle]` module needs none of this, since it is
+/// not carried through a macro.
 ///
 /// ```rust
-/// #[decycle::decycle(marker = Marker)]
-/// trait MyTrait {
-///     fn value(&self) -> i32;
+/// # use decycle::decycle;
+/// pub struct Value(pub i32);
+///
+/// #[decycle::announce::announce(crate = ::decycle::announce, allow_std_prelude = true)]
+/// pub trait MyTrait {
+///     fn value(&self) -> crate::Value;
+///     fn text(&self) -> String;
 /// }
-/// struct Marker;
+/// # fn main() {}
 /// ```
 pub use decycle_macro::decycle;
 
-/// Internal helper used by generated code to track staged type expansion.
-#[doc(hidden)]
-pub trait Repeater<const RANDOM: u64, const IX: usize, PARAM: ?Sized> {
-    /// The resolved type at the given stage.
-    type Type: ?Sized;
-}
+/// Checks a trait at its definition: it can take part in a `#[decycle]` cycle.
+///
+/// A trait is made available to `#[decycle] use` by announcing it with the
+/// [`announce`](https://docs.rs/announce) attribute (re-exported as [`announce`](mod@crate::announce)).
+/// `#[decycle]` reads the trait through its trampoline, so nothing else is needed. Without this
+/// check the trait is validated only when a `#[decycle]` module receives it, and the error appears
+/// there. List `decycle::check` among the options of `#[announce]` to get the error at the trait:
+///
+/// ```
+/// use decycle::{announce::announce, decycle};
+///
+/// // `crate = ..` is needed when the crate does not depend on `announce` itself.
+/// #[announce(crate = ::decycle::announce, decycle::check)]
+/// pub trait Walk {
+///     fn walk(&self, depth: usize) -> usize;
+/// }
+///
+/// #[decycle]
+/// mod m {
+///     #[decycle]
+///     pub use super::Walk;
+///
+///     pub struct A(pub Option<Box<B>>);
+///     pub struct B(pub Option<Box<A>>);
+///
+///     impl Walk for A where B: Walk {
+///         fn walk(&self, depth: usize) -> usize {
+///             self.0.as_ref().map_or(depth, |b| b.walk(depth + 1))
+///         }
+///     }
+///     impl Walk for B where A: Walk {
+///         fn walk(&self, depth: usize) -> usize {
+///             self.0.as_ref().map_or(depth, |a| a.walk(depth + 1))
+///         }
+///     }
+/// }
+/// # fn main() {
+/// use m::Walk;
+/// assert_eq!(m::A(Some(Box::new(m::B(None)))).walk(0), 1);
+/// # }
+/// ```
+///
+/// A trait that `#[decycle]` cannot carry through a cycle is rejected at its definition:
+///
+/// ```compile_fail
+/// use decycle::announce::announce;
+/// #[announce(crate = ::decycle::announce, decycle::check)]
+/// pub trait Bad {
+///     fn items(&self) -> impl Iterator<Item = u8>; // return-position `impl Trait`
+/// }
+/// ```
+///
+/// The rules that depend on the trait alone are checked:
+///
+/// - no default on a generic parameter (`trait Tr<T = u8>`, `trait Tr<const N: usize = 4>`): every
+///   use of the trait is re-spelled with a rank argument, so each use site has to write every
+///   parameter;
+/// - no return-position `impl Trait` in a method (`-> impl Iterator<..>`): it has no nameable
+///   type for the re-entry. Declare an associated type and return it instead.
+///
+/// Whatever depends on the impls (a where-clause bound, an `async fn` impl, a `#[track_caller]`)
+/// can only be checked when the module is expanded.
+pub use decycle_macro::check;
 
 /// Runtime fn-pointer registry backing unbounded `support_infinite_cycle` re-entry.
 #[doc(hidden)]
@@ -543,6 +618,3 @@ pub mod __reentry {
 #[doc(hidden)]
 #[cfg(feature = "api")]
 pub use decycle_impl::proc_macro_error;
-#[doc(hidden)]
-#[cfg(feature = "api")]
-pub use decycle_impl::type_leak;

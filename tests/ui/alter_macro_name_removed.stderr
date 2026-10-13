@@ -1,8 +1,8 @@
-error: `alter_macro_name` was replaced by `mock = path::to::RealTrait`
+error: `alter_macro_name` was an option of `#[decycle]` on a trait, which was removed in 0.6
 
-         = help: declare the trait as a stand-in for the real trait: `#[decycle(mock = crate::path::RealTrait)] pub trait RealTrait`; its trampoline macro is named after the stand-in item, at the item's path
+         = help: announce the trait with `#[::decycle::announce::announce(crate = ::decycle::announce, macro_name = Name)]` to rename its trampoline, or with `mock = path::to::RealTrait` to declare a stand-in for another trait
 
- --> tests/ui/alter_macro_name_removed.rs:2:20
+ --> tests/ui/alter_macro_name_removed.rs:3:20
   |
-2 | #[decycle::decycle(alter_macro_name = Renamed)]
+3 | #[decycle::decycle(alter_macro_name = Renamed)]
   |                    ^^^^^^^^^^^^^^^^

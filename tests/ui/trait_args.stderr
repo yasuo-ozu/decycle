@@ -1,7 +1,0 @@
-error: recurse_level is not supported for trait items
- --> tests/ui/trait_args.rs:1:1
-  |
-1 | #[decycle::decycle(recurse_level = 4)]
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  |
-  = note: this error originates in the attribute macro `decycle::decycle` (in Nightly builds, run with -Z macro-backtrace for more info)

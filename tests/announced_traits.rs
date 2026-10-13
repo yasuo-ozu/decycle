@@ -1,14 +1,14 @@
-//! `#[decycle]` traits are announced in announce's module-wrapper form, so decycle's own path
-//! handling (`allowed_paths`, a relative `marker`) is not second-guessed by announce
-//! (AUDIT part 3, decycle #1-#3).
+//! Traits are announced with `#[announce]` (re-exported as `decycle::announce`), not annotated with
+//! `#[decycle]`: a trait of another crate that names a type of its crate by an absolute path,
+//! one validated with `decycle::check`, one with a type of its own module, and a private stand-in.
 
-// `#[decycle(allowed_paths = [tys])]` on a trait of another crate.
+// `crate::tys::Unit` in a trait of another crate: absolute, so it resolves at the use site.
 #[decycle::decycle]
 mod m {
     use traitdef::tys;
 
     #[decycle]
-    pub use traitdef::allowed::FromTys;
+    pub use traitdef::checked::FromTys;
 
     pub struct A(pub Option<Box<B>>);
     pub struct B(pub usize);
@@ -33,35 +33,39 @@ mod m {
 }
 
 #[test]
-fn allowed_paths_across_crates() {
-    use traitdef::allowed::FromTys as _;
+fn absolute_type_across_crates() {
+    use traitdef::checked::FromTys as _;
     let a = m::A(Some(Box::new(m::B(3))));
     // B: 3 * 10 + 1 = 31; A: 31 + 1 = 32
     assert_eq!(a.unit(0).0, 32);
 }
 
-// The doc example's form: a relative `marker`, and a relative type that needs interning.
-mod relative_marker {
+// A type of the trait's own module, spelled absolutely; `String` and `Vec<u8>` are std prelude
+// names, accepted with `allow_std_prelude = true`.
+mod same_crate_types {
     pub struct MyTy(pub usize);
-    #[allow(dead_code)]
-    pub struct Marker;
 
-    #[decycle::decycle(marker = Marker)]
+    #[decycle::announce::announce(crate = ::decycle::announce, allow_std_prelude = true, decycle::check)]
     pub trait Produce {
-        fn produce(&self) -> MyTy;
+        fn produce(&self) -> crate::same_crate_types::MyTy;
+        fn name(&self, bytes: Vec<u8>) -> String;
     }
 
     impl Produce for u8 {
         fn produce(&self) -> MyTy {
             MyTy(*self as usize)
         }
+        fn name(&self, bytes: Vec<u8>) -> String {
+            format!("{}:{}", self, bytes.len())
+        }
     }
 }
 
 #[test]
-fn relative_marker() {
-    use relative_marker::Produce as _;
+fn announced_trait_is_an_ordinary_trait() {
+    use same_crate_types::Produce as _;
     assert_eq!(3u8.produce().0, 3);
+    assert_eq!(3u8.name(vec![1, 2]), "3:2");
 }
 
 // A private stand-in (`mock = path`) is announced at the item's visibility: its trampoline is
@@ -72,7 +76,7 @@ mod private_stand {
         fn real(&self) -> u8;
     }
     pub(crate) mod stand {
-        #[decycle::decycle(mock = crate::private_stand::Real)]
+        #[decycle::announce::announce(crate = ::decycle::announce, mock = crate::private_stand::Real)]
         pub(crate) trait Real {
             fn real(&self) -> u8;
         }

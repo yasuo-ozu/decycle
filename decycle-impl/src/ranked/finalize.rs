@@ -2214,7 +2214,7 @@ fn used_lifetime_idents(norm: &NormSig) -> std::collections::HashSet<String> {
 /// (`#[decycle(mock = path)]`, `#[announce(mock = path)]`) — by the real trait's absolute path.
 fn original_trait_path(trait_: &ItemTrait) -> Path {
     let trait_ident = &trait_.ident;
-    crate::ranked::process_trait::mock_path(trait_)
+    crate::ranked::carried::mock_path(trait_)
         .unwrap_or_else(|| parse_quote!(super::super::#trait_ident))
 }
 
@@ -3112,7 +3112,7 @@ impl Parse for FinalizeArgs {
         let mut traits: Vec<ItemTrait> = announce_input
             .entries
             .iter()
-            .map(crate::ranked::process_trait::receive_carried_trait)
+            .map(crate::ranked::carried::receive_carried_trait)
             .collect();
         let rest = announce_input.rest;
         let mut args = syn::parse::Parser::parse2(
@@ -3484,27 +3484,61 @@ fn check_no_defaulted_trait_generics(
     replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
 ) {
     for (trait_, _, _) in replacing_table.values() {
-        for param in &trait_.generics.params {
-            let (ident, default) = match param {
-                GenericParam::Type(tp) => (&tp.ident, tp.default.as_ref().map(|d| quote!(#d))),
-                GenericParam::Const(cp) => (&cp.ident, cp.default.as_ref().map(|d| quote!(#d))),
-                GenericParam::Lifetime(_) => continue,
-            };
-            if let Some(default) = default {
+        check_no_defaulted_generics_of(trait_);
+    }
+}
+
+/// [`check_no_defaulted_trait_generics`] for one trait.
+fn check_no_defaulted_generics_of(trait_: &ItemTrait) {
+    for param in &trait_.generics.params {
+        let (ident, default) = match param {
+            GenericParam::Type(tp) => (&tp.ident, tp.default.as_ref().map(|d| quote!(#d))),
+            GenericParam::Const(cp) => (&cp.ident, cp.default.as_ref().map(|d| quote!(#d))),
+            GenericParam::Lifetime(_) => continue,
+        };
+        if let Some(default) = default {
+            abort!(
+                param,
+                "decycle: generic parameter `{}` of #[decycle] trait `{}` cannot have a default",
+                ident,
+                &trait_.ident;
+                help = "decycle re-spells every use of `{}` with a synthesized rank argument inserted into the argument list the user WROTE, so each use site has to spell every parameter; a default lets a use site leave `{}` out, and that expands to a rank-lowered path with too few arguments. Drop the `= {}` and write `{}` at every use site.",
+                &trait_.ident,
+                ident,
+                default,
+                ident
+            );
+        }
+    }
+}
+
+/// Return-position `impl Trait` (RPITIT) in a trait method is rejected, by both engines, in every
+/// mode: the ranked re-entry fn-pointer type `fn(..) -> impl Trait` is not nameable (E0562), and
+/// the structural layout cast can't reinterpret an opaque return type. An associated type is the
+/// portable escape hatch — it names the return type, so both engines can carry it.
+pub(crate) fn check_no_impl_trait_output_in(trait_: &ItemTrait) {
+    for item in &trait_.items {
+        if let TraitItem::Fn(tf) = item {
+            if sig_has_impl_trait_output(&tf.sig) {
                 abort!(
-                    param,
-                    "decycle: generic parameter `{}` of #[decycle] trait `{}` cannot have a default",
-                    ident,
-                    &trait_.ident;
-                    help = "decycle re-spells every use of `{}` with a synthesized rank argument inserted into the argument list the user WROTE, so each use site has to spell every parameter; a default lets a use site leave `{}` out, and that expands to a rank-lowered path with too few arguments. Drop the `= {}` and write `{}` at every use site.",
-                    &trait_.ident,
-                    ident,
-                    default,
-                    ident
+                    &tf.sig.output,
+                    "decycle: return-position `impl Trait` in method `{}` of #[decycle] trait `{}` is not supported", tf.sig.ident, trait_.ident;
+                    help = "declare an associated type on the trait and return it instead (e.g. `type Output; fn m(&self) -> Self::Output`)"
                 );
             }
         }
     }
+}
+
+/// The rules a trait must satisfy to take part in a `#[decycle]` cycle that depend on the trait
+/// alone, checked at its definition. The same rules are enforced where a `#[decycle]` module or
+/// `#[decycle] use` receives the trait; this runs them early, so that the error appears at the
+/// trait. It aborts (through `proc_macro_error`) at the first violation.
+///
+/// Behind `decycle::check`, which an announced trait lists among the options of `#[announce]`.
+pub fn check_trait(trait_: &ItemTrait) {
+    check_no_defaulted_generics_of(trait_);
+    check_no_impl_trait_output_in(trait_);
 }
 
 /// A `#[decycle]` trait listed as a supertrait of ANOTHER `#[decycle]` trait — both in the

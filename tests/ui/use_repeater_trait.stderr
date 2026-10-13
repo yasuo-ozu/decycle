@@ -1,0 +1,13 @@
+error: #[decycle] use: `Produce!` is announced with a `repeater`, which decycle does not support
+
+         = help: announce the trait without `repeater` and spell its types with absolute paths (`crate::..`, `::krate::..`)
+
+  --> tests/ui/use_repeater_trait.rs:9:5
+   |
+ 9 |     pub trait Produce {
+   |     ^^^
+...
+14 | #[decycle::decycle]
+   | ------------------- in this attribute macro expansion
+   |
+   = note: this error originates in the macro `Produce` which comes from the expansion of the attribute macro `decycle::decycle` (in Nightly builds, run with -Z macro-backtrace for more info)

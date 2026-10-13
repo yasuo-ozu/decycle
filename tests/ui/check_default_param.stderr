@@ -1,0 +1,8 @@
+error: decycle: generic parameter `T` of #[decycle] trait `Ca` cannot have a default
+
+         = help: decycle re-spells every use of `Ca` with a synthesized rank argument inserted into the argument list the user WROTE, so each use site has to spell every parameter; a default lets a use site leave `T` out, and that expands to a rank-lowered path with too few arguments. Drop the `= u8` and write `T` at every use site.
+
+ --> tests/ui/check_default_param.rs:4:14
+  |
+4 | pub trait Ca<T = u8> {
+  |              ^^^^^^

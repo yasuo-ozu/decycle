@@ -77,8 +77,7 @@ jobs:
       # 1.71 is measured, and it is only reachable because `safegraph` is taken with
       # `default-features = false`. Its default `matrix` feature pulls `sprs`, which declares
       # rustc 1.88 and dragged the whole crate's floor up with it; nothing here needs the matrix
-      # backend. `type-leak` already depends on `safegraph` with default features off, so that
-      # second path never contributed. Cargo.lock is gitignored, so the step above resolves fresh.
+      # backend. Cargo.lock is gitignored, so the step above resolves fresh.
       - name: cargo build (decycle + macro + impl)
         run: cargo +1.71.0 build -p decycle -p decycle-macro -p decycle-impl --locked
 

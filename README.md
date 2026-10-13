@@ -31,7 +31,7 @@ All are on by default; a normal `std` user needs none of these flags.
 | --- | --- | --- |
 | `std` | on | Drops the re-entry registry, which is a `thread_local!` map. The ranked engine then requires `support_infinite_cycle = false`; asking for unbounded re-entry without `std` is a compile error naming `UnboundedReentryRequiresTheDecycleStdFeature`. The structural engine is unaffected — it emits no runtime machinery at all. |
 | `api` | on | Drops the programmatic surface (`decycle::{analysis, ranked, structural, safegraph}`). This is what keeps `decycle-impl` out of your *target* graph, and is therefore required for `no_std`. |
-| `announce` | on | Drops the [announce](https://docs.rs/announce) crate from your *target* graph, and with it `#[decycle]` on a trait **outside** a `#[decycle]` module (such a trait is an announce trampoline that other crates `#[decycle] use`; without the feature it is a compile error naming the feature). Required for `no_std`, because announce cannot be built for a core-only target. `#[decycle] use` of such a trait and everything inside a `#[decycle]` module need no feature. |
+| `announce` | on | Drops the [announce](https://docs.rs/announce) crate from your *target* graph, and with it the re-export `decycle::announce`, through which a trait **outside** a `#[decycle]` module is announced for other crates to `#[decycle] use` (`#[decycle::announce::announce(crate = ::decycle::announce)]`). Required for `no_std`, because announce cannot be built for a core-only target. `#[decycle] use` of an announced trait, `decycle::check` and everything inside a `#[decycle]` module need no feature. |
 
 **`no_std` needs `default-features = false`.** With the defaults on, `api` pulls `decycle-impl`
 (and `proc-macro2`) and `announce` into the target graph, so a core-only target fails to build.
@@ -164,13 +164,14 @@ fn main() {
 ### Using `use` to mark traits
 
 You can also annotate `use` items inside the module to use traits defined out of
-the module:
+the module. Such a trait is announced with [`#[announce]`](https://docs.rs/announce)
+(re-exported as `decycle::announce`), not annotated with `#[decycle]`:
 
 ```rust
 # use decycle::decycle;
 
 // can be defined out of the crate
-#[decycle]
+#[decycle::announce::announce(crate = ::decycle::announce, decycle::check)]
 pub trait Evaluate {
     fn evaluate(&self, input: &[&'static str], index: &mut usize) -> i32;
 }
@@ -202,7 +203,7 @@ mod cycle {
 | Generic arg instantiated with an **anonymous type** (closure, `async` block, `-> impl Trait` value) | ✗ in unbounded mode — see the closure note below | **✓** |
 | Arg mentioning `Self`: **`fn(&Self)`** / **`&dyn Fn(&Self)`** | ✗ | **✓** |
 | Non-`#[decycle]` **supertrait** on the trait | **✓** | ✗ |
-| Third-party trait *in* the cycle | only when `#[decycle]`-annotated at its definition | **✓**  |
+| Third-party trait *in* the cycle | only when announced (`#[announce]`) at its definition | **✓**  |
 
 > **Note on closures (ranked engine, unbounded mode only).** With
 > `support_infinite_cycle = true` (the default), instantiating a cyclic method with a closure or
@@ -265,9 +266,9 @@ Smallest example (two mutually recursive traits):
 ```rust
 # use decycle::decycle;
 
-#[decycle]
+#[decycle::announce::announce(crate = ::decycle::announce)]
 trait A { fn a(&self) -> ::core::primitive::usize; }
-#[decycle]
+#[decycle::announce::announce(crate = ::decycle::announce)]
 trait B { fn b(&self) -> ::core::primitive::usize; }
 
 #[decycle]
@@ -516,17 +517,77 @@ resolve in one pass.
   - `recurse_level`: expansion depth (default 10, must be at least 1)
   - `support_infinite_cycle`: enables/disable infinite cycle handling (default true)
   - `decycle`: override the path used to refer to this crate
-- **Trait**:
-  - `#[decycle::decycle(marker = path, decycle = path)]`
-  - `marker`: marker type used for internal references (required when reported)
-  - `mock = path`: declare the trait a *stand-in* for the real trait at `path` (e.g. one you do not
-    own). Only its trampoline macro is emitted, at the stand-in's path; `#[decycle] use` sites treat
-    the carried copy as the real trait, so their impls implement `path`. Name the stand-in like the
-    real trait (or `#[decycle] use stand::X as Real;`) and keep the real trait in scope. Replaces
-    0.5's `alter_macro_name` (now an error). Plain `#[announce(mock = ..)]` copies (announce-std)
-    work with `#[decycle] use` too.
-  - `decycle`: override the path used to refer to this crate
-  - `allowed_paths = [path, ...]`: overrides the type-leak allowed-path set (advanced; rarely needed)
+
+## Traits outside a module
+
+`#[decycle]` on a trait is only valid *inside* a `#[decycle]` module. A trait defined anywhere
+else (another module, another crate) is announced with
+[`#[announce]`](https://docs.rs/announce/latest/announce/attr.announce.html), which `decycle`
+re-exports as `decycle::announce`, and brought in with `#[decycle] use`:
+
+```rust
+# use decycle::decycle;
+// `crate = ..` is needed when the crate does not depend on `announce` itself.
+#[decycle::announce::announce(crate = ::decycle::announce, decycle::check)]
+pub trait Walk {
+    fn walk(&self, depth: usize) -> usize;
+}
+
+#[decycle]
+mod cycle {
+    #[decycle]
+    use super::Walk;
+
+    pub struct A(pub Option<Box<B>>);
+    pub struct B(pub Option<Box<A>>);
+
+    impl Walk for A where B: Walk {
+        fn walk(&self, depth: usize) -> usize {
+            self.0.as_ref().map_or(depth, |b| b.walk(depth + 1))
+        }
+    }
+    impl Walk for B where A: Walk {
+        fn walk(&self, depth: usize) -> usize {
+            self.0.as_ref().map_or(depth, |a| a.walk(depth + 1))
+        }
+    }
+}
+# fn main() {}
+```
+
+`decycle::check` is optional. It validates the trait at its definition (no default on a generic
+parameter, no return-position `impl Trait`), so that the error appears at the trait instead of
+where a module receives it.
+
+`#[announce]` checks that every path in the trait means the same thing in another crate, and
+rejects a path relative to the defining module (`Local`, `super::X`, `std::fmt::Debug`) at the
+definition: write it absolutely (`crate::Local`, `::core::fmt::Debug`). Primitive types need
+nothing, and `allow_std_prelude = true` accepts the bare std prelude names (`String`, `Vec<u8>`,
+`Clone`). The error also suggests announce's `repeater`; `#[decycle] use` does not read it and
+rejects a trait announced with one, so write the path absolutely. A trait written inside a
+`#[decycle]` module is not carried through a macro, so none of this applies to it.
+
+`#[decycle]` on a trait outside a module (the 0.5 way) is a compile error that points here. Its
+options map to:
+
+| 0.5 `#[decycle(..)]` on a trait | now |
+| --- | --- |
+| `#[decycle]` | `#[announce(crate = ::decycle::announce)]` |
+| `mock = path` (unreleased 0.6 form) | `#[announce(.., mock = path)]` |
+| `alter_macro_name = N` | `#[announce(.., macro_name = N)]`, or `mock = path` |
+| `decycle = path` | none: the trait no longer names decycle (pass `crate = ::renamed::announce` if you renamed the dependency) |
+| `marker = path` | none: write the paths of the trait absolutely (`crate::..`, `::krate::..`); announce reports the ones that do not resolve |
+| `allowed_paths = [..]` | none: `allow_std_prelude = true` accepts the bare std prelude names |
+| (new) | `decycle::check`: validate the trait at its definition |
+
+### Stand-ins for traits you do not own
+
+`#[announce(mock = path::to::RealTrait)]` declares a trait a *stand-in* for the real trait at
+`path` (e.g. one you do not own). Only its trampoline macro is emitted, at the stand-in's path;
+`#[decycle] use` sites treat the carried copy as the real trait, so their impls implement `path`.
+Name the stand-in like the real trait (or `#[decycle] use stand::X as Real;`) and keep the real
+trait in scope. [announce-std](https://docs.rs/announce-std) provides such copies for the traits of
+`std`, and they work with `#[decycle] use` as they are.
 
 ## Contributing
 

@@ -1,4 +1,4 @@
-// `HashMap`/`VisitMut` are used by the `GenericRenamer` cluster below, reached via `process_trait`.
+// `HashMap`/`VisitMut` are used by the `GenericRenamer` cluster below, reached via `carried`.
 use std::collections::HashMap;
 use syn::visit_mut::VisitMut;
 use syn::*;
@@ -16,7 +16,7 @@ pub(crate) use ranked::helper;
 #[doc(hidden)]
 pub use ranked::process_module;
 #[doc(hidden)]
-pub use ranked::process_trait;
+pub use ranked::check_trait;
 
 // ===== Structural unroll (`#[decycle(structural)]`) =====
 pub mod structural;
@@ -35,7 +35,6 @@ pub(crate) const NO_DECYCLE_TRAITS_MSG: &str =
 
 pub use proc_macro_error;
 pub use safegraph;
-pub use type_leak;
 
 #[derive(Clone)]
 struct GenericRenamer {
@@ -146,12 +145,11 @@ fn names_decycle_attribute(attr: &Attribute, decycle_crate: &Ident) -> bool {
 /// module) — and reject any argument list it carries.
 ///
 /// The inner marker is a marker, nothing more: every knob is read from the attribute on the
-/// enclosing `mod` (`structural`, `recurse_level`, `support_infinite_cycle`) or belongs to a
-/// `#[decycle]` trait declared OUTSIDE such a module (`marker`, `mock`,
-/// `allowed_paths`). Arguments written here used to be dropped on the floor, silently — including
-/// the ones that are hard errors at the top level. The worst of them was `#[decycle(structural)]`
-/// written on the inner trait instead of on the module: the user asked for the structural engine,
-/// got no diagnostic, and was quietly given the ranked one.
+/// enclosing `mod` (`structural`, `recurse_level`, `support_infinite_cycle`). Arguments written
+/// here used to be dropped on the floor, silently — including the ones that are hard errors at the
+/// top level. The worst of them was `#[decycle(structural)]` written on the inner trait instead of
+/// on the module: the user asked for the structural engine, got no diagnostic, and was quietly
+/// given the ranked one.
 ///
 /// The rejection lives HERE, at the predicate, so it covers every consumer: both engines' marker
 /// scans (`ranked::process_module`, `structural::collect_decycle_traits`) and the nested-module
@@ -175,7 +173,7 @@ fn reject_inner_decycle_args(args: proc_macro2::Span) -> ! {
     proc_macro_error::abort!(
         args,
         "#[decycle] takes no arguments on an item inside a #[decycle] module";
-        hint = "engine options (`structural`, `recurse_level`, `support_infinite_cycle`) belong on the enclosing `#[decycle] mod`; trait options (`marker`, `mock`, `allowed_paths`) apply only to a `#[decycle]` trait declared outside such a module"
+        hint = "engine options (`structural`, `recurse_level`, `support_infinite_cycle`) belong on the enclosing `#[decycle] mod`"
     )
 }
 

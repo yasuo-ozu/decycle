@@ -1,0 +1,10 @@
+error: `#[decycle]` on a trait outside a `#[decycle] mod` was removed in 0.6
+
+         = help: announce the trait instead: `#[::decycle::announce::announce(crate = ::decycle::announce)]` (add `mock = path` for a stand-in, `::decycle::check` to validate it at its definition); `#[decycle] use` brings it into a `#[decycle] mod` as before
+
+ --> tests/ui/trait_decycle_removed.rs:4:1
+  |
+4 | #[decycle::decycle]
+  | ^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `decycle::decycle` (in Nightly builds, run with -Z macro-backtrace for more info)

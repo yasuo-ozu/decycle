@@ -1,0 +1,8 @@
+error: decycle: return-position `impl Trait` in method `ca` of #[decycle] trait `Ca` is not supported
+
+         = help: declare an associated type on the trait and return it instead (e.g. `type Output; fn m(&self) -> Self::Output`)
+
+ --> tests/ui/check_impl_trait_return.rs:5:28
+  |
+5 |     fn ca(&self, n: usize) -> impl ::core::iter::Iterator<Item = u8>;
+  |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

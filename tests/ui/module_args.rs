@@ -1,7 +1,6 @@
-//! F5: `allowed_paths` configures the `type-leak` allowlist for a trait defined OUTSIDE a
-//! `#[decycle]` module (a TRAIT-only argument, same family as `marker`); writing it on a
-//! `#[decycle]` MODULE used to be silently ignored instead of rejected like its siblings
-//! `marker`/`mock` — now a clean `abort!`, matching them.
+//! `allowed_paths` was an option of the trait-side `#[decycle]` (the type-leak allowlist), which was
+//! removed in 0.6 together with `marker` and `mock`. Written on a `#[decycle]` MODULE it is rejected
+//! with the same message; the module is still processed first, so this stays a single error.
 #[decycle::decycle(allowed_paths = [::core::primitive::u32])]
 mod m {
     #[decycle]

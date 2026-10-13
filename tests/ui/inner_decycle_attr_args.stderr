@@ -1,16 +1,16 @@
 error: #[decycle] takes no arguments on an item inside a #[decycle] module
 
-         = help: engine options (`structural`, `recurse_level`, `support_infinite_cycle`) belong on the enclosing `#[decycle] mod`; trait options (`marker`, `mock`, `allowed_paths`) apply only to a `#[decycle]` trait declared outside such a module
+         = help: engine options (`structural`, `recurse_level`, `support_infinite_cycle`) belong on the enclosing `#[decycle] mod`
 
   --> tests/ui/inner_decycle_attr_args.rs:12:15
    |
-12 |     #[decycle(structural, recurse_level = 0, marker = Nonexistent, bogus_keyword)]
+12 |     #[decycle(structural, recurse_level = 0, decycle = ::nope, bogus_keyword)]
    |               ^^^^^^^^^^
 
 error: cannot find attribute `decycle` in this scope
   --> tests/ui/inner_decycle_attr_args.rs:12:7
    |
-12 |     #[decycle(structural, recurse_level = 0, marker = Nonexistent, bogus_keyword)]
+12 |     #[decycle(structural, recurse_level = 0, decycle = ::nope, bogus_keyword)]
    |       ^^^^^^^
    |
    = note: `decycle` is in scope, but it is a crate, not an attribute

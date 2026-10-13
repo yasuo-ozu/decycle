@@ -1,19 +1,18 @@
-//! Two `#[decycle]` traits that are token-identical but declared in different modules.
+//! Two announced traits that are token-identical but declared in different modules.
 //!
-//! The temporal carrier macro is `#[macro_export]`ed, which hoists its name to the crate root, so
-//! that name must be unique per invocation. Its discriminant used to be a hash of the trait's own
-//! TOKENS — which cannot separate the one case it exists for, since identical traits hash
-//! identically:
+//! The trampoline macro of a `pub` announced trait is `#[macro_export]`ed, which hoists its name to
+//! the crate root, so that name must be unique per invocation. A name derived from the trait's own
+//! TOKENS cannot separate the one case it exists for, since identical traits hash identically:
 //!
 //! ```text
-//! error[E0428]: the name `__Render_temporal_<crate>_<tokens>` is defined multiple times
+//! error[E0428]: the name `__announce_Render_<tokens>` is defined multiple times
 //! ```
 //!
-//! Realistic for small traits. Each invocation now gets a fresh discriminant.
+//! Realistic for small traits. announce gives each invocation its own random name.
 #![allow(dead_code)]
 
 mod a {
-    #[decycle::decycle]
+    #[decycle::announce::announce(crate = ::decycle::announce)]
     pub trait Render {
         fn render(&self) -> usize;
     }
@@ -21,7 +20,7 @@ mod a {
 
 mod b {
     // Byte-for-byte identical to `a::Render`.
-    #[decycle::decycle]
+    #[decycle::announce::announce(crate = ::decycle::announce)]
     pub trait Render {
         fn render(&self) -> usize;
     }
@@ -31,7 +30,7 @@ mod b {
 // per-module-depth.
 mod outer {
     pub mod inner {
-        #[decycle::decycle]
+        #[decycle::announce::announce(crate = ::decycle::announce)]
         pub trait Render {
             fn render(&self) -> usize;
         }

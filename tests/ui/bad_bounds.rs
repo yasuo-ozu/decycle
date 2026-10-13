@@ -1,7 +1,7 @@
 use decycle::decycle;
 
 #[allow(dead_code)]
-#[decycle]
+#[decycle::announce::announce(crate = ::decycle::announce)]
 pub trait MyTrait<'a> {
     type MyTrait;
     type T;

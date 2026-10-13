@@ -7,44 +7,64 @@ Notable changes, following [Keep a Changelog](https://keepachangelog.com/) and
 
 ### Changed
 
-- **`#[decycle]` traits are carried to `#[decycle] use` sites by an
-  [announce](https://docs.rs/announce) trampoline** instead of decycle's own `macro_rules!`
-  carrier. `#[decycle] trait T` emits the trait as written plus
-  `#[announce(emit_item = false, ..)] <vis> mod T { <rewritten trait> }` (announce's module-wrapper
-  form: decycle's interning, `marker` and `allowed_paths` keep handling paths, announce only
-  transports the copy). The generated hidden names changed (`__announce_T_<rand>`). decycle depends
-  on `announce = "0.1"`, behind the new default feature `announce`.
-- **New default feature `announce`.** announce cannot be built for a core-only target (it depends
-  on `proc-macro2`/`syn`), so `default-features = false` no longer provides a `#[decycle] trait`
-  outside a `#[decycle] mod`: that is a compile error naming the feature (turn `announce` on for a
-  `std` build). Everything inside a `#[decycle]` module, and `#[decycle] use`, are unaffected.
+- **Breaking: `#[decycle]` on a trait outside a `#[decycle] mod` is removed.** A trait defined
+  anywhere else is announced with [`#[announce]`](https://docs.rs/announce) instead, which decycle
+  re-exports as `decycle::announce`, and brought into a module with `#[decycle] use` as before:
+  `#[decycle::announce::announce(crate = ::decycle::announce)] pub trait T { .. }`. Writing
+  `#[decycle]` on such a trait is a compile error that points to `#[announce]`. The trait is carried
+  by announce's own trampoline, as written; the module-side machinery (`#[decycle] mod`,
+  `#[decycle] use`, a trait written inside a module) is unchanged. Options of the removed form:
+
+  | was | now |
+  | --- | --- |
+  | `#[decycle]` | `#[announce(crate = ::decycle::announce)]` |
+  | `mock = path` (unreleased 0.6 form) | `#[announce(.., mock = path)]` |
+  | `alter_macro_name = N` | `#[announce(.., macro_name = N)]`, or `mock = path` |
+  | `decycle = path` | none (pass `crate = ::renamed::announce` if you renamed the dependency) |
+  | `marker = path` | none: write the trait's paths absolutely (`crate::..`, `::krate::..`) |
+  | `allowed_paths = [..]` | none: `allow_std_prelude = true` accepts the bare std prelude names |
+
+  Writing one of these options is an error that names its replacement.
+- **`type-leak` is no longer a dependency** of `decycle`, `decycle-macro` or `decycle-impl` (it
+  remains in the graph only as a dependency of `announce`). The relative-type interning it did for
+  `#[decycle] trait` (`marker`, `allowed_paths`, the hidden `Repeater` trait) is gone with that form:
+  `#[announce]` checks at the definition that every path in the trait resolves in other crates, and
+  reports a relative one (`Local`, `super::X`, `std::vec::Vec<u8>`) as an error naming it. A trait
+  that used `marker` to carry a relative type spells it absolutely now (`crate::Local`); bare std
+  prelude names (`Clone`, `Vec<u8>`, `Option<T>`) need `allow_std_prelude = true`. announce's own
+  `repeater` option is not supported by `#[decycle] use`, which rejects such a trait with an error.
+- Removed from the public surface: `decycle::type_leak`, `decycle_impl::type_leak`,
+  `decycle_impl::process_trait` (nothing remains for it to do) and the hidden
+  `decycle::Repeater`.
+- **New default feature `announce`.** It gates the `decycle::announce` re-export. announce cannot be
+  built for a core-only target (it depends on `proc-macro2`/`syn`), so `default-features = false`
+  leaves it out; everything else (`#[decycle] mod`, `#[decycle] use`, `decycle::check`) needs no
+  feature.
 - The trampoline's wire format changed: `FinalizeArgs` now parses an announce input
   `[list] ENTRY* REST`, and its `ToTokens` writes `[list] REST`; `FinalizeArgs::cont_list` and
   `FinalizeArgs::rest_tokens` are new. Traits defined with decycle 0.5 cannot be used from 0.6 and
   vice versa (as before, definer and user must run the same decycle version).
-- **Breaking: `alter_macro_name = N` is removed**, replaced by `mock = path::to::RealTrait`
-  (writing `alter_macro_name` is now an error saying so). `#[decycle(mock = path)] <vis> trait
-  Stand { .. }` declares `Stand` a stand-in for the real trait at `path`: `Stand` is not emitted as
-  a trait, only its trampoline `Stand!` at the item's path and visibility; the copy is announced
-  with announce's `mock = path` (type-checked in a hidden module, `mock(path)` in the entry META).
-  `#[decycle] use` sites treat such an entry as the real trait: its ident becomes `path`'s last
-  segment (so `impl RealTrait for X` is matched) and the re-entry machinery names it by `path`.
-- `decycle_impl::process_trait`'s `alter_macro_name: Option<&Ident>` parameter is now
-  `mock: Option<&Path>`.
 
 ### Added
 
-- A plain `#[announce]` trait (without `#[decycle]`) can be brought in with `#[decycle] use`,
-  including an `#[announce(mock = ..)]` copy such as `announce_std::fmt::Display` (treated as the
-  real trait).
+- `decycle::announce`, the re-export of the announce crate (feature `announce`), and
+  `decycle::check` (`decycle_impl::check_trait` for the programmatic API): list it among the options
+  of `#[announce]` to validate a trait at its definition. It rejects a default on a generic parameter
+  and a return-position `impl Trait` in a method, the two rules that depend on the trait alone, with
+  the error a `#[decycle]` module would give when it receives the trait.
+- A plain `#[announce]` trait can be brought in with `#[decycle] use`, including an
+  `#[announce(mock = ..)]` copy such as `announce_std::fmt::Display` (treated as the real trait).
+  `#[announce(mock = path)]` declares a stand-in for the real trait at `path`: only its trampoline
+  `Stand!` is emitted, at the item's path and visibility, and `#[decycle] use` sites treat the entry
+  as the real trait (its ident becomes `path`'s last segment, so `impl RealTrait for X` is matched).
 - `#[decycle] use` of an announced item that is not a trait is a clear error
   (`#[decycle] use: 'X!' is not a trait`).
 
 ### Fixed
 
-- Nested `#[cfg]`s in a foreign `#[decycle]` trait are evaluated in the defining crate, so a
+- Nested `#[cfg]`s in a foreign announced trait are evaluated in the defining crate, so a
   cfg'd-out method no longer reaches the `#[decycle] use` site (`E0576` before).
-- `$crate` and `$(..)*` macros in default method bodies of a foreign `#[decycle]` trait work.
+- `$crate` and `$(..)*` macros in default method bodies of a foreign announced trait work.
 
 ## [0.5.3] — 2026-09-27
 

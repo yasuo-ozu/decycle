@@ -1,8 +1,7 @@
-//! `#[decycle(mock = path)] trait Stand` declares a stand-in for the real trait at `path`: only
+//! `#[announce(mock = path)] trait Stand` declares a stand-in for the real trait at `path`: only
 //! the trampoline is emitted (at the stand-in's path); `#[decycle] use` sites receive the copy as
 //! the real trait, so the module's impls implement the REAL trait and their cycles are resolved
-//! as for any `#[decycle]` trait. Plain `#[announce(mock = path)]` copies (announce-std) work the
-//! same way.
+//! as for any `#[decycle]` trait. announce-std's copies of the std traits work the same way.
 
 // A stand-in named like its real trait (another crate's).
 #[decycle::decycle]
@@ -113,7 +112,7 @@ mod local {
         fn count(&self, depth: usize) -> usize;
     }
     pub mod stand {
-        #[decycle::decycle(mock = crate::local::Count)]
+        #[decycle::announce::announce(crate = ::decycle::announce, mock = crate::local::Count)]
         pub trait Count {
             fn count(&self, depth: usize) -> usize;
         }

@@ -566,17 +566,7 @@ fn process_module_inner(
     // (E0562), and the structural layout cast can't reinterpret an opaque return type. An associated
     // type is the portable escape hatch — it names the return type, so both engines can carry it.
     for t in &traits {
-        for item in &t.items {
-            if let TraitItem::Fn(tf) = item {
-                if crate::finalize::sig_has_impl_trait_output(&tf.sig) {
-                    abort!(
-                        &tf.sig.output,
-                        "decycle: return-position `impl Trait` in method `{}` of #[decycle] trait `{}` is not supported", tf.sig.ident, t.ident;
-                        help = "declare an associated type on the trait and return it instead (e.g. `type Output; fn m(&self) -> Self::Output`)"
-                    );
-                }
-            }
-        }
+        crate::finalize::check_no_impl_trait_output_in(t);
     }
     // `async fn` in a `#[decycle]` trait method is unsupported by the ranked engine (its return is an
     // opaque `impl Future`, which the rank rewrite can't thread through — the raw symptom is a

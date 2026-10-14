@@ -1,4 +1,4 @@
-// `HashMap`/`VisitMut` are used by the `GenericRenamer` cluster below, reached via `carried`.
+// `HashMap`/`VisitMut` are used by the `GenericRenamer` cluster below, reached via `ranked::finalize`.
 use std::collections::HashMap;
 use syn::visit_mut::VisitMut;
 use syn::*;

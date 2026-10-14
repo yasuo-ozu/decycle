@@ -3,7 +3,7 @@
 Notable changes, following [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
-## [0.6.0] — Unreleased
+## [0.6.0] — 2026-10-15
 
 ### Changed
 

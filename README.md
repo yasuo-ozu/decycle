@@ -578,31 +578,10 @@ The options of 0.5's `#[decycle]` on a trait map to:
 | 0.5 `#[decycle(..)]` on a trait | now |
 | --- | --- |
 | `#[decycle]` | `#[decycle]` (expands to `#[announce(crate = ::decycle::announce)]`) |
-| `alter_macro_name = N` | `#[announce(.., macro_name = N)]`, or `mock = path`; a module then writes both `use super::d::Walk;` and `#[decycle] use super::d::WalkMac;` (below) |
+| `alter_macro_name = N` | none: `#[decycle] use` the trait by its own name |
 | `decycle = path` | unchanged: the trait is announced with `crate = path::announce` |
 | `marker = path` | none: write the paths of the trait absolutely (`crate::..`, `::krate::..`); announce reports the ones that do not resolve |
 | (new) | `decycle::check` (`decycle::check(structural)`): validate the trait at its definition |
-
-A trait announced with `macro_name = N` has a trampoline `N!` that is not named like the trait (so
-that a derive or attribute macro can keep the trait's name). The module's `impl Trait for ..` is
-matched to the trait by name, and the trait is brought in by a plain `use`, beside the
-`#[decycle] use` of its trampoline (the two live in different namespaces):
-
-```text
-use super::d::Walk;                  // the trait
-#[decycle] use super::d::WalkMac;    // its trampoline
-```
-
-A `#[decycle] use` without an `as` does not say which trait it carries, so decycle asks the
-trampoline (`Walk`) when the module has an `impl` of a trait that no `#[decycle]` item names but a
-plain `use` does. That is one more trampoline call at the expansion of such a module, and no other
-module pays it. The plain `use` must be written in the module itself; a glob import (`use super::*;`)
-is not looked at.
-
-Do not write `#[decycle] use super::d::WalkMac as Walk;` when a derive or attribute macro named
-`Walk` shares the path: `use super::d::Walk;` imports the trait **and** that macro, and a `use`
-cannot import only one of the namespaces of a name, so `as Walk` would define `Walk` twice in the
-macro namespace (E0252). The `as` form is for a trampoline whose name is free to take.
 
 ### Stand-ins for traits you do not own
 
@@ -610,9 +589,10 @@ macro namespace (E0252). The `as` form is for a trampoline whose name is free to
 `path` (e.g. one you do not own). Only its trampoline macro is emitted, at the stand-in's path;
 `#[decycle] use` sites treat the carried copy as the real trait, so their impls implement `path`.
 Name the stand-in like the real trait, or `#[decycle] use stand::X as Real;` when its name differs
-(a stand-in `use`d under another name without the `as` is an error, in both engines). A stand-in
-written by hand imports nothing but its trampoline, so the module also `use`s the real trait under
-that name. [announce-std](https://docs.rs/announce-std) provides such copies for the traits of `std`,
+(the ranked engine rejects a stand-in `use`d under another name without the `as`; the structural
+engine reads no trait through a `use`, so it cannot tell, and the module fails with an unrelated
+`E0275`). A stand-in written by hand imports nothing but its trampoline, so the module also `use`s
+the real trait under that name. [announce-std](https://docs.rs/announce-std) provides such copies for the traits of `std`,
 and they work with `#[decycle] use` as they are: `announce_std::fmt::Display` is the real trait in
 the type namespace as well as the trampoline, so `#[decycle] use announce_std::fmt::Display;` is all
 a module writes, and `use core::fmt::Display;` beside it is an error (`Display` defined twice).

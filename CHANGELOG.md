@@ -10,7 +10,7 @@ Notable changes, following [Keep a Changelog](https://keepachangelog.com/) and
 - **Breaking: `#[decycle]` on a trait outside a `#[decycle] mod` now just announces it.** It
   expands to [`#[announce]`](https://docs.rs/announce) (re-exported as `decycle::announce`):
   `#[decycle::announce::announce(crate = ::decycle::announce)]`, or `crate = PATH::announce` with
-  `decycle = PATH`. Write `#[announce]` directly for its options (`mock`, `macro_name`,
+  `decycle = PATH`. Write `#[announce]` directly for its options (`mock`,
   `allow_std_prelude`, checks). The trait is carried by announce's own trampoline, as written, and
   brought into a module with `#[decycle] use` as before; the module-side machinery is unchanged. The
   other options of the old form are errors:
@@ -18,7 +18,7 @@ Notable changes, following [Keep a Changelog](https://keepachangelog.com/) and
   | was | now |
   | --- | --- |
   | `#[decycle]` | `#[decycle]` (expands to `#[announce(crate = ::decycle::announce)]`) |
-  | `alter_macro_name = N` | `#[announce(.., macro_name = N)]`, or `mock = path`; a module then writes both `use super::d::Walk;` (the trait) and `#[decycle] use super::d::WalkMac;` (its trampoline; the two live in different namespaces) |
+  | `alter_macro_name = N` | none: `#[decycle] use` the trait by its own name |
   | `decycle = path` | unchanged: the trait is announced with `crate = path::announce` |
   | `marker = path` | none: write the trait's paths absolutely (`crate::..`, `::krate::..`) |
   
@@ -53,24 +53,15 @@ Notable changes, following [Keep a Changelog](https://keepachangelog.com/) and
   `NodeIxRef`/`EdgeIxRef` handles (`ctx.node_indices()`, `ctx.edge_indices()`), turned into the
   copyable `NodeIx`/`EdgeIx` with `.to_ix()`, and `ctx.endpoints(e)` is an iterator rather than an
   array.
-- **A trampoline named differently from its trait: `#[decycle] use path::N;`.** The module's
-  `impl Tr for ..` is matched to the trait by name. A trait announced with `macro_name = N` is
-  brought in by `use path::Tr;` (the trait) and `#[decycle] use path::N;` (its trampoline). decycle
-  asks the trampoline which trait it carries, and the module spells the trait by its own name, which
-  the plain `use` supplies; the question is one more trampoline call, made only for a module that has
-  an `impl` of a trait that nothing marked `#[decycle]` names but a plain `use`. The earlier recipe,
-  `#[decycle] use path::N as Tr;`, still works, but not when a derive or attribute macro named `Tr`
-  shares the path: `use path::Tr;` imports it too, and `as Tr` defines `Tr` twice in the macro
-  namespace (E0252). A trampoline that is reached under another name only because it is re-exported
-  (`pub use d::Tr as Step;`) works the same way.
 - **A stand-in named differently from the trait it stands in for has to be renamed**
   (`mock = path` with a name of its own: `#[decycle] use stand::Sz as Size;`). A stand-in is not the
   trait, so left unrenamed the impls would not be matched to it and the module would fail with an
-  unrelated `E0275`; it is an error that names the `as` to write, in both engines. The alias is the
-  name the impls spell, so a stand-in `use`d `as` a third name
+  unrelated `E0275`; the ranked engine reports an error that names the `as` to write. (The structural
+  engine reads no trait through a `#[decycle] use`, so it cannot tell, and still fails with the
+  `E0275`.) The alias is the name the impls spell, so a stand-in `use`d `as` a third name
   (`use real::Size as Cnt; #[decycle] use stand::Sz as Cnt;`) works too. Under
   `#[decycle(structural)]`, which reads no trait through a `#[decycle] use`, the `use` is exempt from
-  `unused_imports`, so such a renamed trampoline does not fail `#![deny(warnings)]`.
+  `unused_imports`, so such a renamed stand-in does not fail `#![deny(warnings)]`.
 
 ### Added
 

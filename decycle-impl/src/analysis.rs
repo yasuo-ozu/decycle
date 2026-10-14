@@ -88,11 +88,7 @@ pub enum EdgeKind {
 ///   expansion it is meant to reproduce (a graph over idents cannot spell a foreign path anyway);
 /// - a glob `#[decycle] use path::*;` routes no trait, because a glob names none. A module whose
 ///   only marker is a glob therefore yields the empty graph — the ranked engine rejects that module
-///   outright ("glob is not supported in #[decycle] use"), so there is no expansion to describe;
-/// - a `#[decycle] use path::N;` (no `as`) whose trampoline `N` is not named like the trait it
-///   carries (`#[announce(macro_name = N)]`) routes `N`, not the trait: the attribute learns the
-///   trait's name from the trampoline, which a function that only reads the module cannot. Write
-///   `#[decycle] use path::N as Trait;` for the graph to see it.
+///   outright ("glob is not supported in #[decycle] use"), so there is no expansion to describe.
 pub fn analyze_module(module: &ItemMod, decycle: &Path) -> VecGraph<Ident, EdgeKind> {
     let Some((_, items)) = module.content.as_ref() else {
         return VecGraph::default();

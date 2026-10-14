@@ -24,10 +24,6 @@ pub mod structural;
 #[doc(hidden)]
 pub use structural::process_module as process_module_structural;
 
-// Learning what a module's `#[decycle] use` items carry before expanding it; for `decycle-macro`.
-#[doc(hidden)]
-pub mod discover;
-
 // Rendering `syn::Generics` to token form, shared by both engines.
 mod generics_fmt;
 mod growth;

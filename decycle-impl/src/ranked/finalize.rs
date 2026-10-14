@@ -3787,14 +3787,6 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                 out.push(original.clone());
             }
         }
-        // The name a carried trait's trampoline was reached under is shadowed likewise: its `use`
-        // may import the trait under that name too (`pub use d::Tr as Step;` imports `Step` as the
-        // trait as well as the trampoline), which would make the trait applicable through it.
-        for via in traits.iter().filter_map(crate::ranked::carried::carried_via) {
-            if seen.insert(via.to_string()) {
-                out.push(via);
-            }
-        }
         out
     };
 

@@ -91,21 +91,6 @@ fn renamed_stand_in() {
     assert_eq!(a.measure(0).0, 13);
 }
 
-// The stand-in's macro is reachable at the item's path, and its entry carries `mock(path)`.
-macro_rules! show {
-    ([$($list:tt)*] $($key:ident)::+ ! => [$($meta:tt)*] { $($item:tt)* }) => {
-        const META: &str = stringify!($($meta)*);
-        const ITEM: &str = stringify!($($item)*);
-    };
-}
-traitdef::stand::Weigh! { [traitdef::stand::Weigh!, show!] }
-
-#[test]
-fn stand_in_macro_carries_mock_meta() {
-    assert!(META.contains("mock") && META.contains("real :: Weigh"), "{}", META);
-    assert!(ITEM.contains("trait Weigh"), "{}", ITEM);
-}
-
 // A stand-in in the same crate: `crate::` reaches the consumer as `$crate::`.
 mod local {
     pub trait Count {

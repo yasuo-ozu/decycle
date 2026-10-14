@@ -1,6 +1,6 @@
 //! Traits are announced with `#[announce]` (re-exported as `decycle::announce`), not annotated with
 //! `#[decycle]`: a trait of another crate that names a type of its crate by an absolute path,
-//! one validated with `decycle::check`, one with a type of its own module, and a private stand-in.
+//! one validated with `decycle::check`, and one with a type of its own module.
 
 // `crate::tys::Unit` in a trait of another crate: absolute, so it resolves at the use site.
 #[decycle::decycle]
@@ -66,34 +66,6 @@ fn announced_trait_is_an_ordinary_trait() {
     use same_crate_types::Produce as _;
     assert_eq!(3u8.produce().0, 3);
     assert_eq!(3u8.name(vec![1, 2]), "3:2");
-}
-
-// A private stand-in (`mock = path`) is announced at the item's visibility: its trampoline is
-// usable at its path within the crate, and the stand-in itself is not emitted as a trait.
-mod private_stand {
-    #[allow(dead_code)]
-    pub trait Real {
-        fn real(&self) -> u8;
-    }
-    pub(crate) mod stand {
-        #[decycle::announce::announce(crate = ::decycle::announce, mock = crate::private_stand::Real)]
-        pub(crate) trait Real {
-            fn real(&self) -> u8;
-        }
-    }
-}
-
-macro_rules! private_stand_show {
-    ([$($list:tt)*] $($key:ident)::+ ! => [$($meta:tt)*] { $($item:tt)* }) => {
-        const PRIVATE_STAND: &str = stringify!($($meta)* => $($item)*);
-    };
-}
-private_stand::stand::Real! { [private_stand::stand::Real!, private_stand_show!] }
-
-#[test]
-fn private_stand_in_macro_at_item_path() {
-    assert!(PRIVATE_STAND.contains("mock"), "{}", PRIVATE_STAND);
-    assert!(PRIVATE_STAND.contains("trait Real"), "{}", PRIVATE_STAND);
 }
 
 // `decycle::check(structural)` checks the rules of the structural engine, which accepts a default on

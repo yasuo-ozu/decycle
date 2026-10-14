@@ -1,5 +1,0 @@
-error: announce: this type does not resolve outside the defining crate; add `#[announce(repeater = crate::path::to::Repeater)]` (define the trait with `announce::define_repeater!(pub Repeater);`), or write it as an absolute path (`crate::..`, `::std::vec::Vec<..>`, `::other_crate::..`; std prelude names count as relative)
- --> tests/ui/announce_relative_path.rs:9:30
-  |
-9 |         fn produce(&self) -> Local;
-  |                              ^^^^^

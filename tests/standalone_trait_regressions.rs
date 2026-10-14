@@ -6,8 +6,8 @@
 ///
 /// announce accepts the bare std prelude names (`Clone`, `Vec<u8>`, `Option<usize>`, ..) only with
 /// `allow_std_prelude = true`; without it a bare `Vec<u8>` is a path relative to the defining
-/// module and is rejected at the definition (see `tests/ui/announce_relative_path.rs`). Traits
-/// with arguments (`Into<usize>`) are spelled absolutely, as announce requires of every trait path.
+/// module and is rejected at the definition. Traits with arguments (`Into<usize>`) are spelled
+/// absolutely, as announce requires of every trait path.
 mod prelude_bounds {
     #[decycle::announce::announce(
         crate = ::decycle::announce,
@@ -71,8 +71,8 @@ mod prelude_bounds {
 ///
 /// The trait is re-quoted into whatever module routes it, where a name relative to its definition
 /// does not exist (`error[E0412]: cannot find type MyTy in this scope`). announce rejects such a
-/// name at the definition (`tests/ui/announce_relative_path.rs`); `crate::absolute_types::MyTy`
-/// names the same type from anywhere in the crate, and `$crate::..` from any crate.
+/// name at the definition; `crate::absolute_types::MyTy` names the same type from anywhere in the
+/// crate, and `$crate::..` from any crate.
 mod absolute_types {
     pub struct MyTy(pub usize);
 

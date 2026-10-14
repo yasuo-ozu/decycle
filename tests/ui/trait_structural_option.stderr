@@ -1,0 +1,10 @@
+error: `structural` applies to a `#[decycle]` module, not a trait
+
+         = help: write it on the enclosing `#[decycle] mod`
+
+ --> tests/ui/trait_structural_option.rs:3:1
+  |
+3 | #[decycle::decycle(structural)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `decycle::decycle` (in Nightly builds, run with -Z macro-backtrace for more info)

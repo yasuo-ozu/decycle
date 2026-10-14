@@ -161,11 +161,13 @@ fn trampoline_renamed_with_macro_name() {
     assert_eq!(a.walk(0), 12);
 }
 
-// `#[decycle]` on a trait outside a module announces it, as `#[announce]` would.
+// `#[decycle]` on a trait outside a module announces it, as `#[announce]` would. The std prelude
+// names in its signature (`String`, `Option`) are accepted, as they were before it announced.
 mod decycle_on_trait {
     #[decycle::decycle]
     pub trait Count {
         fn count(&self) -> usize;
+        fn tagged(&self, tag: String) -> Option<usize>;
     }
 }
 
@@ -184,6 +186,10 @@ mod uses_decycle_trait {
         fn count(&self) -> usize {
             self.0.as_ref().map_or(0, |b| b.count() + 1)
         }
+
+        fn tagged(&self, tag: String) -> Option<usize> {
+            self.0.as_ref().map(|b| b.count() + tag.len())
+        }
     }
 
     impl Count for B
@@ -192,6 +198,10 @@ mod uses_decycle_trait {
     {
         fn count(&self) -> usize {
             self.0.as_ref().map_or(0, |a| a.count() + 1)
+        }
+
+        fn tagged(&self, tag: String) -> Option<usize> {
+            self.0.as_ref().map(|a| a.count() + tag.len())
         }
     }
 }
@@ -202,4 +212,6 @@ fn decycle_on_a_trait_announces_it() {
     use uses_decycle_trait::{A, B};
     let a = A(Some(Box::new(B(Some(Box::new(A(None)))))));
     assert_eq!(a.count(), 2);
+    assert_eq!(a.tagged("ab".to_string()), Some(3));
+    assert_eq!(A(None).tagged("ab".to_string()), None);
 }

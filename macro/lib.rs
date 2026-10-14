@@ -149,14 +149,50 @@ fn pending_decycle_attr(attrs: &[Attribute], decycle_path: &Path) -> Option<proc
     })
 }
 
+/// Is `attr` a `#[decycle]` marker, in either spelling: bare, or two-segment `<x>::decycle`? The
+/// args are not known where this is used, so `<x>` is not tied to one crate name.
+fn names_decycle(attr: &Attribute) -> bool {
+    let path = attr.path();
+    path.is_ident("decycle") || (path.segments.len() == 2 && path.segments[1].ident == "decycle")
+}
+
+/// Drop the `#[decycle]` markers from the direct items of `module`, for the dummy set before the
+/// arguments are parsed.
+///
+/// Without it, an abort while parsing the arguments leaves the markers in the dummy, where each
+/// one adds a "cannot find attribute `decycle`" error to the one the user needs to see.
+fn strip_inner_decycle_attrs(module: &mut ItemMod) {
+    if let Some((_, items)) = module.content.as_mut() {
+        for item in items {
+            let attrs = match item {
+                Item::Trait(ItemTrait { attrs, .. })
+                | Item::TraitAlias(ItemTraitAlias { attrs, .. })
+                | Item::Use(ItemUse { attrs, .. })
+                | Item::Mod(ItemMod { attrs, .. }) => attrs,
+                _ => continue,
+            };
+            attrs.retain(|attr| !names_decycle(attr));
+        }
+    }
+}
+
 #[proc_macro_error]
 #[proc_macro_attribute]
 pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
-    set_dummy(input.clone().into());
+    let module = parse::<ItemMod>(input.clone()).ok();
+    set_dummy(match &module {
+        Some(module) if !module.attrs.iter().any(names_decycle) => {
+            let mut module = module.clone();
+            strip_inner_decycle_attrs(&mut module);
+            quote!(#module)
+        }
+        // Applied twice: the remaining outer `#[decycle]` expands the module with its markers.
+        _ => input.clone().into(),
+    });
     let args = parse_macro_input!(attr as Args);
     let decycle_path = args.decycle.clone().unwrap_or_else(|| parse_quote!(::decycle));
 
-    if let Ok(module) = parse::<ItemMod>(input.clone()) {
+    if let Some(module) = module {
         // Applied twice? Abort here, where it can still be said plainly. The dummy is the raw
         // input, whose remaining `#[decycle]` will expand the original module cleanly — so this
         // stays a single error.
@@ -203,12 +239,35 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
         set_dummy(quote!(#ret));
         reject_duplicate(&args);
         ret.into()
-    } else if parse::<ItemTrait>(input.clone()).is_ok() {
+    } else if let Ok(item_trait) = parse::<ItemTrait>(input.clone()) {
+        // The dummy is the raw trait here, so each abort below stays a single error.
+        if let Some(span) = pending_decycle_attr(&item_trait.attrs, &decycle_path) {
+            abort!(span, "#[decycle] is already applied to this trait")
+        }
+        // The engine options belong to the module; on a trait they would be dropped silently.
+        let module_only = if args.structural {
+            Some("structural")
+        } else if args.recurse_level.is_some() {
+            Some("recurse_level")
+        } else if args.support_infinite_cycle.is_some() {
+            Some("support_infinite_cycle")
+        } else {
+            None
+        };
+        if let Some(name) = module_only {
+            abort!(
+                Span::call_site(),
+                "`{}` applies to a `#[decycle]` module, not a trait", name;
+                help = "write it on the enclosing `#[decycle] mod`"
+            )
+        }
+        reject_duplicate(&args);
         // A trait outside a `#[decycle] mod` is announced, so that a `#[decycle] use` (in this crate
-        // or another) can carry it into a module.
+        // or another) can carry it into a module. The std prelude names (`Option`, `String`,
+        // `Clone`, ..) stay accepted, as they were before the trait was announced.
         let item = proc_macro2::TokenStream::from(input);
         quote! {
-            #[#decycle_path::announce::announce(crate = #decycle_path::announce)]
+            #[#decycle_path::announce::announce(crate = #decycle_path::announce, allow_std_prelude = true)]
             #item
         }
         .into()

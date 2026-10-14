@@ -9,14 +9,6 @@ error: recurse_level must be at least 1
   |
   = note: this error originates in the attribute macro `decycle::decycle` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error: cannot find attribute `decycle` in this scope
- --> tests/ui/recurse_level_zero.rs:5:7
-  |
-5 |     #[decycle]
-  |       ^^^^^^^
-  |
-  = note: `decycle` is in scope, but it is a crate, not an attribute
-
 error[E0275]: overflow evaluating the requirement `X: A`
   --> tests/ui/recurse_level_zero.rs:12:9
    |

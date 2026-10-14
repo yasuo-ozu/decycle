@@ -520,8 +520,9 @@ resolve in one pass.
   - `decycle`: override the path used to refer to this crate
 - **Trait** (outside a module):
   - `#[decycle::decycle(decycle = path)]`: announces the trait with [`#[announce]`](https://docs.rs/announce)
-    (`#[announce(crate = path::announce)]`), so that `#[decycle] use` can bring it into a module from
-    any crate. Paths in the trait must be absolute (`crate::..`, `::krate::..`). For announce's own
+    (`#[announce(crate = path::announce, allow_std_prelude = true)]`), so that `#[decycle] use` can
+    bring it into a module from any crate. Paths in the trait must be absolute (`crate::..`,
+    `::krate::..`), except std prelude names (`Vec`, `Option`, `Clone`). For announce's own
     options, write `#[decycle::announce::announce(crate = ::decycle::announce, ..)]` instead.
   - `decycle::check` (optional, on `#[announce]`): rejects at the definition what a module cannot
     receive (`async fn`, return-position `impl Trait`, defaulted generics); `decycle::check(structural)`

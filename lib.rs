@@ -122,9 +122,10 @@ pub use decycle_impl::safegraph;
 ///   cycle is rejected by the ranked engine and treated as a silent no-op by the structural engine.
 /// - **Trait** (defined out of `#[decycle]` module):
 ///   - `#[decycle::decycle(decycle = path)]`: announces the trait with
-///     [`#[announce]`](https://docs.rs/announce) (`crate = path::announce`), so that
-///     `#[decycle] use` can bring it into a module from any crate. Paths in the trait must be
-///     absolute (`crate::..`, `::krate::..`). For announce's own options, write
+///     [`#[announce]`](https://docs.rs/announce) (`crate = path::announce`,
+///     `allow_std_prelude = true`), so that `#[decycle] use` can bring it into a module from any
+///     crate. Paths in the trait must be absolute (`crate::..`, `::krate::..`), except std prelude
+///     names (`Vec`, `Option`, `Clone`). For announce's own options, write
 ///     `#[decycle::announce::announce(crate = ::decycle::announce, ..)]`; see also [`check`].
 ///
 /// ### Impl where-clause bounds

@@ -1,0 +1,5 @@
+error: #[decycle] is already applied to this trait
+ --> tests/ui/double_decycle_trait.rs:5:1
+  |
+5 | #[decycle::decycle]
+  | ^

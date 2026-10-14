@@ -7,14 +7,6 @@ error: #[decycle] takes no arguments on an item inside a #[decycle] module
 15 |     #[decycle(decycle = ::nope)]
    |               ^^^^^^^
 
-error: cannot find attribute `decycle` in this scope
-  --> tests/ui/inner_decycle_use_args_structural.rs:15:7
-   |
-15 |     #[decycle(decycle = ::nope)]
-   |       ^^^^^^^
-   |
-   = note: `decycle` is in scope, but it is a crate, not an attribute
-
 error[E0275]: overflow evaluating the requirement `A: Ev`
   --> tests/ui/inner_decycle_use_args_structural.rs:23:9
    |

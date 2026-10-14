@@ -4,14 +4,6 @@ error: glob is not supported in #[decycle] use
 14 |     use crate::ext::*;
    |                     ^
 
-error: cannot find attribute `decycle` in this scope
-  --> tests/ui/ranked_glob_use.rs:13:7
-   |
-13 |     #[decycle]
-   |       ^^^^^^^
-   |
-   = note: `decycle` is in scope, but it is a crate, not an attribute
-
 warning: unused import: `crate::ext::*`
   --> tests/ui/ranked_glob_use.rs:14:9
    |

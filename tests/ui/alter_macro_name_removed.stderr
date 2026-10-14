@@ -1,0 +1,8 @@
+error: `alter_macro_name` was an option of `#[decycle]` on a trait, which was removed in 0.6
+
+         = help: nothing replaces it: `#[decycle] use` the trait by its own name
+
+ --> tests/ui/alter_macro_name_removed.rs:3:20
+  |
+3 | #[decycle::decycle(alter_macro_name = Renamed)]
+  |                    ^^^^^^^^^^^^^^^^

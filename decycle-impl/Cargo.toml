@@ -1,6 +1,6 @@
 [package]
 name = "decycle-impl"
-version = "0.5.3"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.71"
 description = "Internal implementation for decycle macros"
@@ -16,9 +16,9 @@ path = "src/lib.rs"
 [dependencies]
 proc-macro2 = "1.0"
 proc-macro-error = { version = "1.0", default-features = false }
-type-leak = "0.7.0"
-safegraph = { version = "0.2.0", default-features = false }
+safegraph = { version = "0.3.0", default-features = false }
 template-quote = "0.4.0"
+announce = "0.1.1"
 
 [dependencies.syn]
 version = "2.0"

@@ -9,6 +9,8 @@ edition = "2021"
 publish = false
 
 [dependencies]
-decycle = { path = "../..", default-features = false }
+# `announce` builds for a core-only target too: it re-exports announce without its `proc-macro-api`
+# feature, which is all `#[announce]` needs.
+decycle = { path = "../..", default-features = false, features = ["announce"] }
 
 [workspace]

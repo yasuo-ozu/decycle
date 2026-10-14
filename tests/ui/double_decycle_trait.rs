@@ -1,10 +1,10 @@
-//! `#[decycle]` twice on one trait used to expand twice and die with E0252 ("the name … is
-//! defined multiple times", plus a rustc suggestion that is not valid Rust). The outer
-//! invocation now detects the still-pending inner attribute and says what actually happened.
+//! `#[decycle]` twice on one trait used to announce it twice, and fail later on the redefinition of
+//! the trampoline macro. The outer invocation now detects the still-pending inner attribute and
+//! says what actually happened.
 #[decycle::decycle]
 #[decycle::decycle]
-trait Twice {
-    fn value(&self) -> i32;
+pub trait T {
+    fn f(&self) -> usize;
 }
 
 fn main() {}

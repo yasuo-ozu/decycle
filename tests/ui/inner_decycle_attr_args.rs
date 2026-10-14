@@ -3,13 +3,13 @@
 //! `structural`: written on the trait instead of on the `mod`, the user asked for the structural
 //! engine, got no diagnostic at all, and was quietly handed the ranked one.
 //!
-//! (`recurse_level = 0`, an unknown keyword and a `marker` path are in the same list to show that
-//! none of them is read either; each is a clean abort at the top level.)
+//! (`recurse_level = 0`, a `decycle` path and an unknown keyword are in the same list to show that
+//! none of them is read either; each is a clean abort or is read from the `mod` at the top level.)
 use decycle::decycle;
 
 #[decycle]
 mod m {
-    #[decycle(structural, recurse_level = 0, marker = Nonexistent, bogus_keyword)]
+    #[decycle(structural, recurse_level = 0, decycle = ::nope, bogus_keyword)]
     pub trait Tr {
         fn f(&self) -> u32;
     }

@@ -77,8 +77,7 @@ jobs:
       # 1.71 is measured, and it is only reachable because `safegraph` is taken with
       # `default-features = false`. Its default `matrix` feature pulls `sprs`, which declares
       # rustc 1.88 and dragged the whole crate's floor up with it; nothing here needs the matrix
-      # backend. `type-leak` already depends on `safegraph` with default features off, so that
-      # second path never contributed. Cargo.lock is gitignored, so the step above resolves fresh.
+      # backend. Cargo.lock is gitignored, so the step above resolves fresh.
       - name: cargo build (decycle + macro + impl)
         run: cargo +1.71.0 build -p decycle -p decycle-macro -p decycle-impl --locked
 
@@ -103,6 +102,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --no-deps
+      # The crate docs also build with the features off. They link to items that only exist with a
+      # feature on, and an intra-doc link to one is an unresolved link (an error here) without it.
+      - run: cargo doc -p decycle --no-deps --no-default-features
 
   # Miri catches what the ordinary suite cannot: the crate's generated code transmutes fn
   # pointers (ranked floor) and type-puns values (structural casts), and three separate UB
@@ -156,15 +158,20 @@ jobs:
           targets: x86_64-unknown-none
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p decycle --no-default-features --target x86_64-unknown-none
+      # `announce` builds for a core-only target too: the facade takes announce without its
+      # `proc-macro-api` feature, so nothing of proc-macro2/syn reaches the target.
+      - run: cargo build -p decycle --no-default-features --features announce --target x86_64-unknown-none
       # Feature combinations must each stand on their own, not only in the default union.
       - run: cargo build -p decycle --no-default-features
       - run: cargo build -p decycle --no-default-features --features std
       - run: cargo build -p decycle --no-default-features --features api
+      - run: cargo build -p decycle --no-default-features --features announce
       # The steps above build only the FACADE, which contains no expansions — so on their own they
       # say nothing about the code the macro emits. This fixture actually runs `#[decycle]` with
       # default features off, covering the two combinations documented as supported without `std`
-      # (structural, and ranked with `support_infinite_cycle = false`). It is outside the workspace
-      # on purpose; see the root manifest.
+      # (structural, and ranked with `support_infinite_cycle = false`), and announces traits
+      # (`#[announce]` with `decycle::check`) that its modules `#[decycle] use`, through the `announce`
+      # feature. It is outside the workspace on purpose; see the root manifest.
       - name: build a real no_std consumer (expands the macro)
         run: cargo build --manifest-path tests/nostd_consumer/Cargo.toml --target x86_64-unknown-none
       - name: build the same consumer for the host

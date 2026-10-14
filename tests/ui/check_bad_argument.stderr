@@ -1,0 +1,5 @@
+error: `decycle::check` takes no argument, or `structural` (`decycle::check(structural)`)
+ --> tests/ui/check_bad_argument.rs:2:75
+  |
+2 | #[decycle::announce::announce(crate = ::decycle::announce, decycle::check(ranked))]
+  |                                                                           ^^^^^^

@@ -1,0 +1,5 @@
+error: #[decycle] use: `NotTrait!` is not a trait
+  --> tests/ui/decycle_use_not_a_trait.rs:11:19
+   |
+11 |     use crate::d::NotTrait;
+   |                   ^^^^^^^^

@@ -11,7 +11,9 @@ fn edges(module: &syn::ItemMod) -> Vec<(String, EdgeKind, String)> {
     let mut out = g.scope(|ctx| {
         ctx.edge_indices()
             .map(|e| {
-                let [a, b] = ctx.endpoints(e);
+                let e = e.to_ix();
+                let mut ends = ctx.endpoints(e).map(|n| n.to_ix());
+                let (a, b) = (ends.next().unwrap(), ends.next().unwrap());
                 (ctx.node(a).to_string(), *ctx.edge(e), ctx.node(b).to_string())
             })
             .collect::<Vec<_>>()

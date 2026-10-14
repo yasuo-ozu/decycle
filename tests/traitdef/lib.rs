@@ -2,7 +2,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 
 // Local trait that exists only in this crate
-#[decycle::decycle]
+#[decycle::announce::announce(crate = ::decycle::announce)]
 pub trait LocalTrait {
     fn local_method(&self) -> usize;
 }
@@ -144,5 +144,87 @@ where
         let mut hasher = DefaultHasher::new();
         self.0.hash(&mut hasher);
         hasher.finish().is_multiple_of(2)
+    }
+}
+
+// A foreign `#[decycle]` trait whose default method body holds a `macro_rules!` using `$crate`
+// (AUDIT decycle #1), and one whose default body holds a `$(..)*` repetition (AUDIT decycle #2).
+pub fn dollar_crate_helper() -> usize {
+    7
+}
+
+#[decycle::announce::announce(crate = ::decycle::announce)]
+pub trait DollarCrateDefault {
+    fn base(&self) -> usize;
+    fn with_helper(&self) -> usize {
+        macro_rules! helper {
+            () => {
+                $crate::dollar_crate_helper()
+            };
+        }
+        self.base() + helper!()
+    }
+}
+
+#[decycle::announce::announce(crate = ::decycle::announce)]
+pub trait RepetitionDefault {
+    fn base2(&self) -> usize;
+    fn summed(&self) -> usize {
+        macro_rules! sum {
+            ($($x:expr),*) => { 0 $(+ $x)* };
+        }
+        sum!(self.base2(), 1, 2)
+    }
+}
+
+// `mock = path`: a stand-in for a real trait that is not itself announced (here a plain trait of
+// this crate; it could be any crate's). The stand-in is not emitted as a trait — only its
+// trampoline, at the item's path (`traitdef::stand::Weigh!`), carrying a copy that `#[decycle]
+// use` sites treat as `crate::real::Weigh`.
+pub mod real {
+    pub trait Weigh {
+        fn weigh(&self, depth: usize) -> usize;
+        fn doubled(&self) -> usize {
+            self.weigh(0) * 2
+        }
+    }
+}
+
+pub mod stand {
+    #[decycle::announce::announce(crate = ::decycle::announce, mock = crate::real::Weigh)]
+    pub trait Weigh {
+        fn weigh(&self, depth: usize) -> usize;
+        fn doubled(&self) -> usize {
+            self.weigh(0) * 2
+        }
+    }
+}
+
+// A stand-in named differently from its real trait: `#[decycle] use` it `as` the real name. Its
+// copy names a type of this crate by its absolute path: announce type-checks the mock copy in a
+// hidden module, and the path must resolve at every use site.
+pub mod stand_renamed {
+    #[decycle::announce::announce(crate = ::decycle::announce, mock = crate::real_unit::Measure)]
+    pub trait MeasureStandIn {
+        fn measure(&self, depth: usize) -> crate::tys::Unit;
+    }
+}
+
+pub mod real_unit {
+    pub trait Measure {
+        fn measure(&self, depth: usize) -> crate::tys::Unit;
+    }
+}
+
+// A type of this crate, named by its absolute path in the announced trait below.
+pub mod tys {
+    pub struct Unit(pub usize);
+}
+
+// Validated at its definition by `decycle::check`, and announced with a type of this crate.
+pub mod checked {
+    #[decycle::announce::announce(crate = ::decycle::announce, decycle::check)]
+    pub trait FromTys {
+        fn unit(&self, depth: usize) -> crate::tys::Unit;
     }
 }

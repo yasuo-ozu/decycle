@@ -8,6 +8,11 @@
 #[doc(hidden)]
 pub use decycle_macro::__finalize;
 
+/// Re-export of the [`announce`](https://docs.rs/announce) crate, which `#[decycle]` on a trait
+/// outside a module expands to.
+#[cfg(feature = "announce")]
+pub use announce;
+
 /// The default **ranked** engine's programmatic API — hidden "Ranked" helper traits plus a
 /// thread-local re-entry registry. For macro authors and tooling built on decycle; most users want
 /// the [`macro@decycle`] attribute. See the module for its entry points.
@@ -116,11 +121,12 @@ pub use decycle_impl::safegraph;
 ///   An empty `#[decycle]` module is rejected by both engines. A module with no `#[decycle]`-annotated
 ///   cycle is rejected by the ranked engine and treated as a silent no-op by the structural engine.
 /// - **Trait** (defined out of `#[decycle]` module):
-///   - `#[decycle::decycle(marker = path, decycle = path)]`
-///   - `marker`: marker type used for internal references. Required when the
-///     trait definition contains non-absolute type paths so decycle can intern
-///     them into a stable, globally reachable form.
-///   - `decycle`: override the path used to refer to this crate
+///   - `#[decycle::decycle(decycle = path)]`: announces the trait with
+///     [`#[announce]`](https://docs.rs/announce) (`crate = path::announce`,
+///     `allow_std_prelude = true`), so that `#[decycle] use` can bring it into a module from any
+///     crate. Paths in the trait must be absolute (`crate::..`, `::krate::..`), except std prelude
+///     names (`Vec`, `Option`, `Clone`). For announce's own options, write
+///     `#[decycle::announce::announce(crate = ::decycle::announce, ..)]`; see also [`check`].
 ///
 /// ### Impl where-clause bounds
 /// In `impl` blocks inside a `#[decycle]` module, avoid constraining
@@ -219,28 +225,25 @@ pub use decycle_impl::safegraph;
 /// `#[track_caller]`, `no_std`, higher-order `Self`-mentioning arguments
 /// (`fn(&Self)` / `dyn` / `impl Fn(&Self)`), and more — see the crate README's *Two algorithms*
 /// section.
-///
-/// ## Example with markers
-/// Use `marker` when the trait contains non-absolute paths (e.g. `super::Type`,
-/// `crate::Type`, or local aliases) so decycle can intern those references.
-/// The path given with `marker = <path>` argument should be practically absolute and accessible from anywhere
-/// where the defined trait is used.
-///
-/// ```rust
-/// #[decycle::decycle(marker = Marker)]
-/// trait MyTrait {
-///     fn value(&self) -> i32;
-/// }
-/// struct Marker;
-/// ```
 pub use decycle_macro::decycle;
 
-/// Internal helper used by generated code to track staged type expansion.
-#[doc(hidden)]
-pub trait Repeater<const RANDOM: u64, const IX: usize, PARAM: ?Sized> {
-    /// The resolved type at the given stage.
-    type Type: ?Sized;
-}
+/// Checks a trait at its definition: it can take part in a `#[decycle]` cycle.
+///
+/// Without it, a trait is validated when a `#[decycle]` module receives it, and the error appears
+/// there. Listed among the options of `#[announce]`, it rejects at the trait:
+///
+/// - a return-position `impl Trait` in a method;
+/// - an `async fn` in a method;
+/// - a default on a generic parameter (`trait Tr<T = u8>`), a rule of the ranked engine only:
+///   `decycle::check(structural)` skips it.
+///
+/// ```compile_fail
+/// #[decycle::announce::announce(crate = ::decycle::announce, decycle::check)]
+/// pub trait Bad {
+///     fn items(&self) -> impl ::core::iter::Iterator<Item = u8>;
+/// }
+/// ```
+pub use decycle_macro::check;
 
 /// Runtime fn-pointer registry backing unbounded `support_infinite_cycle` re-entry.
 #[doc(hidden)]
@@ -483,6 +486,3 @@ pub mod __reentry {
 #[doc(hidden)]
 #[cfg(feature = "api")]
 pub use decycle_impl::proc_macro_error;
-#[doc(hidden)]
-#[cfg(feature = "api")]
-pub use decycle_impl::type_leak;

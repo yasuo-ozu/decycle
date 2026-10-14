@@ -12,7 +12,7 @@
 
 use decycle::decycle;
 
-#[decycle]
+#[decycle::announce::announce(crate = ::decycle::announce)]
 pub trait Loop {
     fn step(&self, n: usize) -> usize;
 }

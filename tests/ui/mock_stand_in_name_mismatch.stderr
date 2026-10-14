@@ -1,0 +1,38 @@
+error: #[decycle] use: the stand-in `Sz` is reached under a name other than `Size`, the trait it stands in for, and is not renamed
+
+         = help: the module's `impl Size for ..` is matched to the trait by name, so give the `use` that name: `#[decycle] use path::to::Sz as Size;` (the real trait must be in scope under that name too, unless the stand-in imports it)
+
+  --> tests/ui/mock_stand_in_name_mismatch.rs:21:23
+   |
+21 |     use crate::stand::Sz;
+   |                       ^^
+
+error[E0275]: overflow evaluating the requirement `Node: Size`
+  --> tests/ui/mock_stand_in_name_mismatch.rs:28:9
+   |
+28 |         Leaf: Size,
+   |         ^^^^^^^^^^
+   |
+note: required for `Leaf` to implement `Size`
+  --> tests/ui/mock_stand_in_name_mismatch.rs:35:10
+   |
+35 |     impl Size for Leaf
+   |          ^^^^     ^^^^
+36 |     where
+37 |         Node: Size,
+   |               ---- unsatisfied trait bound introduced here
+
+error[E0275]: overflow evaluating the requirement `Leaf: Size`
+  --> tests/ui/mock_stand_in_name_mismatch.rs:37:9
+   |
+37 |         Node: Size,
+   |         ^^^^^^^^^^
+   |
+note: required for `Node` to implement `Size`
+  --> tests/ui/mock_stand_in_name_mismatch.rs:26:10
+   |
+26 |     impl Size for Node
+   |          ^^^^     ^^^^
+27 |     where
+28 |         Leaf: Size,
+   |               ---- unsatisfied trait bound introduced here

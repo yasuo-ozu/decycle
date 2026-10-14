@@ -1,0 +1,8 @@
+error: `mock` was an option of `#[decycle]` on a trait, which was removed in 0.6
+
+         = help: announce the trait with `#[::decycle::announce::announce(crate = ::decycle::announce, mock = path::to::RealTrait)]`
+
+ --> tests/ui/trait_mock_generic_removed.rs:3:20
+  |
+3 | #[decycle::decycle(mock = crate::real::Size<u8, u16>, recurse_level = 3)]
+  |                    ^^^^

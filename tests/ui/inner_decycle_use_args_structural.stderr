@@ -1,46 +1,38 @@
 error: #[decycle] takes no arguments on an item inside a #[decycle] module
 
-         = help: engine options (`structural`, `recurse_level`, `support_infinite_cycle`) belong on the enclosing `#[decycle] mod`; trait options (`marker`, `alter_macro_name`, `allowed_paths`) apply only to a `#[decycle]` trait declared outside such a module
+         = help: engine options (`structural`, `recurse_level`, `support_infinite_cycle`) belong on the enclosing `#[decycle] mod`
 
-  --> tests/ui/inner_decycle_use_args_structural.rs:14:15
+  --> tests/ui/inner_decycle_use_args_structural.rs:15:15
    |
-14 |     #[decycle(marker = ::nope::Marker)]
-   |               ^^^^^^
-
-error: cannot find attribute `decycle` in this scope
-  --> tests/ui/inner_decycle_use_args_structural.rs:14:7
-   |
-14 |     #[decycle(marker = ::nope::Marker)]
-   |       ^^^^^^^
-   |
-   = note: `decycle` is in scope, but it is a crate, not an attribute
+15 |     #[decycle(decycle = ::nope)]
+   |               ^^^^^^^
 
 error[E0275]: overflow evaluating the requirement `A: Ev`
-  --> tests/ui/inner_decycle_use_args_structural.rs:22:9
+  --> tests/ui/inner_decycle_use_args_structural.rs:23:9
    |
-22 |         B: Ev,
+23 |         B: Ev,
    |         ^^^^^
    |
 note: required for `B` to implement `Ev`
-  --> tests/ui/inner_decycle_use_args_structural.rs:29:10
+  --> tests/ui/inner_decycle_use_args_structural.rs:30:10
    |
-29 |     impl Ev for B
+30 |     impl Ev for B
    |          ^^     ^
-30 |     where
-31 |         A: Ev,
+31 |     where
+32 |         A: Ev,
    |            -- unsatisfied trait bound introduced here
 
 error[E0275]: overflow evaluating the requirement `B: Ev`
-  --> tests/ui/inner_decycle_use_args_structural.rs:31:9
+  --> tests/ui/inner_decycle_use_args_structural.rs:32:9
    |
-31 |         A: Ev,
+32 |         A: Ev,
    |         ^^^^^
    |
 note: required for `A` to implement `Ev`
-  --> tests/ui/inner_decycle_use_args_structural.rs:20:10
+  --> tests/ui/inner_decycle_use_args_structural.rs:21:10
    |
-20 |     impl Ev for A
+21 |     impl Ev for A
    |          ^^     ^
-21 |     where
-22 |         B: Ev,
+22 |     where
+23 |         B: Ev,
    |            -- unsatisfied trait bound introduced here

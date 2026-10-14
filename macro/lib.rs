@@ -8,13 +8,10 @@ use template_quote::quote;
 
 use decycle_impl::process_module;
 use decycle_impl::process_module_structural;
-use decycle_impl::process_trait;
+use decycle_impl::{check_trait, check_trait_structural};
 
 struct Args {
     decycle: Option<Path>,
-    marker: Option<Path>,
-    alter_macro_name: Option<Ident>,
-    allowed_paths: Option<Vec<Path>>,
     recurse_level: Option<usize>,
     support_infinite_cycle: Option<bool>,
     structural: bool,
@@ -38,9 +35,6 @@ impl Parse for Args {
     fn parse(input: ParseStream) -> Result<Self> {
         let mut args = Args {
             decycle: None,
-            marker: None,
-            alter_macro_name: None,
-            allowed_paths: None,
             recurse_level: None,
             support_infinite_cycle: None,
             structural: false,
@@ -48,8 +42,8 @@ impl Parse for Args {
         };
         syn::custom_keyword!(decycle);
         syn::custom_keyword!(marker);
+        syn::custom_keyword!(mock);
         syn::custom_keyword!(alter_macro_name);
-        syn::custom_keyword!(allowed_paths);
         syn::custom_keyword!(recurse_level);
         syn::custom_keyword!(support_infinite_cycle);
         syn::custom_keyword!(structural);
@@ -70,35 +64,27 @@ impl Parse for Args {
                 } else {
                     args.decycle = Some(value);
                 }
-            } else if lookahead.peek(marker) {
+            } else if input.peek(marker) {
                 let kw: marker = input.parse()?;
-                input.parse::<Token![=]>()?;
-                let value = input.parse()?;
-                if args.marker.is_some() {
-                    args.note_duplicate(kw.span, "marker");
-                } else {
-                    args.marker = Some(value);
-                }
-            } else if lookahead.peek(alter_macro_name) {
+                abort!(
+                    kw.span,
+                    "`marker` was an option of `#[decycle]` on a trait, which was removed in 0.6";
+                    help = "nothing replaces it: `#[announce]` requires every path in the trait to resolve outside the defining module, so spell them absolutely (`crate::..`, `::krate::..`)"
+                )
+            } else if input.peek(mock) {
+                let kw: mock = input.parse()?;
+                abort!(
+                    kw.span,
+                    "`mock` was an option of `#[decycle]` on a trait, which was removed in 0.6";
+                    help = "announce the trait with `#[::decycle::announce::announce(crate = ::decycle::announce, mock = path::to::RealTrait)]`"
+                )
+            } else if input.peek(alter_macro_name) {
                 let kw: alter_macro_name = input.parse()?;
-                input.parse::<Token![=]>()?;
-                let value = input.parse()?;
-                if args.alter_macro_name.is_some() {
-                    args.note_duplicate(kw.span, "alter_macro_name");
-                } else {
-                    args.alter_macro_name = Some(value);
-                }
-            } else if lookahead.peek(allowed_paths) {
-                let kw: allowed_paths = input.parse()?;
-                input.parse::<Token![=]>()?;
-                let content;
-                bracketed!(content in input);
-                let paths = content.parse_terminated(Path::parse, Token![,])?;
-                if args.allowed_paths.is_some() {
-                    args.note_duplicate(kw.span, "allowed_paths");
-                } else {
-                    args.allowed_paths = Some(paths.into_iter().collect());
-                }
+                abort!(
+                    kw.span,
+                    "`alter_macro_name` was an option of `#[decycle]` on a trait, which was removed in 0.6";
+                    help = "nothing replaces it: `#[decycle] use` the trait by its own name"
+                )
             } else if lookahead.peek(recurse_level) {
                 let kw: recurse_level = input.parse()?;
                 input.parse::<Token![=]>()?;
@@ -120,7 +106,7 @@ impl Parse for Args {
             } else {
                 abort!(
                     input.span(),
-                    "keyword arguments should be one of 'decycle', 'marker', 'alter_macro_name', 'allowed_paths', 'recurse_level', 'support_infinite_cycle', 'structural'"
+                    "keyword arguments should be one of 'decycle', 'recurse_level', 'support_infinite_cycle', 'structural'"
                 )
             }
             if input.parse::<Token![,]>().is_err() {
@@ -163,14 +149,50 @@ fn pending_decycle_attr(attrs: &[Attribute], decycle_path: &Path) -> Option<proc
     })
 }
 
+/// Is `attr` a `#[decycle]` marker, in either spelling: bare, or two-segment `<x>::decycle`? The
+/// args are not known where this is used, so `<x>` is not tied to one crate name.
+fn names_decycle(attr: &Attribute) -> bool {
+    let path = attr.path();
+    path.is_ident("decycle") || (path.segments.len() == 2 && path.segments[1].ident == "decycle")
+}
+
+/// Drop the `#[decycle]` markers from the direct items of `module`, for the dummy set before the
+/// arguments are parsed.
+///
+/// Without it, an abort while parsing the arguments leaves the markers in the dummy, where each
+/// one adds a "cannot find attribute `decycle`" error to the one the user needs to see.
+fn strip_inner_decycle_attrs(module: &mut ItemMod) {
+    if let Some((_, items)) = module.content.as_mut() {
+        for item in items {
+            let attrs = match item {
+                Item::Trait(ItemTrait { attrs, .. })
+                | Item::TraitAlias(ItemTraitAlias { attrs, .. })
+                | Item::Use(ItemUse { attrs, .. })
+                | Item::Mod(ItemMod { attrs, .. }) => attrs,
+                _ => continue,
+            };
+            attrs.retain(|attr| !names_decycle(attr));
+        }
+    }
+}
+
 #[proc_macro_error]
 #[proc_macro_attribute]
 pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
-    set_dummy(input.clone().into());
+    let module = parse::<ItemMod>(input.clone()).ok();
+    set_dummy(match &module {
+        Some(module) if !module.attrs.iter().any(names_decycle) => {
+            let mut module = module.clone();
+            strip_inner_decycle_attrs(&mut module);
+            quote!(#module)
+        }
+        // Applied twice: the remaining outer `#[decycle]` expands the module with its markers.
+        _ => input.clone().into(),
+    });
     let args = parse_macro_input!(attr as Args);
     let decycle_path = args.decycle.clone().unwrap_or_else(|| parse_quote!(::decycle));
 
-    if let Ok(module) = parse::<ItemMod>(input.clone()) {
+    if let Some(module) = module {
         // Applied twice? Abort here, where it can still be said plainly. The dummy is the raw
         // input, whose remaining `#[decycle]` will expand the original module cleanly — so this
         // stays a single error.
@@ -216,69 +238,39 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
         // args — matching the original ordering so an unsupported-arg abort doesn't cascade.
         set_dummy(quote!(#ret));
         reject_duplicate(&args);
-        if let Some(marker) = &args.marker {
-            abort!(marker, "unsupported argument 'marker'")
-        }
-        if let Some(alter_macro_name) = &args.alter_macro_name {
-            abort!(alter_macro_name, "unsupported argument 'alter_macro_name'")
-        }
-        if args.allowed_paths.is_some() {
-            abort!(
-                Span::call_site(),
-                "allowed_paths is not supported for modules"
-            )
-        }
         ret.into()
-    } else if let Ok(item) = parse::<ItemTrait>(input.clone()) {
-        // Applied twice? Same detection as the module branch, same reasoning: the outer invocation
-        // sees the inner attribute still attached and would otherwise expand right over it,
-        // re-defining the trait name (E0252) with a rustc suggestion that isn't valid Rust.
-        if let Some(span) = pending_decycle_attr(&item.attrs, &decycle_path) {
+    } else if let Ok(item_trait) = parse::<ItemTrait>(input.clone()) {
+        // The dummy is the raw trait here, so each abort below stays a single error.
+        if let Some(span) = pending_decycle_attr(&item_trait.attrs, &decycle_path) {
             abort!(span, "#[decycle] is already applied to this trait")
         }
-        let mut config = type_leak::LeakerConfig::new();
-        if let Some(paths) = &args.allowed_paths {
-            config.allowed_paths.extend(paths.clone());
+        // The engine options belong to the module; on a trait they would be dropped silently.
+        let module_only = if args.structural {
+            Some("structural")
+        } else if args.recurse_level.is_some() {
+            Some("recurse_level")
+        } else if args.support_infinite_cycle.is_some() {
+            Some("support_infinite_cycle")
         } else {
-            config.allow_crate();
-            config.allow_primitive();
-            // The standard prelude is in scope wherever the carrier macro is expanded, so its
-            // names need no interning — and without them here, type-leak hard-errors on any
-            // relative trait path, which `process_trait` turns into `use absolute path`. That
-            // rejected `fn f<T: Clone>(..)` on a standalone `#[decycle]` trait, while the
-            // identical trait inside a `#[decycle] mod` compiled fine. `allowed_paths = [..]`
-            // still replaces the whole set, exactly as before.
-            config.allow_std_prelude();
+            None
+        };
+        if let Some(name) = module_only {
+            abort!(
+                Span::call_site(),
+                "`{}` applies to a `#[decycle]` module, not a trait", name;
+                help = "write it on the enclosing `#[decycle] mod`"
+            )
         }
-        let ret = process_trait(
-            &item,
-            &decycle_path,
-            args.marker.as_ref(),
-            args.alter_macro_name.as_ref(),
-            config,
-        );
-        set_dummy(quote!(#ret));
         reject_duplicate(&args);
-        if args.recurse_level.is_some() {
-            abort!(
-                Span::call_site(),
-                "recurse_level is not supported for trait items"
-            )
+        // A trait outside a `#[decycle] mod` is announced, so that a `#[decycle] use` (in this crate
+        // or another) can carry it into a module. The std prelude names (`Option`, `String`,
+        // `Clone`, ..) stay accepted, as they were before the trait was announced.
+        let item = proc_macro2::TokenStream::from(input);
+        quote! {
+            #[#decycle_path::announce::announce(crate = #decycle_path::announce, allow_std_prelude = true)]
+            #item
         }
-        if args.support_infinite_cycle.is_some() {
-            abort!(
-                Span::call_site(),
-                "support_infinite_cycle is not supported for trait items"
-            )
-        }
-        if args.structural {
-            abort!(
-                Span::call_site(),
-                "structural is not supported for trait items";
-                hint = "structural selects the module-level engine; write it on the enclosing #[decycle(structural)] mod instead"
-            )
-        }
-        ret.into()
+        .into()
     } else if let Ok(mut item_use) = parse::<ItemUse>(input.clone()) {
         item_use.attrs.clear();
         abort!(
@@ -297,7 +289,7 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
         abort!(
             Span::call_site(),
             "not supported";
-            hint = "#[decycle] supports module or trait"
+            hint = "#[decycle] supports an inline module"
         )
     }
 }
@@ -308,4 +300,50 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
 pub fn __finalize(input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(input as decycle_impl::finalize::FinalizeArgs);
     decycle_impl::finalize::finalize(args).into()
+}
+
+/// The implementation of `decycle::check`: validates a trait at its definition (see the docs of
+/// `decycle::check`). Run by `#[announce(.., decycle::check)]` as `check! { (), TRAIT }`, and by
+/// `#[announce(.., decycle::check(structural))]` as `check! { (structural), TRAIT }`.
+#[proc_macro_error]
+#[proc_macro]
+pub fn check(input: TokenStream) -> TokenStream {
+    announce::helper::check(input.into(), &[], |c| {
+        let structural = parse_check_args(&c.args)?;
+        match &c.item {
+            Item::Trait(item_trait) => {
+                if structural {
+                    check_trait_structural(item_trait);
+                } else {
+                    check_trait(item_trait);
+                }
+                Ok(proc_macro2::TokenStream::new())
+            }
+            other => Err(Error::new(
+                // The first token of the item (a single token, so that the position does not depend
+                // on whether the compiler can join spans).
+                template_quote::ToTokens::to_token_stream(other)
+                    .into_iter()
+                    .next()
+                    .map_or_else(proc_macro2::Span::call_site, |t| t.span()),
+                "`decycle::check` applies to a trait definition",
+            )),
+        }
+    })
+    .into()
+}
+
+/// The arguments of `decycle::check(..)`: nothing (the rules of the default ranked engine), or
+/// `structural` (the rules of `#[decycle(structural)]`). Returns whether it was `structural`.
+fn parse_check_args(args: &proc_macro2::TokenStream) -> Result<bool> {
+    if args.is_empty() {
+        return Ok(false);
+    }
+    syn::custom_keyword!(structural);
+    syn::parse2::<structural>(args.clone()).map(|_| true).map_err(|e| {
+        Error::new(
+            e.span(),
+            "`decycle::check` takes no argument, or `structural` (`decycle::check(structural)`)",
+        )
+    })
 }

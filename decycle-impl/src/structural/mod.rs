@@ -263,6 +263,11 @@ fn collect_decycle_traits(items: &mut [Item], decycle_crate: &Ident) -> HashSet<
             Item::Use(u) => {
                 if take_decycle_attr(&mut u.attrs, decycle_crate) {
                     collect_use_trait_idents(&u.tree, &mut traits);
+                    // This engine reads no trait through the `use`: its name is all it takes, and
+                    // the module's impls spell the trait by it. Nothing else may name the import
+                    // (a stand-in that is only the real trait's copy, reached under a rename), so
+                    // it would be reported unused.
+                    u.attrs.push(parse_quote!(#[allow(unused_imports)]));
                 }
             }
             _ => {}

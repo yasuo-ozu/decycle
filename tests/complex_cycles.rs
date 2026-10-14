@@ -12,34 +12,34 @@
 
 use decycle::decycle;
 
-#[decycle]
+#[decycle::announce::announce(crate = ::decycle::announce)]
 trait Compute<T> {
     type Output;
     fn compute(&self, input: T) -> Self::Output;
 }
 
-#[decycle]
+#[decycle::announce::announce(crate = ::decycle::announce)]
 trait Process {
     fn process(&self);
 }
 
-#[decycle]
+#[decycle::announce::announce(crate = ::decycle::announce)]
 trait Validate<T> {
     fn validate(&self, data: T) -> bool;
 }
 
-#[decycle]
+#[decycle::announce::announce(crate = ::decycle::announce)]
 trait Transform<From, To> {
     fn transform(&self, from: From) -> To;
 }
 
-#[decycle]
+#[decycle::announce::announce(crate = ::decycle::announce)]
 trait Cache<K, V> {
     fn get(&self, key: K) -> ::core::option::Option<V>;
     fn put(&self, key: K, value: V);
 }
 
-#[decycle]
+#[decycle::announce::announce(crate = ::decycle::announce)]
 trait Serialize<T> {
     fn serialize(&self, data: T) -> ::std::vec::Vec<u8>;
 }

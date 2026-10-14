@@ -1,0 +1,8 @@
+error: `marker` was an option of `#[decycle]` on a trait, which was removed in 0.6
+
+         = help: nothing replaces it: `#[announce]` requires every path in the trait to resolve outside the defining module, so spell them absolutely (`crate::..`, `::krate::..`)
+
+ --> tests/ui/trait_marker_removed.rs:5:20
+  |
+5 | #[decycle::decycle(marker = Marker)]
+  |                    ^^^^^^

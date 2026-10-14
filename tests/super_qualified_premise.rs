@@ -12,7 +12,7 @@
 use decycle::decycle;
 
 pub mod x {
-    #[decycle::decycle]
+    #[decycle::announce::announce(crate = ::decycle::announce)]
     pub trait Tr {
         fn f(&self) -> usize;
     }

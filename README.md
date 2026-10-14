@@ -20,17 +20,18 @@ traits with circular dependencies that would otherwise fail to compile.
 
 ```toml
 [dependencies]
-decycle = "0.5.3"
+decycle = "0.6.0"
 ```
 
 ### Cargo features
 
-Both are on by default; a normal `std` user needs neither flag.
+All are on by default; a normal `std` user needs none of these flags.
 
 | feature | default | what turning it **off** does |
 | --- | --- | --- |
 | `std` | on | Drops the re-entry registry, which is a `thread_local!` map. The ranked engine then requires `support_infinite_cycle = false`; asking for unbounded re-entry without `std` is a compile error naming `UnboundedReentryRequiresTheDecycleStdFeature`. The structural engine is unaffected — it emits no runtime machinery at all. |
 | `api` | on | Drops the programmatic surface (`decycle::{analysis, ranked, structural, safegraph}`). This is what keeps `decycle-impl` out of your *target* graph, and is therefore required for `no_std`. |
+| `announce` | on | Drops `decycle::announce`, the re-export of [announce](https://docs.rs/announce) that `#[decycle]` on a trait outside a module expands to. It builds for a core-only target. |
 
 **`no_std` needs `default-features = false`.** With the defaults on, `api` pulls `decycle-impl`
 (and `proc-macro2`) into the target graph, so a core-only target fails to build. The working
@@ -38,7 +39,9 @@ spelling is:
 
 ```toml
 [dependencies]
-decycle = { version = "0.5.3", default-features = false }
+decycle = { version = "0.6.0", default-features = false }
+# ... or, to use `#[decycle]` on traits outside a module:
+# decycle = { version = "0.6.0", default-features = false, features = ["announce"] }
 ```
 
 Note that turning `api` off does **not** shrink a normal native build: `decycle-macro` depends on
@@ -515,11 +518,16 @@ resolve in one pass.
   - `recurse_level`: expansion depth (default 10, must be at least 1)
   - `support_infinite_cycle`: enables/disable infinite cycle handling (default true)
   - `decycle`: override the path used to refer to this crate
-- **Trait**:
-  - `#[decycle::decycle(marker = path, decycle = path)]`
-  - `marker`: marker type used for internal references (required when reported)
-  - `decycle`: override the path used to refer to this crate
-  - `allowed_paths = [path, ...]`: overrides the type-leak allowed-path set (advanced; rarely needed)
+- **Trait** (outside a module):
+  - `#[decycle::decycle(decycle = path)]`: announces the trait with [`#[announce]`](https://docs.rs/announce)
+    (`#[announce(crate = path::announce, allow_std_prelude = true)]`), so that `#[decycle] use` can
+    bring it into a module from any crate. Paths in the trait must be absolute (`crate::..`,
+    `::krate::..`), except std prelude names (`Vec`, `Option`, `Clone`). For announce's own
+    options, write `#[decycle::announce::announce(crate = ::decycle::announce, ..)]` instead.
+  - `decycle::check` (optional, on `#[announce]`): rejects at the definition what a module cannot
+    receive (`async fn`, return-position `impl Trait`, defaulted generics); `decycle::check(structural)`
+    allows defaulted generics.
+  - `marker`, `allowed_paths` and `alter_macro_name` were removed in 0.6.
 
 ## Contributing
 

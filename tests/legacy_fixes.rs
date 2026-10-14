@@ -1,5 +1,5 @@
 //! Regression tests for the LEGACY-machinery findings fixed in this pass
-//! (process_module.rs / process_trait.rs / helper.rs / lib.rs / the LEGACY regions of
+//! (process_module.rs / carried.rs / helper.rs / lib.rs / the LEGACY regions of
 //! finalize.rs). Each mod is a minimal repro of exactly one finding; see the doc comment
 //! on each mod for the finding id.
 //!
@@ -38,7 +38,7 @@ pub trait CrateRootBound<A> {
 /// name again). `finalize` now carries the local alias and renames the incoming
 /// `ItemTrait` before indexing by ident.
 mod rename_tracking {
-    #[decycle::decycle]
+    #[decycle::announce::announce(crate = ::decycle::announce)]
     pub trait RenameBase {
         fn outer(&self) -> u32;
     }
@@ -629,7 +629,7 @@ mod gat_delegation {
 /// identically to the trait, with a lifetime-parameterized method, implemented for a const-generic +
 /// multi-lifetime struct — all must survive decycle processing.
 mod assoc_name_and_generics {
-    #[decycle::decycle]
+    #[decycle::announce::announce(crate = ::decycle::announce)]
     pub trait NameClash<'a> {
         type NameClash;
         type T;
@@ -678,7 +678,7 @@ mod assoc_name_and_generics {
 /// (Migrated from single-ADT bug3.rs) A UFCS trait-method call with an INFERRED Self type
 /// (`<_ as Trait>::method(self, ..)`) must be rewritten correctly by decycle.
 mod ufcs_self_call {
-    #[decycle::decycle]
+    #[decycle::announce::announce(crate = ::decycle::announce)]
     pub trait Recurse {
         fn go(&self, n: usize) -> usize;
     }
@@ -722,7 +722,7 @@ mod ufcs_self_call {
 /// `impl Trait` argument with an associated-type equality — both re-quoted through decycle's macro
 /// carrier, where a naive `$crate` would resolve against the wrong crate. Compile-only.
 mod crate_path_generic_bounds {
-    #[decycle::decycle]
+    #[decycle::announce::announce(crate = ::decycle::announce)]
     pub trait Sink<A> {
         fn sink<S: crate::CrateRootBound<A, S = S>>(sink: &mut S);
         fn f(sink: impl crate::CrateRootBound<A, S = A>);
@@ -747,7 +747,7 @@ mod crate_path_generic_bounds {
 /// (Migrated from single-ADT bug5.rs) A `#[decycle]` trait with a `Sized` supertrait and a generic
 /// method bounded by `Iterator<Item = _>`. Compile-only.
 mod supertrait_and_iter_method {
-    #[decycle::decycle]
+    #[decycle::announce::announce(crate = ::decycle::announce)]
     pub trait Consume<Item>: ::core::marker::Sized {
         fn consume<I: ::core::iter::Iterator<Item = Item>>(stream: I);
     }

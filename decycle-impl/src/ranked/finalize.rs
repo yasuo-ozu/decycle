@@ -490,9 +490,7 @@ fn emit_impl_items_leaf(
                             });
                         let s_ident = name!("DclSelf");
                         let s_ty: Type = parse_quote!(#s_ident);
-                        let trait_args = trait_.generics.ty_generics();
-                        let trait_path_full: Path =
-                            parse_quote!(super::super::#trait_ident #trait_args);
+                        let trait_path_full = original_trait_path(trait_);
                         let norm = normalize_reentry_sig(tf, &s_ty, &trait_path_full);
                         reentry_used_mask(trait_, &norm, &s_ident)
                     };
@@ -2209,6 +2207,18 @@ fn used_lifetime_idents(norm: &NormSig) -> std::collections::HashSet<String> {
     used.0
 }
 
+/// How the re-entry machinery (inside `ranked_traits`) names the ORIGINAL trait: through the
+/// `#[decycle] mod`'s scope (`super::super::T`), or — for a carried stand-in
+/// (`#[decycle(mock = path)]`, `#[announce(mock = path)]`) — by the real trait's absolute path.
+fn original_trait_path(trait_: &ItemTrait) -> Path {
+    let trait_ident = &trait_.ident;
+    let trait_args = trait_.generics.ty_generics();
+    match mock_path(trait_) {
+        Some(path) => parse_quote!(#path #trait_args),
+        None => parse_quote!(super::super::#trait_ident #trait_args),
+    }
+}
+
 /// Per trait × method: the `type_name` key marker ZST, the explicit fn-pointer type alias
 /// (the only transmute target the floor is allowed to name), and the full-height re-entry
 /// fn whose body calls the *original* trait method. Emitted inside `ranked_traits`, where
@@ -2219,8 +2229,7 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize, _decycle: &Path) -> T
     let trait_ident = &trait_.ident;
     let s_ident = name!("DclSelf");
     let s_ty: Type = parse_quote!(#s_ident);
-    let trait_args = trait_.generics.ty_generics();
-    let trait_path_full: Path = parse_quote!(super::super::#trait_ident #trait_args);
+    let trait_path_full = original_trait_path(trait_);
     // The `#fa` alias's body is a bare `fn(...) -> ...` type: a `Self::Assoc` return/param
     // (normalized to `<S as Trait>::Assoc` by `SelfSubst`) is a PROJECTION, which — unlike a
     // `where`-clause requirement — must be resolved the moment the alias is NAMED with a
@@ -2530,7 +2539,7 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize, _decycle: &Path) -> T
                 #(for (pat, ty) in &norm.params), { #pat: #ty }
             ) #out_tokens
             where
-                #s_ident: super::super::#trait_ident #trait_args,
+                #s_ident: #trait_path_full,
                 #(for w in &trait_where) { #w, }
                 #(for w in &m_where) { #w, }
             {
@@ -2538,13 +2547,13 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize, _decycle: &Path) -> T
                 // present `{ ... }` when there's no `unsafe` to scope it for.
                 #(if unsafety.is_some()) {
                     unsafe {
-                        <#s_ident as super::super::#trait_ident #trait_args>::#m_ident
+                        <#s_ident as #trait_path_full>::#m_ident
                         #(if do_turbofish) { ::<#(#orig_margs),*> }
                         (#(#param_pats),*)
                     }
                 }
                 #(if unsafety.is_none()) {
-                    <#s_ident as super::super::#trait_ident #trait_args>::#m_ident
+                    <#s_ident as #trait_path_full>::#m_ident
                     #(if do_turbofish) { ::<#(#orig_margs),*> }
                     (#(#param_pats),*)
                 }
@@ -3090,7 +3099,34 @@ pub struct FinalizeArgs {
 }
 
 impl Parse for FinalizeArgs {
+    /// The wire form `__finalize!` receives: an announce trampoline input
+    /// `[decycle::__finalize!] ENTRY* REST`. Each ENTRY is one foreign `#[decycle]` trait,
+    /// newest first; REST is decycle's own header
+    /// `"decycle" "VERSION" { traits, } { impls, } LEVEL BOOL [renames] {also_rank}?`.
     fn parse(input: ParseStream) -> Result<Self> {
+        let announce_input: announce::helper::Input = input.parse()?;
+        let working_list: Vec<Path> = announce_input.list.0.iter().map(|c| c.path()).collect();
+        let rest = announce_input.rest;
+        let mut args = syn::parse::Parser::parse2(
+            |input: ParseStream| -> Result<FinalizeArgs> { parse_rest(input) },
+            rest,
+        )?;
+        // Newest first, ahead of the module's own traits — the order the old carrier chain,
+        // which prepended each definition, produced. (Read after the REST, whose `renames` name a
+        // stand-in's local alias.)
+        let mut traits: Vec<ItemTrait> = announce_input
+            .entries
+            .iter()
+            .map(|entry| receive_carried_trait(entry, &args.renames))
+            .collect();
+        traits.append(&mut args.traits);
+        args.traits = traits;
+        args.working_list = working_list;
+        Ok(args)
+    }
+}
+
+fn parse_rest(input: ParseStream) -> Result<FinalizeArgs> {
         let _crate_identity: LitStr = input.parse()?;
         let crate_version: LitStr = input.parse()?;
         let expected_version = env!("CARGO_PKG_VERSION");
@@ -3102,10 +3138,6 @@ impl Parse for FinalizeArgs {
                 crate_version.value()
             )
         }
-
-        let working_list_content;
-        bracketed!(working_list_content in input);
-        let working_list = parse_comma_separated(&working_list_content)?;
 
         let traits_content;
         braced!(traits_content in input);
@@ -3147,7 +3179,7 @@ impl Parse for FinalizeArgs {
         };
 
         Ok(FinalizeArgs {
-            working_list,
+            working_list: Vec::new(),
             traits,
             contents,
             recurse_level,
@@ -3158,14 +3190,23 @@ impl Parse for FinalizeArgs {
             // programmatic caller of `finalize` sets it.
             decycle_path: None,
         })
-    }
 }
 
-impl template_quote::ToTokens for FinalizeArgs {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
+impl FinalizeArgs {
+    /// The continuation list the trampoline walks: every `#[decycle] use`d trait's announce macro,
+    /// then `__finalize` (`working_list`, each as `path!`).
+    pub fn cont_list(&self) -> announce::helper::ContList {
+        self.working_list
+            .iter()
+            .cloned()
+            .map(announce::helper::Cont::bang)
+            .collect()
+    }
+
+    /// Decycle's own header: the REST of the trampoline input, which announce never touches.
+    pub fn rest_tokens(&self) -> TokenStream {
         let crate_identity = LitStr::new(&crate::get_crate_identity(), Span::call_site());
         let crate_version = env!("CARGO_PKG_VERSION");
-        let working_list = &self.working_list;
         let traits = &self.traits;
         let contents = &self.contents;
 
@@ -3181,10 +3222,9 @@ impl template_quote::ToTokens for FinalizeArgs {
             .collect();
         let also_rank = &self.also_rank;
 
-        tokens.extend(quote! {
+        quote! {
             #crate_identity
             #crate_version
-            [ #(#working_list),* ]
             { #(#traits),* }
             { #(#contents),* }
             #recurse_level
@@ -3193,7 +3233,16 @@ impl template_quote::ToTokens for FinalizeArgs {
             #(if !also_rank.is_empty()) {
                 { #(#also_rank),* }
             }
-        });
+        }
+    }
+}
+
+impl template_quote::ToTokens for FinalizeArgs {
+    /// `[list] REST` — a trampoline input with no entries yet.
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        let list = self.cont_list();
+        let rest = self.rest_tokens();
+        tokens.extend(quote! { #list #rest });
     }
 }
 
@@ -3435,27 +3484,82 @@ fn check_no_defaulted_trait_generics(
     replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
 ) {
     for (trait_, _, _) in replacing_table.values() {
-        for param in &trait_.generics.params {
-            let (ident, default) = match param {
-                GenericParam::Type(tp) => (&tp.ident, tp.default.as_ref().map(|d| quote!(#d))),
-                GenericParam::Const(cp) => (&cp.ident, cp.default.as_ref().map(|d| quote!(#d))),
-                GenericParam::Lifetime(_) => continue,
-            };
-            if let Some(default) = default {
+        check_no_defaulted_generics_of(trait_);
+    }
+}
+
+/// [`check_no_defaulted_trait_generics`] for one trait.
+fn check_no_defaulted_generics_of(trait_: &ItemTrait) {
+    for param in &trait_.generics.params {
+        let (ident, default) = match param {
+            GenericParam::Type(tp) => (&tp.ident, tp.default.as_ref().map(|d| quote!(#d))),
+            GenericParam::Const(cp) => (&cp.ident, cp.default.as_ref().map(|d| quote!(#d))),
+            GenericParam::Lifetime(_) => continue,
+        };
+        if let Some(default) = default {
+            abort!(
+                param,
+                "decycle: generic parameter `{}` of #[decycle] trait `{}` cannot have a default",
+                ident,
+                &trait_.ident;
+                help = "decycle re-spells every use of `{}` with a synthesized rank argument inserted into the argument list the user WROTE, so each use site has to spell every parameter; a default lets a use site leave `{}` out, and that expands to a rank-lowered path with too few arguments. Drop the `= {}` and write `{}` at every use site.",
+                &trait_.ident,
+                ident,
+                default,
+                ident
+            );
+        }
+    }
+}
+
+/// Return-position `impl Trait` (RPITIT) and `async fn` in a trait method are rejected, by both
+/// engines, in every mode. The ranked re-entry fn-pointer type `fn(..) -> impl Trait` is not nameable
+/// (E0562), and the structural layout cast can't reinterpret an opaque return type; an `async fn`
+/// returns exactly such an opaque `impl Future`. An associated type (or a boxed future) is the
+/// portable escape hatch — it names the return type, so both engines can carry it.
+pub(crate) fn check_no_impl_trait_output_in(trait_: &ItemTrait) {
+    for item in &trait_.items {
+        if let TraitItem::Fn(tf) = item {
+            if let Some(a) = &tf.sig.asyncness {
                 abort!(
-                    param,
-                    "decycle: generic parameter `{}` of #[decycle] trait `{}` cannot have a default",
-                    ident,
-                    &trait_.ident;
-                    help = "decycle re-spells every use of `{}` with a synthesized rank argument inserted into the argument list the user WROTE, so each use site has to spell every parameter; a default lets a use site leave `{}` out, and that expands to a rank-lowered path with too few arguments. Drop the `= {}` and write `{}` at every use site.",
-                    &trait_.ident,
-                    ident,
-                    default,
-                    ident
+                    a,
+                    "decycle: `async fn` in method `{}` of #[decycle] trait `{}` is not supported — its `impl Future` return is an opaque type, like a return-position `impl Trait`", tf.sig.ident, trait_.ident;
+                    help = "return a boxed future (`-> Pin<Box<dyn Future<Output = ..>>>`), or declare an associated type on the trait and return it"
+                );
+            }
+            if sig_has_impl_trait_output(&tf.sig) {
+                abort!(
+                    &tf.sig.output,
+                    "decycle: return-position `impl Trait` in method `{}` of #[decycle] trait `{}` is not supported", tf.sig.ident, trait_.ident;
+                    help = "declare an associated type on the trait and return it instead (e.g. `type Output; fn m(&self) -> Self::Output`)"
                 );
             }
         }
     }
+}
+
+/// The rules a trait must satisfy to take part in a `#[decycle]` cycle that depend on the trait
+/// alone, checked at its definition. The same rules are enforced where a `#[decycle]` module or
+/// `#[decycle] use` receives the trait; this runs them early, so that the error appears at the
+/// trait. It aborts (through `proc_macro_error`) at the first violation.
+///
+/// These are the rules of the default **ranked** engine, the stricter of the two. A trait meant
+/// for `#[decycle(structural)]` only is checked with [`check_trait_structural`].
+///
+/// Behind `decycle::check`, which an announced trait lists among the options of `#[announce]`.
+pub fn check_trait(trait_: &ItemTrait) {
+    check_no_defaulted_generics_of(trait_);
+    check_no_impl_trait_output_in(trait_);
+}
+
+/// [`check_trait`] for a trait used with `#[decycle(structural)]`: the rules both engines share
+/// (no `async fn`, no return-position `impl Trait`). A default on a generic parameter is a ranked
+/// engine rule only — the structural engine emits no rank argument, so a use site may leave a
+/// defaulted parameter out.
+///
+/// Behind `decycle::check(structural)`.
+pub fn check_trait_structural(trait_: &ItemTrait) {
+    check_no_impl_trait_output_in(trait_);
 }
 
 /// A `#[decycle]` trait listed as a supertrait of ANOTHER `#[decycle]` trait — both in the
@@ -3564,9 +3668,25 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
     // `replacing_table` is built, means every downstream consumer keyed on
     // `replacing_table`'s idents (leaf/inductive impls, the re-entry engine, diagnostics)
     // sees the local name for free.
+    //
+    // A trait received from a trampoline (`FinalizeArgs::parse`) is renamed already, by the entry
+    // that carried it, which knows which rename is its own (`receive_carried_trait`). A
+    // second, by-name pass would rename the wrong trait: a local `trait Walk` beside
+    // `#[decycle] use d::Walk as W`, or the carried `Y` of `use d::X as Y; use d::Y as Z`. So a
+    // pair whose alias a carried trait bears is done, and only a caller's own, unrenamed traits
+    // (the programmatic `FinalizeArgs`) are renamed here.
     let mut traits = args.traits.clone();
     for (original, local) in &args.renames {
-        if let Some(t) = traits.iter_mut().find(|t| &t.ident == original) {
+        let applied = traits
+            .iter()
+            .any(|t| is_carried(t) && &t.ident == local);
+        if applied {
+            continue;
+        }
+        if let Some(t) = traits
+            .iter_mut()
+            .find(|t| &t.ident == original && !is_carried(t))
+        {
             t.ident = local.clone();
         }
     }
@@ -3671,8 +3791,8 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
 
     // The decycle crate path. D1: an explicit programmatic override (`args.decycle_path`)
     // wins; otherwise recover it from the working list exactly as before: `process_module`
-    // always appends `#decycle::__finalize` as the final element (and the carrier-macro chain
-    // only ever pops from the front), so stripping the last segment yields the caller's
+    // always appends `#decycle::__finalize` as the final element (and the announce trampoline
+    // chain only ever drops its head), so stripping the last segment yields the caller's
     // `decycle = path` override verbatim. The carrier path always leaves `decycle_path: None`,
     // so this is byte-identical to today for every existing (attribute + carrier) caller.
     let decycle_path: Path = args.decycle_path.clone().unwrap_or_else(|| {
@@ -4063,6 +4183,125 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
             }
         }
     }
+}
+
+// Traits that reach a `#[decycle] use` site through an announce trampoline: the receiving end. A
+// trait is made available to `#[decycle] use` by announcing it where it is defined
+// (`#[announce(crate = ::decycle::announce)]`, optionally with `mock = path` and `decycle::check`).
+
+/// The carried item of one trampoline entry, as a trait. An item that is not a trait is rejected at
+/// the user's `#[decycle] use` (`entry.key`), not at the definition, which may be in another crate.
+fn entry_trait(entry: &announce::helper::Entry) -> ItemTrait {
+    match syn::parse2::<Item>(entry.item.clone()) {
+        Ok(Item::Trait(t)) => t,
+        _ => abort!(
+            syn::spanned::Spanned::span(&entry.key),
+            "#[decycle] use: `{}` is not a trait",
+            template_quote::ToTokens::to_token_stream(&entry.key).to_string()
+        ),
+    }
+}
+
+/// The name the module spells a carried trait by: what its `impl Tr for X` and bounds say.
+///
+/// The module's impls are matched against the carried trait by NAME, and the module spells the trait
+/// by the local name of its `#[decycle] use`: the last segment of the path (`#[decycle] use path::Tr;`
+/// names it `Tr`), or the alias if it has an `as` (`#[decycle] use path::Tr as Local;` names it
+/// `Local`, whatever the trait is called). `renames` holds the `(original, local)` pairs of the
+/// module's `as`es.
+///
+/// A stand-in (an entry with a `mock(path)` META, announced with `#[announce(mock = path)]`, such as
+/// announce-std's) is the real trait at `path`, so the name it is reached under has to be `path`'s
+/// last segment, or an alias given by an `as`. Otherwise the module's impls are not the stand-in's,
+/// and that is an error.
+fn carried_name(
+    entry: &announce::helper::Entry,
+    item_ident: &Ident,
+    renames: &[(Ident, Ident)],
+) -> Ident {
+    let mock = entry.mock();
+    let Some(used) = entry.key.path().segments.last().map(|seg| seg.ident.clone()) else {
+        return item_ident.clone();
+    };
+    let Some(path) = mock else {
+        return used;
+    };
+    let own = &path
+        .segments
+        .last()
+        .unwrap_or_else(|| abort!(path, "decycle: empty `mock` path"))
+        .ident;
+    if used == *own || renames.iter().any(|(_, local)| *local == used) {
+        return used;
+    }
+    abort!(
+        syn::spanned::Spanned::span(&entry.key),
+        "#[decycle] use: the stand-in `{}` is reached under a name other than `{}`, the trait it stands in for, and is not renamed", used, own;
+        help = "the module's `impl {} for ..` is matched to the trait by name, so give the `use` that name: `#[decycle] use path::to::{} as {};` (the real trait must be in scope under that name too, unless the stand-in imports it)", own, used, own
+    )
+}
+
+/// Receive one trampoline entry at `__finalize`: the announced trait, its generic parameters
+/// renamed to decycle's randomized names, and named as the module spells it (see [`carried_name`]).
+///
+/// The trait is marked ([`CARRIED_ATTR`]): its `#[decycle] use ... as` rename is applied here, once.
+/// An entry with a `mock(path)` META also records an absolute `path` (see [`MOCK_ATTR`]) for the
+/// places that name the trait itself.
+pub(crate) fn receive_carried_trait(
+    entry: &announce::helper::Entry,
+    renames: &[(Ident, Ident)],
+) -> ItemTrait {
+    let mut trait_item = entry_trait(entry);
+    let mut renamer = crate::randomize_impl_generics(&mut trait_item.generics, crate::get_random());
+    syn::visit_mut::VisitMut::visit_item_trait_mut(&mut renamer, &mut trait_item);
+    trait_item.ident = carried_name(entry, &trait_item.ident, renames);
+    if let Some(path) = entry.mock() {
+        if is_absolute(&path) {
+            let attr = Ident::new(MOCK_ATTR, Span::call_site());
+            trait_item.attrs.push(syn::parse_quote!(#[#attr(#path)]));
+        }
+    }
+    let attr = Ident::new(CARRIED_ATTR, Span::call_site());
+    trait_item.attrs.push(syn::parse_quote!(#[#attr]));
+    trait_item
+}
+
+/// The name of the inert attribute [`receive_carried_trait`] puts on every carried trait, saying
+/// that the `#[decycle] use ... as` rename of its entry has been applied to it. Read it with
+/// [`is_carried`].
+pub(crate) const CARRIED_ATTR: &str = "__decycle_carried";
+
+/// Whether `trait_item` was received from a trampoline ([`receive_carried_trait`]) and so already
+/// bears the name its module spells.
+pub(crate) fn is_carried(trait_item: &ItemTrait) -> bool {
+    trait_item
+        .attrs
+        .iter()
+        .any(|a| a.path().is_ident(CARRIED_ATTR))
+}
+
+/// The name of the inert attribute [`receive_carried_trait`] puts on a carried stand-in trait to
+/// record its real trait's absolute path. Carried traits' own attributes are never re-emitted by
+/// `finalize`, so it only travels inside the `ItemTrait`; read it with [`mock_path`].
+pub(crate) const MOCK_ATTR: &str = "__decycle_mock";
+
+/// The real trait's absolute path of a carried stand-in trait (`mock(path)` META), if any.
+pub(crate) fn mock_path(trait_item: &ItemTrait) -> Option<Path> {
+    trait_item
+        .attrs
+        .iter()
+        .find(|a| a.path().is_ident(MOCK_ATTR))
+        .and_then(|a| a.parse_args::<Path>().ok())
+}
+
+/// `::a::b`, `crate::..` or `$crate::..` (what announce turns the definer's `crate::` into): a
+/// path that names the same item from any module.
+fn is_absolute(path: &Path) -> bool {
+    path.leading_colon.is_some()
+        || path
+            .segments
+            .first()
+            .is_some_and(|s| s.ident == "crate" || s.ident == "$crate")
 }
 
 #[cfg(test)]

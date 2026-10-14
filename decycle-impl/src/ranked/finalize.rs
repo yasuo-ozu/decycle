@@ -490,9 +490,7 @@ fn emit_impl_items_leaf(
                             });
                         let s_ident = name!("DclSelf");
                         let s_ty: Type = parse_quote!(#s_ident);
-                        let trait_args = trait_.generics.ty_generics();
-                        let trait_base = original_trait_path(trait_);
-                        let trait_path_full: Path = parse_quote!(#trait_base #trait_args);
+                        let trait_path_full = original_trait_path(trait_);
                         let norm = normalize_reentry_sig(tf, &s_ty, &trait_path_full);
                         reentry_used_mask(trait_, &norm, &s_ident)
                     };
@@ -2214,8 +2212,11 @@ fn used_lifetime_idents(norm: &NormSig) -> std::collections::HashSet<String> {
 /// (`#[decycle(mock = path)]`, `#[announce(mock = path)]`) — by the real trait's absolute path.
 fn original_trait_path(trait_: &ItemTrait) -> Path {
     let trait_ident = &trait_.ident;
-    crate::ranked::carried::mock_path(trait_)
-        .unwrap_or_else(|| parse_quote!(super::super::#trait_ident))
+    let trait_args = trait_.generics.ty_generics();
+    match crate::ranked::carried::mock_path(trait_) {
+        Some(path) => parse_quote!(#path #trait_args),
+        None => parse_quote!(super::super::#trait_ident #trait_args),
+    }
 }
 
 /// Per trait × method: the `type_name` key marker ZST, the explicit fn-pointer type alias
@@ -2228,9 +2229,7 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize, _decycle: &Path) -> T
     let trait_ident = &trait_.ident;
     let s_ident = name!("DclSelf");
     let s_ty: Type = parse_quote!(#s_ident);
-    let trait_args = trait_.generics.ty_generics();
-    let trait_base = original_trait_path(trait_);
-    let trait_path_full: Path = parse_quote!(#trait_base #trait_args);
+    let trait_path_full = original_trait_path(trait_);
     // The `#fa` alias's body is a bare `fn(...) -> ...` type: a `Self::Assoc` return/param
     // (normalized to `<S as Trait>::Assoc` by `SelfSubst`) is a PROJECTION, which — unlike a
     // `where`-clause requirement — must be resolved the moment the alias is NAMED with a
@@ -2540,7 +2539,7 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize, _decycle: &Path) -> T
                 #(for (pat, ty) in &norm.params), { #pat: #ty }
             ) #out_tokens
             where
-                #s_ident: #trait_base #trait_args,
+                #s_ident: #trait_path_full,
                 #(for w in &trait_where) { #w, }
                 #(for w in &m_where) { #w, }
             {
@@ -2548,13 +2547,13 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize, _decycle: &Path) -> T
                 // present `{ ... }` when there's no `unsafe` to scope it for.
                 #(if unsafety.is_some()) {
                     unsafe {
-                        <#s_ident as #trait_base #trait_args>::#m_ident
+                        <#s_ident as #trait_path_full>::#m_ident
                         #(if do_turbofish) { ::<#(#orig_margs),*> }
                         (#(#param_pats),*)
                     }
                 }
                 #(if unsafety.is_none()) {
-                    <#s_ident as #trait_base #trait_args>::#m_ident
+                    <#s_ident as #trait_path_full>::#m_ident
                     #(if do_turbofish) { ::<#(#orig_margs),*> }
                     (#(#param_pats),*)
                 }

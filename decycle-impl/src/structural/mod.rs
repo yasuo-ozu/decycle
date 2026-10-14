@@ -44,12 +44,30 @@ pub(crate) use rho::*;
 /// crate, used to recognise `#[<crate>::decycle]` on inner items). For macro authors wrapping
 /// `#[decycle(structural)]`; most users should use the attribute.
 pub fn process_module(module: ItemMod, decycle: &Path) -> TokenStream {
-    match expand(module.clone(), None, decycle) {
+    match expand(module.clone(), None, decycle, None) {
         Ok(ts) => ts,
         Err(e) => {
             // Re-emit the module verbatim alongside the error so downstream code still sees the defs.
             let err = e.to_compile_error();
             quote! { #err #module }
+        }
+    }
+}
+
+/// [`process_module`] once `#[decycle]` has learnt, from the trampolines, the names of the traits its
+/// `#[decycle] use` items carry (`crate::discover`). Emits the module's BODY only: the module and its
+/// `#[decycle] use` items are already in place, the trampolines having been called from inside it.
+pub(crate) fn process_module_discovered(
+    module: ItemMod,
+    decycle: &Path,
+    discovered: &crate::discover::Discovered,
+) -> TokenStream {
+    match expand(module.clone(), None, decycle, Some(discovered)) {
+        Ok(ts) => ts,
+        Err(e) => {
+            let err = e.to_compile_error();
+            let items = module.content.map(|(_, items)| items).unwrap_or_default();
+            quote! { #err #(#items)* }
         }
     }
 }
@@ -76,7 +94,7 @@ pub fn process_module_with_graph(
 ) -> TokenStream {
     use crate::safegraph::graph::Graph;
     let allowed: HashSet<String> = graph.nodes().map(|n| n.to_string()).collect();
-    match expand(module.clone(), Some(&allowed), decycle) {
+    match expand(module.clone(), Some(&allowed), decycle, None) {
         Ok(ts) => ts,
         Err(e) => {
             let err = e.to_compile_error();
@@ -89,6 +107,7 @@ fn expand(
     mut module: ItemMod,
     allowed_types: Option<&HashSet<String>>,
     decycle: &Path,
+    discovered: Option<&crate::discover::Discovered>,
 ) -> syn::Result<TokenStream> {
     let decycle_crate = decycle
         .segments
@@ -117,7 +136,15 @@ fn expand(
 
     // Only impls of traits annotated `#[decycle]` in this module participate — collect their idents
     // and strip the `#[decycle]` attrs from the trait/use items.
-    let decycle_traits = collect_decycle_traits(brace_items, &decycle_crate);
+    let mut decycle_traits = collect_decycle_traits(brace_items, &decycle_crate);
+    if let Some(discovered) = discovered {
+        // The `#[decycle] use` items were emitted before the trampolines (see `crate::discover`), so
+        // they are not among the items; their names and the carried traits' are all they add.
+        for u in &discovered.uses {
+            collect_use_trait_idents(&u.tree, &mut decycle_traits);
+        }
+        decycle_traits.extend(discovered.carried.iter().map(|ident| ident.to_string()));
+    }
 
     // A caller supplying a graph is generating these impls, which means a cycle member and its helper
     // types are separate impls that each declare only their OWN leaf premises — and the generated
@@ -146,20 +173,28 @@ fn expand(
     }
 
     let items = brace_items.clone();
+    // The module as it stands, for a pass-through; with the trampolines already called from inside
+    // it (`discovered`), only its body: the module itself is in place.
+    let unchanged = |module: &ItemMod| -> TokenStream {
+        match (&module.content, discovered) {
+            (Some((_, items)), Some(_)) => quote! { #(#items)* },
+            _ => module.to_token_stream(),
+        }
+    };
 
     // No `#[decycle]`-annotated trait/use → no cyclic participants. Re-emit the module unchanged (its
     // inner `#[decycle]` attrs were already stripped in place): the impls are valid Rust on their own,
     // so a `structural` annotation on a module with nothing to unroll is a silent no-op, not an error.
     // (The ranked engine instead REQUIRES an annotated cycle and rejects this — `NO_DECYCLE_TRAITS_MSG`.)
     if decycle_traits.is_empty() {
-        return Ok(module.to_token_stream());
+        return Ok(unchanged(&module));
     }
 
     let model = Model::collect(&items, nonce)?;
     let sccs = model.cyclic_sccs(&decycle_traits, allowed_types);
     // Annotated traits present but they form no cycle — the same silent no-op pass-through.
     if sccs.is_empty() {
-        return Ok(module.to_token_stream());
+        return Ok(unchanged(&module));
     }
 
     let mut replaced_impls: HashSet<(String, String)> = HashSet::new();
@@ -236,6 +271,9 @@ fn expand(
         out.extend(codegen_scc(&model, scc)?);
     }
 
+    if discovered.is_some() {
+        return Ok(out);
+    }
     let attrs = &module.attrs;
     let vis = &module.vis;
     let unsafety = &module.unsafety;
@@ -263,6 +301,11 @@ fn collect_decycle_traits(items: &mut [Item], decycle_crate: &Ident) -> HashSet<
             Item::Use(u) => {
                 if take_decycle_attr(&mut u.attrs, decycle_crate) {
                     collect_use_trait_idents(&u.tree, &mut traits);
+                    // This engine reads no trait through the `use`: its name is all it takes, and
+                    // the module's impls spell the trait by it. Nothing else may name the import
+                    // (a trampoline that is only a macro, a stand-in that is only the real trait's
+                    // copy), so it would be reported unused.
+                    u.attrs.push(parse_quote!(#[allow(unused_imports)]));
                 }
             }
             _ => {}

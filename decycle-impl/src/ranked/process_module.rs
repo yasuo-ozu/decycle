@@ -96,7 +96,7 @@ fn process_trait_path(item: &Item) -> Vec<Path> {
 /// `(original_ident, local_alias)` for every `UseRename` (`use path::T as R;`) reachable
 /// from a `#[decycle] use` item — see `finalize::TraitRename`/L-C1. A plain `UseName`
 /// (`use path::T;`) needs no entry: the local name already matches the original.
-fn collect_trait_renames(item: &Item) -> Vec<(Ident, Ident)> {
+pub(crate) fn collect_trait_renames(item: &Item) -> Vec<(Ident, Ident)> {
     fn walk(tree: &UseTree, out: &mut Vec<(Ident, Ident)>) {
         match tree {
             UseTree::Path(UsePath { tree, .. }) => walk(tree, out),
@@ -423,7 +423,27 @@ pub fn process_module(
     recurse_level: usize,
     support_infinite_cycle: bool,
 ) -> TokenStream {
-    process_module_inner(module, None, decycle, recurse_level, support_infinite_cycle)
+    process_module_inner(module, None, decycle, recurse_level, support_infinite_cycle, None)
+}
+
+/// [`process_module`] once `#[decycle]` has learnt, from the trampolines, the names of the traits its
+/// `#[decycle] use` items carry (`crate::discover`). Emits the module's BODY only: the module and its
+/// `#[decycle] use` items are already in place, the trampolines having been called from inside it.
+pub(crate) fn process_module_discovered(
+    module: ItemMod,
+    decycle: &Path,
+    recurse_level: usize,
+    support_infinite_cycle: bool,
+    discovered: &crate::discover::Discovered,
+) -> TokenStream {
+    process_module_inner(
+        module,
+        None,
+        decycle,
+        recurse_level,
+        support_infinite_cycle,
+        Some(discovered),
+    )
 }
 
 /// [`process_module`], but with the participant set supplied by the caller instead of derived.
@@ -474,6 +494,7 @@ pub fn process_module_with_graph(
         decycle,
         recurse_level,
         support_infinite_cycle,
+        None,
     )
 }
 
@@ -483,6 +504,7 @@ fn process_module_inner(
     decycle: &Path,
     recurse_level: usize,
     support_infinite_cycle: bool,
+    discovered: Option<&crate::discover::Discovered>,
 ) -> TokenStream {
     // Value-level instantiation growth (a cyclic method reborrowing its own by-value generic
     // parameter) — neither engine can break it, and left alone it surfaces as a monomorphisation limit
@@ -500,7 +522,7 @@ fn process_module_inner(
     // The decycle crate name as passed to the macro (leading segment of `decycle = …`, default
     // `decycle`) — used to match `#[<crate>::decycle]` on inner items without reading the manifest.
     let decycle_crate = &decycle.segments.first().unwrap().ident;
-    let (traits, working_list, renames): (Vec<_>, Vec<_>, Vec<_>) = contents.iter_mut().fold(
+    let (traits, mut working_list, mut renames): (Vec<_>, Vec<_>, Vec<_>) = contents.iter_mut().fold(
         Default::default(),
         |(mut traits, mut working_list, mut renames), item| {
             match item {
@@ -531,13 +553,24 @@ fn process_module_inner(
             (traits, working_list, renames)
         },
     );
-    proc_macro_error::set_dummy(
+    // `#[decycle] use` items that were emitted ahead of the trampolines (see `crate::discover`) are
+    // not in `contents`; they route traits all the same.
+    if let Some(discovered) = discovered {
+        for item in discovered.uses.iter().cloned().map(Item::Use) {
+            working_list.extend(process_trait_path(&item));
+            renames.extend(collect_trait_renames(&item));
+        }
+    }
+    let body_only = discovered.is_some();
+    proc_macro_error::set_dummy(if body_only {
+        quote! { #(for content in contents.clone()) { #content } }
+    } else {
         quote! {
             #{&module.vis} #{&module.unsafety} mod #{&module.ident} {
                 #(for content in contents.clone()) { #content }
             }
-        },
-    );
+        }
+    });
     if let Err(e) = growth {
         abort!(e.span(), "{}", e);
     }
@@ -614,6 +647,7 @@ fn process_module_inner(
         .iter()
         .filter_map(|path| path.segments.last().map(|seg| seg.ident.clone()))
         .chain(traits.iter().map(|ItemTrait { ident, .. }| ident.clone()))
+        .chain(discovered.into_iter().flat_map(|d| d.carried.iter().cloned()))
         .collect();
     // Head idents of the types that IMPLEMENT a cyclic trait here — the only heads a bare cyclic
     // where-bound may target (besides `Self` / an impl type-param). A bound whose head is a foreign
@@ -764,20 +798,25 @@ fn process_module_inner(
         decycle_path: None,
     };
     args.working_list.push(parse_quote!(#decycle::__finalize));
+    let body = quote! {
+        #(for alias_item in &alias_items) { #alias_item }
+
+        #(for raw_content in raw_contents) { #raw_content }
+
+        #(if first_path.is_some()) {
+            #{ args.cont_list().invoke(args.rest_tokens()) }
+        }
+        #(else) {
+            #{ crate::finalize::finalize(args) }
+        }
+    };
+    if body_only {
+        return body;
+    }
     quote! {
         #(for attr in &module.attrs) { #attr }
         #{&module.vis} #{&module.unsafety} #{&module.mod_token} #{&module.ident} {
-
-            #(for alias_item in &alias_items) { #alias_item }
-
-            #(for raw_content in raw_contents) { #raw_content }
-
-            #(if first_path.is_some()) {
-                #{ args.cont_list().invoke(args.rest_tokens()) }
-            }
-            #(else) {
-                #{ crate::finalize::finalize(args) }
-            }
+            #body
         }
     }
 }

@@ -1,0 +1,10 @@
+error[E0252]: the name `Display` is defined multiple times
+ --> tests/ui/announce_std_real_trait_in_scope.rs:9:9
+  |
+7 |     use core::fmt::Display;
+  |         ------------------ previous import of the trait `Display` here
+8 |     #[decycle]
+9 |     use announce_std::fmt::Display;
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^ `Display` reimported here
+  |
+  = note: `Display` must be defined only once in the type namespace of this module

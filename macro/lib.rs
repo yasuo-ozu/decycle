@@ -7,6 +7,7 @@ use syn::parse::{Parse, ParseStream};
 use syn::*;
 use template_quote::quote;
 
+use decycle_impl::discover;
 use decycle_impl::process_module;
 use decycle_impl::process_module_structural;
 use decycle_impl::{check_trait, check_trait_structural};
@@ -159,7 +160,7 @@ impl Parse for Args {
 fn abort_removed_option(span: proc_macro2::Span, name: &str) -> ! {
     let help = match name {
         "mock" => "announce the trait with `#[::decycle::announce::announce(crate = ::decycle::announce, mock = path::to::RealTrait)]`",
-        "alter_macro_name" => "announce the trait with `#[::decycle::announce::announce(crate = ::decycle::announce, macro_name = Name)]` to rename its trampoline (a `#[decycle] mod` then needs `use path::to::Trait;` and `#[decycle] use path::to::Name as Trait;`), or with `mock = path::to::RealTrait` to declare a stand-in for another trait",
+        "alter_macro_name" => "announce the trait with `#[::decycle::announce::announce(crate = ::decycle::announce, macro_name = Name)]` to rename its trampoline (a `#[decycle] mod` then needs `use path::to::Trait;` and `#[decycle] use path::to::Name;`), or with `mock = path::to::RealTrait` to declare a stand-in for another trait",
         _ => "nothing replaces it: `#[announce]` requires every path in the trait to resolve outside the defining module, so spell them absolutely (`crate::..`, `::krate::..`)",
     };
     abort!(
@@ -244,7 +245,12 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
                     "recurse_level / support_infinite_cycle are not supported with `structural`"
                 )
             }
-            process_module_structural(module, &decycle_path)
+            // A module whose `#[decycle] use` does not say which trait it carries learns it from the
+            // trampoline first (`__discover`); any other is expanded at once.
+            match discover::start(&module, &decycle_path, discover::Engine::Structural) {
+                Some(ret) => ret,
+                None => process_module_structural(module, &decycle_path),
+            }
         } else {
             let recurse_level = args.recurse_level.unwrap_or(10);
             if recurse_level == 0 {
@@ -255,7 +261,14 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
                 )
             }
             let support_infinite_cycle = args.support_infinite_cycle.unwrap_or(true);
-            process_module(module, &decycle_path, recurse_level, support_infinite_cycle)
+            let engine = discover::Engine::Ranked {
+                recurse_level,
+                support_infinite_cycle,
+            };
+            match discover::start(&module, &decycle_path, engine) {
+                Some(ret) => ret,
+                None => process_module(module, &decycle_path, recurse_level, support_infinite_cycle),
+            }
         };
         // Process FIRST so the dummy fallback is the (valid) expanded module, THEN reject unsupported
         // args — matching the original ordering so an unsupported-arg abort doesn't cascade.
@@ -302,6 +315,15 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
 pub fn __finalize(input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(input as decycle_impl::finalize::FinalizeArgs);
     decycle_impl::finalize::finalize(args).into()
+}
+
+/// The callback of a module whose `#[decycle] use` needed the trampolines for the names of its
+/// traits (`decycle_impl::discover`): expands the rest of the module. Called by `#[decycle]`.
+#[doc(hidden)]
+#[proc_macro]
+#[proc_macro_error]
+pub fn __discover(input: TokenStream) -> TokenStream {
+    discover::finish(input.into()).into()
 }
 
 /// The implementation of `decycle::check`: validates a trait at its definition (see the docs of

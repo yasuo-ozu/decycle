@@ -102,6 +102,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --no-deps
+      # The crate docs also build with the features off. They link to items that only exist with a
+      # feature on, and an intra-doc link to one is an unresolved link (an error here) without it.
+      - run: cargo doc -p decycle --no-deps --no-default-features
 
   # Miri catches what the ordinary suite cannot: the crate's generated code transmutes fn
   # pointers (ranked floor) and type-puns values (structural casts), and three separate UB

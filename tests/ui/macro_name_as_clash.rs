@@ -1,19 +1,24 @@
-//! A trait announced with `macro_name = WalkMac` (the 0.5 `alter_macro_name`) is `#[decycle] use`d
-//! through its trampoline `WalkMac`. The module's `impl Walk for ..` can only be matched to the trait
-//! by name, so `use` the trampoline `as Walk` (and the trait itself with a plain `use`). (Left
-//! unrenamed, it used to fail with an unrelated E0275, the cycle unexpanded.)
+//! `#[decycle] use d::WalkMac as Walk;` beside `use d::Walk;` when a macro named `Walk` shares the
+//! path of the trait: `use d::Walk;` imports the trait AND that macro, and a `use` imports every
+//! namespace of what it names, so `Walk` is defined twice in the macro namespace. Use the trampoline
+//! under its own name (`#[decycle] use d::WalkMac;`, see `tests/macro_name_clash.rs`).
 pub mod d {
     #[decycle::announce::announce(crate = ::decycle::announce, macro_name = WalkMac)]
     pub trait Walk {
         fn walk(&self, depth: usize) -> usize;
     }
+
+    macro_rules! walk_m {
+        ($($t:tt)*) => {};
+    }
+    pub(crate) use walk_m as Walk;
 }
 
 #[decycle::decycle]
 mod m {
     use crate::d::Walk;
     #[decycle]
-    use crate::d::WalkMac;
+    use crate::d::WalkMac as Walk;
 
     pub struct A(pub Option<Box<B>>);
     pub struct B(pub Option<Box<A>>);

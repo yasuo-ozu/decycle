@@ -18,7 +18,7 @@ Notable changes, following [Keep a Changelog](https://keepachangelog.com/) and
   | was | now |
   | --- | --- |
   | `#[decycle]` | `#[announce(crate = ::decycle::announce)]` |
-  | `alter_macro_name = N` | `#[announce(.., macro_name = N)]`, or `mock = path`; a module then writes both `use super::d::Walk;` and `#[decycle] use super::d::WalkMac as Walk;` (the trampoline under the trait's name; the two live in different namespaces) |
+  | `alter_macro_name = N` | `#[announce(.., macro_name = N)]`, or `mock = path`; a module then writes both `use super::d::Walk;` (the trait) and `#[decycle] use super::d::WalkMac;` (its trampoline; the two live in different namespaces) |
   | `decycle = path` | none (pass `crate = ::renamed::announce` if you renamed the dependency) |
   | `marker = path` | none: write the trait's paths absolutely (`crate::..`, `::krate::..`) |
   | `allowed_paths = [..]` | none: `allow_std_prelude = true` accepts the bare std prelude names |
@@ -54,36 +54,50 @@ Notable changes, following [Keep a Changelog](https://keepachangelog.com/) and
   `NodeIxRef`/`EdgeIxRef` handles (`ctx.node_indices()`, `ctx.edge_indices()`), turned into the
   copyable `NodeIx`/`EdgeIx` with `.to_ix()`, and `ctx.endpoints(e)` is an iterator rather than an
   array.
-- **`#[decycle] use` checks the trampoline's name.** The module's `impl Tr for ..` is matched to the
-  trait by name, so a trampoline named differently from its trait — a `macro_name = N` trait, or a
-  `mock = path` stand-in with a name of its own — has to be renamed with `as`
-  (`#[decycle] use path::WalkMac as Walk;`, `#[decycle] use stand::Sz as Size;`). Left unrenamed, the
-  impls would not be matched to the trait and the module would fail with an unrelated `E0275`, so
-  it is an error that names the `as` to write. The alias is the name the impls spell, so a stand-in
-  `use`d `as` a third name (`use real::Size as Cnt; #[decycle] use stand::Sz as Cnt;`) works too.
+- **A trampoline named differently from its trait: `#[decycle] use path::N;`.** The module's
+  `impl Tr for ..` is matched to the trait by name. A trait announced with `macro_name = N` is
+  brought in by `use path::Tr;` (the trait) and `#[decycle] use path::N;` (its trampoline). decycle
+  asks the trampoline which trait it carries, and the module spells the trait by its own name, which
+  the plain `use` supplies; the question is one more trampoline call, made only for a module that has
+  an `impl` of a trait that nothing marked `#[decycle]` names but a plain `use`. The earlier recipe,
+  `#[decycle] use path::N as Tr;`, still works, but not when a derive or attribute macro named `Tr`
+  shares the path: `use path::Tr;` imports it too, and `as Tr` defines `Tr` twice in the macro
+  namespace (E0252). A trampoline that is reached under another name only because it is re-exported
+  (`pub use d::Tr as Step;`) works the same way.
+- **A stand-in named differently from the trait it stands in for has to be renamed**
+  (`mock = path` with a name of its own: `#[decycle] use stand::Sz as Size;`). A stand-in is not the
+  trait, so left unrenamed the impls would not be matched to it and the module would fail with an
+  unrelated `E0275`; it is an error that names the `as` to write, in both engines. The alias is the
+  name the impls spell, so a stand-in `use`d `as` a third name
+  (`use real::Size as Cnt; #[decycle] use stand::Sz as Cnt;`) works too. Under
+  `#[decycle(structural)]`, which reads no trait through a `#[decycle] use`, the `use` is exempt from
+  `unused_imports`, so such a renamed trampoline does not fail `#![deny(warnings)]`.
 
 ### Added
 
 - `decycle::announce`, the re-export of the announce crate (feature `announce`), and
-  `decycle::check` (`decycle_impl::check_trait` for the programmatic API): list it among the options
-  of `#[announce]` to validate a trait at its definition. It rejects a default on a generic parameter,
-  a return-position `impl Trait` in a method and an `async fn` in a method, the rules that depend on
-  the trait alone, with the error a `#[decycle]` module would give when it receives the trait.
-  The default-parameter rule belongs to the ranked engine only, and `decycle::check` enforces the
-  ranked engine's rules; `decycle::check(structural)` (`decycle_impl::check_trait_structural`) skips
-  it for a trait meant for `#[decycle(structural)]`, which accepts a default.
+  `decycle::check`: list it among the options of `#[announce]` to validate a trait at its
+  definition. It rejects a default on a generic parameter, a return-position `impl Trait` in a
+  method and an `async fn` in a method, the rules that depend on the trait alone, with the error a
+  `#[decycle]` module would give when it receives the trait. The default-parameter rule belongs to
+  the ranked engine only, and `decycle::check` enforces the ranked engine's rules;
+  `decycle::check(structural)` skips it for a trait meant for `#[decycle(structural)]`, which accepts
+  a default. (The functions behind them in `decycle-impl` are internal, `#[doc(hidden)]`, and not an
+  API.)
 - A plain `#[announce]` trait can be brought in with `#[decycle] use`, including an
   `#[announce(mock = ..)]` copy such as `announce_std::fmt::Display` (treated as the real trait).
   `#[announce(mock = path)]` declares a stand-in for the real trait at `path`: only its trampoline
   `Stand!` is emitted, at the item's path and visibility, and `#[decycle] use` sites treat the entry
   as the real trait (its ident becomes `path`'s last segment, so `impl RealTrait for X` is matched).
-- `#[decycle] use` of an announced item that is not a trait is a clear error
-  (`#[decycle] use: 'X!' is not a trait`).
+- `#[decycle] use` of an announced item that is not a trait is a clear error at the `use`
+  (`` #[decycle] use: `X!` is not a trait ``), not at the definition, which may be in another crate.
 
 ### Fixed
 
 - Nested `#[cfg]`s in a foreign announced trait are evaluated in the defining crate, so a
-  cfg'd-out method no longer reaches the `#[decycle] use` site (`E0576` before).
+  cfg'd-out method no longer reaches the `#[decycle] use` site. In 0.5.3 the consuming crate
+  evaluated them, and a method gated with `#[cfg(any())]` failed with `E0576` (cannot find method
+  `gone` in trait `Gen`).
 - `$crate` and `$(..)*` macros in default method bodies of a foreign announced trait work.
 
 ## [0.5.3] — 2026-09-27

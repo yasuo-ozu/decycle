@@ -1,6 +1,6 @@
-error: #[decycle] use: the stand-in `Sz` is named differently from the trait `Size` it stands in for, and is not renamed
+error: #[decycle] use: the stand-in `Sz` is reached under a name other than `Size`, the trait it stands in for, and is not renamed
 
-         = help: the module's `impl Size for ..` is matched to the trait by name, so give the `use` that name: `#[decycle] use path::to::Sz as Size;`, and keep the real trait `Size` in scope
+         = help: the module's `impl Size for ..` is matched to the trait by name, so give the `use` that name: `#[decycle] use path::to::Sz as Size;` (the real trait must be in scope under that name too, unless the stand-in imports it)
 
   --> tests/ui/mock_stand_in_name_mismatch.rs:21:23
    |

@@ -6,6 +6,8 @@
 #![doc = include_str!("README.md")]
 
 #[doc(hidden)]
+pub use decycle_macro::__discover;
+#[doc(hidden)]
 pub use decycle_macro::__finalize;
 
 /// Re-export of the [`announce`](https://docs.rs/announce) crate, so that a crate can announce its
@@ -143,7 +145,7 @@ pub use decycle_impl::safegraph;
 /// | 0.5 `#[decycle(..)]` on a trait | now |
 /// | --- | --- |
 /// | `#[decycle]` | `#[announce(crate = ::decycle::announce)]` |
-/// | `alter_macro_name = N` | `#[announce(.., macro_name = N)]`, or `mock = path`. A module then writes both `use path::Trait;` and `#[decycle] use path::N as Trait;` (below) |
+/// | `alter_macro_name = N` | `#[announce(.., macro_name = N)]`, or `mock = path`. A module then writes both `use path::Trait;` and `#[decycle] use path::N;` (below) |
 /// | `decycle = path` | none; the trait no longer names decycle (`crate = ::my_rename::announce` if you renamed it) |
 /// | `marker = path` | none; announce checks the trait's paths at its definition: write them absolutely (`crate::..`, `::krate::..`) |
 /// | `allowed_paths = [..]` | none; `allow_std_prelude = true` accepts the bare std prelude names (`Clone`, `Vec<u8>`) |
@@ -151,15 +153,24 @@ pub use decycle_impl::safegraph;
 ///
 /// A trait announced with `macro_name = N` has a trampoline `N!` that is not named like the trait (so
 /// that a derive or attribute macro can keep the trait's name). The module's `impl Trait for ..` is
-/// matched to the trait by name, so the `#[decycle] use` gives the trampoline the trait's name with an
-/// `as`, and the trait itself is a plain `use` (the two live in different namespaces):
+/// matched to the trait by name, and the trait is brought in by a plain `use`, beside the
+/// `#[decycle] use` of its trampoline (the two live in different namespaces):
 ///
 /// ```text
-/// use super::d::Walk;                          // the trait
-/// #[decycle] use super::d::WalkMac as Walk;    // its trampoline, named like the trait
+/// use super::d::Walk;                  // the trait
+/// #[decycle] use super::d::WalkMac;    // its trampoline
 /// ```
 ///
-/// Without the `as`, the `#[decycle] use` is an error that says so.
+/// A `#[decycle] use` without an `as` does not say which trait it carries, so decycle asks the
+/// trampoline (`Walk`) when the module has an `impl` of a trait that no `#[decycle]` item names but
+/// a plain `use` does. That is one more trampoline call at the expansion of such a module, and no
+/// other module pays it. The plain `use` must be written in the module itself; a glob import
+/// (`use super::*;`) is not looked at.
+///
+/// Do not write `#[decycle] use super::d::WalkMac as Walk;` when a derive or attribute macro named
+/// `Walk` shares the path: `use super::d::Walk;` imports the trait **and** that macro, and a `use`
+/// cannot import only one of the namespaces of a name, so `as Walk` would define `Walk` twice in the
+/// macro namespace (E0252). The `as` form is for a trampoline whose name is free to take.
 ///
 /// ### Stand-ins for traits you do not own
 /// `#[announce(mock = path::to::RealTrait)]` on a trait declares it a copy of the real trait at
@@ -168,9 +179,49 @@ pub use decycle_impl::safegraph;
 /// at the stand-in's path and visibility. `#[decycle] use path::to::Stand;` then brings in the copy
 /// as the **real** trait, so the module's impls implement `RealTrait`. Name the stand-in like the
 /// real trait, or `#[decycle] use path::to::Stand as RealTrait;` when its name differs (a stand-in
-/// `use`d under another name without the `as` is an error), keep the real trait in scope under that
-/// name, and spell `mock = ..` absolutely (`crate::..`, `::krate::..`).
-/// [`announce-std`](https://docs.rs/announce-std) provides such copies for the traits of `std`.
+/// `use`d under another name without the `as` is an error, in both engines), and spell
+/// `mock = ..` absolutely (`crate::..`, `::krate::..`).
+///
+/// A stand-in written by hand imports nothing but its trampoline, so the module also `use`s the
+/// real trait under that name (below). [`announce-std`](https://docs.rs/announce-std)'s copies of the
+/// traits of `std` work as they are: `announce_std::fmt::Display` is the real trait in the type
+/// namespace as well as the trampoline, so `#[decycle] use announce_std::fmt::Display;` is all a
+/// module writes, and `use core::fmt::Display;` beside it is an error (`Display` defined twice).
+///
+/// ```rust
+/// #[decycle::decycle]
+/// mod shapes {
+///     #[decycle]
+///     use announce_std::fmt::Display;
+///
+///     pub struct Pair(pub Option<Box<Tag>>);
+///     pub struct Tag(pub Option<Box<Pair>>);
+///
+///     impl Display for Pair where Tag: Display {
+///         fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+///             match &self.0 {
+///                 Some(t) => write!(f, "Pair({})", t),
+///                 None => write!(f, "Pair"),
+///             }
+///         }
+///     }
+///     impl Display for Tag where Pair: Display {
+///         fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+///             match &self.0 {
+///                 Some(p) => write!(f, "Tag({})", p),
+///                 None => write!(f, "Tag"),
+///             }
+///         }
+///     }
+/// }
+///
+/// fn main() {
+///     let p = shapes::Pair(Some(Box::new(shapes::Tag(None))));
+///     assert_eq!(p.to_string(), "Pair(Tag)");
+/// }
+/// ```
+///
+/// A hand-written stand-in, and the real trait beside it:
 ///
 /// ```rust
 /// pub mod real {
@@ -329,7 +380,7 @@ pub use decycle_macro::decycle;
 /// Checks a trait at its definition: it can take part in a `#[decycle]` cycle.
 ///
 /// A trait is made available to `#[decycle] use` by announcing it with the
-/// [`announce`](https://docs.rs/announce) attribute (re-exported as [`announce`](mod@crate::announce)).
+/// [`announce`](https://docs.rs/announce) attribute (re-exported as `decycle::announce`).
 /// `#[decycle]` reads the trait through its trampoline, so nothing else is needed. Without this
 /// check the trait is validated only when a `#[decycle]` module receives it, and the error appears
 /// there. List `decycle::check` among the options of `#[announce]` to get the error at the trait:

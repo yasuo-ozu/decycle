@@ -1,0 +1,22 @@
+error[E0252]: the name `Walk` is defined multiple times
+  --> tests/ui/macro_name_as_clash.rs:21:9
+   |
+19 |     use crate::d::Walk;
+   |         -------------- previous import of the macro `Walk` here
+20 |     #[decycle]
+21 |     use crate::d::WalkMac as Walk;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^ `Walk` reimported here
+   |
+   = note: `Walk` must be defined only once in the macro namespace of this module
+help: you can use `as` to change the binding name of the import
+   |
+21 |     use crate::d::WalkMac as OtherWalk;
+   |                              +++++
+
+warning: unused import: `crate::d::WalkMac as Walk`
+  --> tests/ui/macro_name_as_clash.rs:21:9
+   |
+21 |     use crate::d::WalkMac as Walk;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

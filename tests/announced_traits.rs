@@ -144,7 +144,9 @@ fn structural_check_accepts_a_defaulted_parameter() {
 // A trampoline renamed with `macro_name = N` (what 0.5 called `alter_macro_name`), which keeps the
 // trait's name free for a derive or attribute macro of the same name. A module that receives it
 // `use`s the trait itself, and the trampoline under the trait's name: `use path::N as Trait;`
-// (macro namespace) beside `use path::Trait;` (type namespace).
+// (macro namespace) beside `use path::Trait;` (type namespace). That spelling is for a trampoline
+// whose name `Trait` is free to take in the macro namespace; `tests/macro_name_clash.rs` has the
+// unrenamed `use path::N;` that works when it is not.
 mod renamed_trampoline {
     #[decycle::announce::announce(crate = ::decycle::announce, macro_name = WalkMac)]
     pub trait Walk {

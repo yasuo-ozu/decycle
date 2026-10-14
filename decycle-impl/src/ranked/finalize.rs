@@ -3669,9 +3669,25 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
     // `replacing_table` is built, means every downstream consumer keyed on
     // `replacing_table`'s idents (leaf/inductive impls, the re-entry engine, diagnostics)
     // sees the local name for free.
+    //
+    // A trait received from a trampoline (`FinalizeArgs::parse`) is renamed already, by the entry
+    // that carried it, which knows which rename is its own (`carried::receive_carried_trait`). A
+    // second, by-name pass would rename the wrong trait: a local `trait Walk` beside
+    // `#[decycle] use d::Walk as W`, or the carried `Y` of `use d::X as Y; use d::Y as Z`. So a
+    // pair whose alias a carried trait bears is done, and only a caller's own, unrenamed traits
+    // (the programmatic `FinalizeArgs`) are renamed here.
     let mut traits = args.traits.clone();
     for (original, local) in &args.renames {
-        if let Some(t) = traits.iter_mut().find(|t| &t.ident == original) {
+        let applied = traits
+            .iter()
+            .any(|t| crate::ranked::carried::is_carried(t) && &t.ident == local);
+        if applied {
+            continue;
+        }
+        if let Some(t) = traits
+            .iter_mut()
+            .find(|t| &t.ident == original && !crate::ranked::carried::is_carried(t))
+        {
             t.ident = local.clone();
         }
     }
@@ -3769,6 +3785,14 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
         for (original, local) in &args.renames {
             if original != local && seen.insert(original.to_string()) {
                 out.push(original.clone());
+            }
+        }
+        // The name a carried trait's trampoline was reached under is shadowed likewise: its `use`
+        // may import the trait under that name too (`pub use d::Tr as Step;` imports `Step` as the
+        // trait as well as the trampoline), which would make the trait applicable through it.
+        for via in traits.iter().filter_map(crate::ranked::carried::carried_via) {
+            if seen.insert(via.to_string()) {
+                out.push(via);
             }
         }
         out

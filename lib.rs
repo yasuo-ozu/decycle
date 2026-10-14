@@ -8,12 +8,8 @@
 #[doc(hidden)]
 pub use decycle_macro::__finalize;
 
-/// Re-export of the [`announce`](https://docs.rs/announce) crate, so that a crate can announce its
-/// traits for `#[decycle] use` without depending on `announce` itself:
-/// `#[decycle::announce::announce(crate = ::decycle::announce, decycle::check)]`. The option
-/// `crate = ..` tells `#[announce]` where its runtime is; it is optional for a crate that depends on
-/// `announce` directly. Needs the `announce` feature (on by default); it is built without `std`, so a
-/// `#![no_std]` crate can announce a trait. See [`check`].
+/// Re-export of the [`announce`](https://docs.rs/announce) crate, which `#[decycle]` on a trait
+/// outside a module expands to.
 #[cfg(feature = "announce")]
 pub use announce;
 
@@ -48,8 +44,8 @@ pub use decycle_impl::analysis;
 /// [`analysis::analyze_module`] returns without depending on `safegraph` themselves.
 #[cfg(feature = "api")]
 pub use decycle_impl::safegraph;
-/// Attribute macro that expands a module to break circular trait obligations within it. Also see
-/// module-level documentation.
+/// Attribute macro that expands a module or trait to break circular trait
+/// obligations within the annotated module. Also see module-level documentation.
 ///
 /// # Two engines
 ///
@@ -65,14 +61,13 @@ pub use decycle_impl::safegraph;
 /// compile time; ranked can re-enter across several instantiations of a generic method, but a residual
 /// set of shapes fails closed at runtime). See the crate README's *Two algorithms* section for the full
 /// per-engine matrix. Both engines require the whole cycle in one *inline* `#[decycle]` module over
-/// traits **you** annotate — either `#[decycle]` on a trait defined in the module, or a
-/// `#[decycle] use` of a trait announced elsewhere (see
-/// [Traits outside the module](#traits-outside-the-module)).
+/// traits **you** annotate — either `#[decycle]` on the trait definition, or a `#[decycle] use` of a
+/// trait defined elsewhere.
 ///
 /// ```rust
 /// # use decycle::decycle;
-/// // A trait outside the module is announced, not annotated with `#[decycle]`.
-/// #[decycle::announce::announce(crate = ::decycle::announce)]
+/// // This annotation is required to be used within #[decycle] module
+/// #[decycle]
 /// trait A {
 ///     fn a(&self) -> ::core::primitive::usize;
 /// }
@@ -125,112 +120,12 @@ pub use decycle_impl::safegraph;
 ///
 ///   An empty `#[decycle]` module is rejected by both engines. A module with no `#[decycle]`-annotated
 ///   cycle is rejected by the ranked engine and treated as a silent no-op by the structural engine.
-///
-/// ### Traits outside the module
-/// A trait defined outside a `#[decycle]` module is announced with
-/// [`#[announce]`](https://docs.rs/announce/latest/announce/attr.announce.html) (re-exported as
-/// `decycle::announce`): that makes its definition available to any crate, and
-/// `#[decycle] use path::to::Trait;` brings it into a module. `#[decycle]` on such a trait expands to
-/// `#[announce(crate = ::decycle::announce)]`; write `#[announce]` itself for its options.
-///
-/// ```text
-/// #[decycle::announce::announce(crate = ::decycle::announce, decycle::check)]
-/// pub trait Trait { .. }
-/// ```
-///
-/// The options of 0.5's `#[decycle]` on a trait map to:
-///
-/// | 0.5 `#[decycle(..)]` on a trait | now |
-/// | --- | --- |
-/// | `#[decycle]` | `#[decycle]` (expands to `#[announce(crate = ::decycle::announce)]`) |
-/// | `alter_macro_name = N` | none; `#[decycle] use` the trait by its own name |
-/// | `decycle = path` | unchanged; the trait is announced with `crate = path::announce` |
-/// | `marker = path` | none; announce checks the trait's paths at its definition: write them absolutely (`crate::..`, `::krate::..`) |
-/// | (checks at use) | `decycle::check`, see [`check`] |
-///
-/// ### Stand-ins for traits you do not own
-/// `#[announce(mock = path::to::RealTrait)]` on a trait declares it a copy of the real trait at
-/// that path (which need not be announced, and may live in another crate). announce does not emit
-/// the stand-in as a trait in place: it only emits its trampoline macro, named after the stand-in,
-/// at the stand-in's path and visibility. `#[decycle] use path::to::Stand;` then brings in the copy
-/// as the **real** trait, so the module's impls implement `RealTrait`. Name the stand-in like the
-/// real trait, or `#[decycle] use path::to::Stand as RealTrait;` when its name differs (the ranked
-/// engine rejects a stand-in `use`d under another name without the `as`; the structural engine reads
-/// no trait through a `use`, so it cannot tell, and the module fails with an unrelated `E0275`), and
-/// spell `mock = ..` absolutely (`crate::..`, `::krate::..`).
-///
-/// A stand-in written by hand imports nothing but its trampoline, so the module also `use`s the
-/// real trait under that name (below). [`announce-std`](https://docs.rs/announce-std)'s copies of the
-/// traits of `std` work as they are: `announce_std::fmt::Display` is the real trait in the type
-/// namespace as well as the trampoline, so `#[decycle] use announce_std::fmt::Display;` is all a
-/// module writes, and `use core::fmt::Display;` beside it is an error (`Display` defined twice).
-///
-/// ```rust
-/// #[decycle::decycle]
-/// mod shapes {
-///     #[decycle]
-///     use announce_std::fmt::Display;
-///
-///     pub struct Pair(pub Option<Box<Tag>>);
-///     pub struct Tag(pub Option<Box<Pair>>);
-///
-///     impl Display for Pair where Tag: Display {
-///         fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-///             match &self.0 {
-///                 Some(t) => write!(f, "Pair({})", t),
-///                 None => write!(f, "Pair"),
-///             }
-///         }
-///     }
-///     impl Display for Tag where Pair: Display {
-///         fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-///             match &self.0 {
-///                 Some(p) => write!(f, "Tag({})", p),
-///                 None => write!(f, "Tag"),
-///             }
-///         }
-///     }
-/// }
-///
-/// fn main() {
-///     let p = shapes::Pair(Some(Box::new(shapes::Tag(None))));
-///     assert_eq!(p.to_string(), "Pair(Tag)");
-/// }
-/// ```
-///
-/// A hand-written stand-in, and the real trait beside it:
-///
-/// ```rust
-/// pub mod real {
-///     pub trait Size { fn size(&self) -> usize; }
-/// }
-/// pub mod stand {
-///     #[decycle::announce::announce(crate = ::decycle::announce, mock = crate::real::Size)]
-///     pub trait Size { fn size(&self) -> usize; }
-/// }
-///
-/// #[decycle::decycle]
-/// mod tree {
-///     use crate::real::Size;
-///     #[decycle]
-///     use crate::stand::Size;
-///
-///     pub struct Node(pub Vec<Leaf>);
-///     pub struct Leaf(pub Option<Box<Node>>);
-///     impl Size for Node where Leaf: Size {
-///         fn size(&self) -> usize { 1 + self.0.iter().map(|l| l.size()).sum::<usize>() }
-///     }
-///     impl Size for Leaf where Node: Size {
-///         fn size(&self) -> usize { self.0.as_ref().map_or(1, |n| n.size()) }
-///     }
-/// }
-///
-/// fn main() {
-///     use real::Size;
-///     let t = tree::Node(vec![tree::Leaf(None), tree::Leaf(Some(Box::new(tree::Node(vec![]))))]);
-///     assert_eq!(t.size(), 3);
-/// }
-/// ```
+/// - **Trait** (defined out of `#[decycle]` module):
+///   - `#[decycle::decycle(decycle = path)]`: announces the trait with
+///     [`#[announce]`](https://docs.rs/announce) (`crate = path::announce`), so that
+///     `#[decycle] use` can bring it into a module from any crate. Paths in the trait must be
+///     absolute (`crate::..`, `::krate::..`). For announce's own options, write
+///     `#[decycle::announce::announce(crate = ::decycle::announce, ..)]`; see also [`check`].
 ///
 /// ### Impl where-clause bounds
 /// In `impl` blocks inside a `#[decycle]` module, avoid constraining
@@ -239,7 +134,7 @@ pub use decycle_impl::safegraph;
 ///
 /// ```rust,compile_fail
 /// # use decycle::decycle;
-/// #[decycle::announce::announce(crate = ::decycle::announce)]
+/// #[decycle]
 /// pub trait MyTrait<'a> {
 ///     type Assoc;
 /// }
@@ -329,129 +224,24 @@ pub use decycle_impl::safegraph;
 /// `#[track_caller]`, `no_std`, higher-order `Self`-mentioning arguments
 /// (`fn(&Self)` / `dyn` / `impl Fn(&Self)`), and more — see the crate README's *Two algorithms*
 /// section.
-///
-/// ## Paths in an announced trait
-/// `#[announce]` hands the trait to other crates, and checks at its definition that every path in
-/// it means the same thing there. Spell the paths of the trait absolutely: `crate::Base`,
-/// `::core::fmt::Debug`, `crate::Local`. A path relative to the defining module (`Local`,
-/// `super::X`, `std::fmt::Debug` without the leading `::`) is an error that names it. Primitive
-/// types need nothing, and `allow_std_prelude = true` accepts the bare std prelude names
-/// (`Clone`, `String`, `Vec<u8>`, `Option<T>`). The error also suggests announce's `repeater`;
-/// `#[decycle] use` does not support it, so write the path absolutely. The same trait defined inside a `#[decycle]` module needs none of this, since it is
-/// not carried through a macro.
-///
-/// ```rust
-/// # use decycle::decycle;
-/// pub struct Value(pub i32);
-///
-/// #[decycle::announce::announce(crate = ::decycle::announce, allow_std_prelude = true)]
-/// pub trait MyTrait {
-///     fn value(&self) -> crate::Value;
-///     fn text(&self) -> String;
-/// }
-/// # fn main() {}
-/// ```
 pub use decycle_macro::decycle;
 
 /// Checks a trait at its definition: it can take part in a `#[decycle]` cycle.
 ///
-/// A trait is made available to `#[decycle] use` by announcing it with the
-/// [`announce`](https://docs.rs/announce) attribute (re-exported as `decycle::announce`).
-/// `#[decycle]` reads the trait through its trampoline, so nothing else is needed. Without this
-/// check the trait is validated only when a `#[decycle]` module receives it, and the error appears
-/// there. List `decycle::check` among the options of `#[announce]` to get the error at the trait:
+/// Without it, a trait is validated when a `#[decycle]` module receives it, and the error appears
+/// there. Listed among the options of `#[announce]`, it rejects at the trait:
 ///
-/// ```
-/// use decycle::{announce::announce, decycle};
-///
-/// // `crate = ..` is needed when the crate does not depend on `announce` itself.
-/// #[announce(crate = ::decycle::announce, decycle::check)]
-/// pub trait Walk {
-///     fn walk(&self, depth: usize) -> usize;
-/// }
-///
-/// #[decycle]
-/// mod m {
-///     #[decycle]
-///     pub use super::Walk;
-///
-///     pub struct A(pub Option<Box<B>>);
-///     pub struct B(pub Option<Box<A>>);
-///
-///     impl Walk for A where B: Walk {
-///         fn walk(&self, depth: usize) -> usize {
-///             self.0.as_ref().map_or(depth, |b| b.walk(depth + 1))
-///         }
-///     }
-///     impl Walk for B where A: Walk {
-///         fn walk(&self, depth: usize) -> usize {
-///             self.0.as_ref().map_or(depth, |a| a.walk(depth + 1))
-///         }
-///     }
-/// }
-/// # fn main() {
-/// use m::Walk;
-/// assert_eq!(m::A(Some(Box::new(m::B(None)))).walk(0), 1);
-/// # }
-/// ```
-///
-/// A trait that `#[decycle]` cannot carry through a cycle is rejected at its definition:
+/// - a return-position `impl Trait` in a method;
+/// - an `async fn` in a method;
+/// - a default on a generic parameter (`trait Tr<T = u8>`), a rule of the ranked engine only:
+///   `decycle::check(structural)` skips it.
 ///
 /// ```compile_fail
-/// use decycle::announce::announce;
-/// #[announce(crate = ::decycle::announce, decycle::check)]
+/// #[decycle::announce::announce(crate = ::decycle::announce, decycle::check)]
 /// pub trait Bad {
-///     fn items(&self) -> impl ::core::iter::Iterator<Item = u8>; // return-position `impl Trait`
+///     fn items(&self) -> impl ::core::iter::Iterator<Item = u8>;
 /// }
 /// ```
-///
-/// The rules that depend on the trait alone are checked:
-///
-/// - no return-position `impl Trait` in a method (`-> impl Iterator<..>`): it has no nameable type
-///   for the re-entry. Declare an associated type and return it instead;
-/// - no `async fn` in a method: its `impl Future` return is such a type. Return a boxed future
-///   (`-> Pin<Box<dyn Future<Output = ..>>>`) instead;
-/// - no default on a generic parameter (`trait Tr<T = u8>`, `trait Tr<const N: usize = 4>`): every
-///   use of the trait is re-spelled with a rank argument, so each use site has to write every
-///   parameter. This is a rule of the **ranked** engine only.
-///
-/// `decycle::check` enforces the rules of the default ranked engine, the stricter of the two. The
-/// structural engine (`#[decycle(structural)]`) shares the first two and accepts a default on a
-/// generic parameter, so a trait that is only meant for it is checked with `decycle::check(structural)`,
-/// which skips the third rule:
-///
-/// ```
-/// use decycle::{announce::announce, decycle};
-///
-/// #[announce(crate = ::decycle::announce, decycle::check(structural))]
-/// pub trait Weigh<T = u8> {
-///     fn weigh(&self, t: T) -> usize;
-/// }
-///
-/// #[decycle(structural)]
-/// mod m {
-///     #[decycle]
-///     pub use super::Weigh;
-///
-///     pub struct A(pub Option<Box<A>>);
-///
-///     // The defaulted argument may be left out under the structural engine.
-///     impl Weigh for A where A: Weigh {
-///         fn weigh(&self, t: u8) -> usize {
-///             self.0.as_ref().map_or(t as usize, |a| a.weigh(t) + 1)
-///         }
-///     }
-/// }
-/// # fn main() {
-/// use m::Weigh as _;
-/// assert_eq!(m::A(Some(Box::new(m::A(None)))).weigh(5), 6);
-/// # }
-/// ```
-///
-/// The trait is the same either way: `check` only decides which engine's rules are enforced at its
-/// definition, and a trait checked with `(structural)` still fails in a ranked `#[decycle]` module
-/// if it has a default. Whatever depends on the impls (a where-clause bound, an `async fn` impl,
-/// a `#[track_caller]`) can only be checked when the module is expanded.
 pub use decycle_macro::check;
 
 /// Runtime fn-pointer registry backing unbounded `support_infinite_cycle` re-entry.

@@ -2,7 +2,6 @@
 
 use decycle_impl::proc_macro_error::*;
 use proc_macro::{Span, TokenStream};
-use syn::parse::discouraged::Speculative;
 use syn::parse::{Parse, ParseStream};
 use syn::*;
 use template_quote::quote;
@@ -21,10 +20,6 @@ struct Args {
     /// used to silently last-win; it is now rejected — but only AFTER the item is processed and
     /// `set_dummy` holds a valid expansion, so the abort does not cascade (see `reject_duplicate`).
     duplicate: Option<(proc_macro2::Span, &'static str)>,
-    /// First option of the removed trait-side `#[decycle]` (see `abort_removed_option`): its span and
-    /// name. Like a repeat, it is rejected only after the item is processed, so the abort does not
-    /// cascade.
-    removed: Option<(proc_macro2::Span, &'static str)>,
 }
 
 impl Args {
@@ -34,44 +29,6 @@ impl Args {
         if self.duplicate.is_none() {
             self.duplicate = Some((span, name));
         }
-    }
-
-    /// Record an option of the removed trait-side `#[decycle]`, skipping its `= value`.
-    ///
-    /// The value is read as a type (then an expression) before anything else, because a comma inside
-    /// it does not end the option: `marker = M<u8, u16>`. Stopping at the first top-level comma
-    /// would leave `u16>` behind and replace the "removed in 0.6" help with a generic parse error.
-    /// If it is neither, the rest of the arguments is dropped: the module or trait is rejected for
-    /// this option anyway.
-    fn note_removed(
-        &mut self,
-        input: ParseStream,
-        span: proc_macro2::Span,
-        name: &'static str,
-    ) -> Result<()> {
-        if self.removed.is_none() {
-            self.removed = Some((span, name));
-        }
-        if input.parse::<Option<Token![=]>>()?.is_some() {
-            let fork = input.fork();
-            if fork.parse::<Type>().is_ok() {
-                input.advance_to(&fork);
-            } else {
-                let fork = input.fork();
-                if fork.parse::<Expr>().is_ok() {
-                    input.advance_to(&fork);
-                } else {
-                    while !input.is_empty() {
-                        input.parse::<proc_macro2::TokenTree>()?;
-                    }
-                }
-            }
-            // Anything left of the value, up to the next argument.
-            while !input.is_empty() && !input.peek(Token![,]) {
-                input.parse::<proc_macro2::TokenTree>()?;
-            }
-        }
-        Ok(())
     }
 }
 
@@ -83,13 +40,11 @@ impl Parse for Args {
             support_infinite_cycle: None,
             structural: false,
             duplicate: None,
-            removed: None,
         };
         syn::custom_keyword!(decycle);
         syn::custom_keyword!(marker);
         syn::custom_keyword!(mock);
         syn::custom_keyword!(alter_macro_name);
-        syn::custom_keyword!(allowed_paths);
         syn::custom_keyword!(recurse_level);
         syn::custom_keyword!(support_infinite_cycle);
         syn::custom_keyword!(structural);
@@ -112,16 +67,25 @@ impl Parse for Args {
                 }
             } else if input.peek(marker) {
                 let kw: marker = input.parse()?;
-                args.note_removed(input, kw.span, "marker")?;
+                abort!(
+                    kw.span,
+                    "`marker` was an option of `#[decycle]` on a trait, which was removed in 0.6";
+                    help = "nothing replaces it: `#[announce]` requires every path in the trait to resolve outside the defining module, so spell them absolutely (`crate::..`, `::krate::..`)"
+                )
             } else if input.peek(mock) {
                 let kw: mock = input.parse()?;
-                args.note_removed(input, kw.span, "mock")?;
-            } else if input.peek(allowed_paths) {
-                let kw: allowed_paths = input.parse()?;
-                args.note_removed(input, kw.span, "allowed_paths")?;
+                abort!(
+                    kw.span,
+                    "`mock` was an option of `#[decycle]` on a trait, which was removed in 0.6";
+                    help = "announce the trait with `#[::decycle::announce::announce(crate = ::decycle::announce, mock = path::to::RealTrait)]`"
+                )
             } else if input.peek(alter_macro_name) {
                 let kw: alter_macro_name = input.parse()?;
-                args.note_removed(input, kw.span, "alter_macro_name")?;
+                abort!(
+                    kw.span,
+                    "`alter_macro_name` was an option of `#[decycle]` on a trait, which was removed in 0.6";
+                    help = "announce the trait with `#[::decycle::announce::announce(crate = ::decycle::announce, macro_name = Name)]` to rename its trampoline (a `#[decycle] mod` then needs `use path::to::Trait;` and `#[decycle] use path::to::Name;`), or with `mock = path::to::RealTrait` to declare a stand-in for another trait"
+                )
             } else if lookahead.peek(recurse_level) {
                 let kw: recurse_level = input.parse()?;
                 input.parse::<Token![=]>()?;
@@ -151,29 +115,6 @@ impl Parse for Args {
             }
         }
         Ok(args)
-    }
-}
-
-/// `#[decycle]` on a trait outside a `#[decycle] mod` was removed in 0.6: such a trait is announced
-/// with `#[announce]`. The options of that form (`marker`, `mock`, `allowed_paths`, and 0.5's
-/// `alter_macro_name`) go with it; this says so, and says what replaces each.
-fn abort_removed_option(span: proc_macro2::Span, name: &str) -> ! {
-    let help = match name {
-        "mock" => "announce the trait with `#[::decycle::announce::announce(crate = ::decycle::announce, mock = path::to::RealTrait)]`",
-        "alter_macro_name" => "announce the trait with `#[::decycle::announce::announce(crate = ::decycle::announce, macro_name = Name)]` to rename its trampoline (a `#[decycle] mod` then needs `use path::to::Trait;` and `#[decycle] use path::to::Name;`), or with `mock = path::to::RealTrait` to declare a stand-in for another trait",
-        _ => "nothing replaces it: `#[announce]` requires every path in the trait to resolve outside the defining module, so spell them absolutely (`crate::..`, `::krate::..`)",
-    };
-    abort!(
-        span,
-        "`{}` was an option of `#[decycle]` on a trait, which was removed in 0.6", name;
-        help = help
-    )
-}
-
-/// Reject an option of the removed trait-side `#[decycle]`, if one was written.
-fn reject_removed(args: &Args) {
-    if let Some((span, name)) = args.removed {
-        abort_removed_option(span, name)
     }
 }
 
@@ -274,18 +215,16 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
         // args — matching the original ordering so an unsupported-arg abort doesn't cascade.
         set_dummy(quote!(#ret));
         reject_duplicate(&args);
-        reject_removed(&args);
         ret.into()
     } else if parse::<ItemTrait>(input.clone()).is_ok() {
-        // Removed in 0.6: a trait outside a `#[decycle] mod` is announced with `#[announce]`. The
-        // dummy is the trait itself, so this stays a single error. An option of the old form is
-        // named, with what replaces it.
-        reject_removed(&args);
-        abort!(
-            Span::call_site(),
-            "`#[decycle]` on a trait outside a `#[decycle] mod` was removed in 0.6";
-            help = "announce the trait instead: `#[::decycle::announce::announce(crate = ::decycle::announce)]` (add `mock = path` for a stand-in, `::decycle::check` to validate it at its definition); `#[decycle] use` brings it into a `#[decycle] mod` as before"
-        )
+        // A trait outside a `#[decycle] mod` is announced, so that a `#[decycle] use` (in this crate
+        // or another) can carry it into a module.
+        let item = proc_macro2::TokenStream::from(input);
+        quote! {
+            #[#decycle_path::announce::announce(crate = #decycle_path::announce)]
+            #item
+        }
+        .into()
     } else if let Ok(mut item_use) = parse::<ItemUse>(input.clone()) {
         item_use.attrs.clear();
         abort!(

@@ -129,26 +129,25 @@ pub use decycle_impl::safegraph;
 ///   cycle is rejected by the ranked engine and treated as a silent no-op by the structural engine.
 ///
 /// ### Traits outside the module
-/// `#[decycle]` on a trait is only valid *inside* a `#[decycle]` module. A trait defined anywhere
-/// else is announced with [`#[announce]`](https://docs.rs/announce/latest/announce/attr.announce.html)
-/// (re-exported as `decycle::announce`): that makes its definition available to any crate, and
-/// `#[decycle] use path::to::Trait;` brings it into a module.
+/// A trait defined outside a `#[decycle]` module is announced with
+/// [`#[announce]`](https://docs.rs/announce/latest/announce/attr.announce.html) (re-exported as
+/// `decycle::announce`): that makes its definition available to any crate, and
+/// `#[decycle] use path::to::Trait;` brings it into a module. `#[decycle]` on such a trait expands to
+/// `#[announce(crate = ::decycle::announce)]`; write `#[announce]` itself for its options.
 ///
 /// ```text
 /// #[decycle::announce::announce(crate = ::decycle::announce, decycle::check)]
 /// pub trait Trait { .. }
 /// ```
 ///
-/// `#[decycle]` on a trait outside a module is a compile error that says so (it was the way to do
-/// this in 0.5). Its options map to:
+/// The options of 0.5's `#[decycle]` on a trait map to:
 ///
 /// | 0.5 `#[decycle(..)]` on a trait | now |
 /// | --- | --- |
-/// | `#[decycle]` | `#[announce(crate = ::decycle::announce)]` |
+/// | `#[decycle]` | `#[decycle]` (expands to `#[announce(crate = ::decycle::announce)]`) |
 /// | `alter_macro_name = N` | `#[announce(.., macro_name = N)]`, or `mock = path`. A module then writes both `use path::Trait;` and `#[decycle] use path::N;` (below) |
-/// | `decycle = path` | none; the trait no longer names decycle (`crate = ::my_rename::announce` if you renamed it) |
+/// | `decycle = path` | unchanged; the trait is announced with `crate = path::announce` |
 /// | `marker = path` | none; announce checks the trait's paths at its definition: write them absolutely (`crate::..`, `::krate::..`) |
-/// | `allowed_paths = [..]` | none; `allow_std_prelude = true` accepts the bare std prelude names (`Clone`, `Vec<u8>`) |
 /// | (checks at use) | `decycle::check`, see [`check`] |
 ///
 /// A trait announced with `macro_name = N` has a trampoline `N!` that is not named like the trait (so
@@ -360,8 +359,7 @@ pub use decycle_impl::safegraph;
 /// `super::X`, `std::fmt::Debug` without the leading `::`) is an error that names it. Primitive
 /// types need nothing, and `allow_std_prelude = true` accepts the bare std prelude names
 /// (`Clone`, `String`, `Vec<u8>`, `Option<T>`). The error also suggests announce's `repeater`;
-/// `#[decycle] use` does not read it and rejects a trait announced with one, so write the path
-/// absolutely. The same trait defined inside a `#[decycle]` module needs none of this, since it is
+/// `#[decycle] use` does not support it, so write the path absolutely. The same trait defined inside a `#[decycle]` module needs none of this, since it is
 /// not carried through a macro.
 ///
 /// ```rust

@@ -6,3 +6,11 @@ error: `mock` was an option of `#[decycle]` on a trait, which was removed in 0.6
   |
 3 | #[decycle::decycle(mock = crate::real::Size<u8, u16>, recurse_level = 3)]
   |                    ^^^^
+
+error: cannot find attribute `decycle` in this scope
+ --> tests/ui/trait_mock_generic_removed.rs:5:7
+  |
+5 |     #[decycle]
+  |       ^^^^^^^
+  |
+  = note: `decycle` is in scope, but it is a crate, not an attribute

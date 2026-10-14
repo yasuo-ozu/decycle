@@ -83,9 +83,6 @@ pub(crate) fn entry_name(entry: &announce::helper::Entry, renames: &[(Ident, Ide
 /// Receive one trampoline entry at `__finalize`: the announced trait, its generic parameters
 /// renamed to decycle's randomized names, and named as the module spells it (see [`carried_name`]).
 ///
-/// An entry announced with a `repeater` is rejected: decycle does not read the repeater table, so
-/// a relative type in the trait would reach the module unresolved.
-///
 /// The trait is marked ([`CARRIED_ATTR`]): its `#[decycle] use ... as` rename is applied here, once.
 /// An entry with a `mock(path)` META also records an absolute `path` (see [`MOCK_ATTR`]) for the
 /// places that name the trait itself.
@@ -94,14 +91,6 @@ pub(crate) fn receive_carried_trait(
     renames: &[(Ident, Ident)],
 ) -> ItemTrait {
     let mut trait_item = entry_trait(entry);
-    if entry.find_meta("type_leak").is_some() {
-        abort!(
-            entry.item.span(),
-            "#[decycle] use: `{}` is announced with a `repeater`, which decycle does not support",
-            template_quote::ToTokens::to_token_stream(&entry.key).to_string();
-            help = "announce the trait without `repeater` and spell its types with absolute paths (`crate::..`, `::krate::..`)"
-        )
-    }
     let mut renamer = crate::randomize_impl_generics(&mut trait_item.generics, crate::get_random());
     renamer.visit_item_trait_mut(&mut trait_item);
     trait_item.ident = carried_name(entry, &trait_item.ident, renames);

@@ -163,3 +163,46 @@ fn trampoline_renamed_with_macro_name() {
     // inner A at depth 2: 2; B: 2 + 10 = 12; outer A: 12
     assert_eq!(a.walk(0), 12);
 }
+
+// `#[decycle]` on a trait outside a module announces it, as `#[announce]` would.
+mod decycle_on_trait {
+    #[decycle::decycle]
+    pub trait Count {
+        fn count(&self) -> usize;
+    }
+}
+
+#[decycle::decycle]
+mod uses_decycle_trait {
+    #[decycle]
+    pub use crate::decycle_on_trait::Count;
+
+    pub struct A(pub Option<Box<B>>);
+    pub struct B(pub Option<Box<A>>);
+
+    impl Count for A
+    where
+        B: Count,
+    {
+        fn count(&self) -> usize {
+            self.0.as_ref().map_or(0, |b| b.count() + 1)
+        }
+    }
+
+    impl Count for B
+    where
+        A: Count,
+    {
+        fn count(&self) -> usize {
+            self.0.as_ref().map_or(0, |a| a.count() + 1)
+        }
+    }
+}
+
+#[test]
+fn decycle_on_a_trait_announces_it() {
+    use decycle_on_trait::Count as _;
+    use uses_decycle_trait::{A, B};
+    let a = A(Some(Box::new(B(Some(Box::new(A(None)))))));
+    assert_eq!(a.count(), 2);
+}

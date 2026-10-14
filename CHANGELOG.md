@@ -7,24 +7,22 @@ Notable changes, following [Keep a Changelog](https://keepachangelog.com/) and
 
 ### Changed
 
-- **Breaking: `#[decycle]` on a trait outside a `#[decycle] mod` is removed.** A trait defined
-  anywhere else is announced with [`#[announce]`](https://docs.rs/announce) instead, which decycle
-  re-exports as `decycle::announce`, and brought into a module with `#[decycle] use` as before:
-  `#[decycle::announce::announce(crate = ::decycle::announce)] pub trait T { .. }`. Writing
-  `#[decycle]` on such a trait is a compile error that points to `#[announce]`. The trait is carried
-  by announce's own trampoline, as written; the module-side machinery (`#[decycle] mod`,
-  `#[decycle] use`, a trait written inside a module) is unchanged. Options of the removed form:
+- **Breaking: `#[decycle]` on a trait outside a `#[decycle] mod` now just announces it.** It
+  expands to [`#[announce]`](https://docs.rs/announce) (re-exported as `decycle::announce`):
+  `#[decycle::announce::announce(crate = ::decycle::announce)]`, or `crate = PATH::announce` with
+  `decycle = PATH`. Write `#[announce]` directly for its options (`mock`, `macro_name`,
+  `allow_std_prelude`, checks). The trait is carried by announce's own trampoline, as written, and
+  brought into a module with `#[decycle] use` as before; the module-side machinery is unchanged. The
+  other options of the old form are errors:
 
   | was | now |
   | --- | --- |
-  | `#[decycle]` | `#[announce(crate = ::decycle::announce)]` |
+  | `#[decycle]` | `#[decycle]` (expands to `#[announce(crate = ::decycle::announce)]`) |
   | `alter_macro_name = N` | `#[announce(.., macro_name = N)]`, or `mock = path`; a module then writes both `use super::d::Walk;` (the trait) and `#[decycle] use super::d::WalkMac;` (its trampoline; the two live in different namespaces) |
-  | `decycle = path` | none (pass `crate = ::renamed::announce` if you renamed the dependency) |
+  | `decycle = path` | unchanged: the trait is announced with `crate = path::announce` |
   | `marker = path` | none: write the trait's paths absolutely (`crate::..`, `::krate::..`) |
-  | `allowed_paths = [..]` | none: `allow_std_prelude = true` accepts the bare std prelude names |
-
-  Writing one of these options is an error that names its replacement, whatever its value
-  (`marker = M<u8, u16>` included).
+  
+  Writing `alter_macro_name`, `marker` or `mock` is an error that names its replacement.
 - **`type-leak` is no longer a dependency** of `decycle`, `decycle-macro` or `decycle-impl` (it
   remains in the graph only as a dependency of `announce`). The relative-type interning it did for
   `#[decycle] trait` (`marker`, `allowed_paths`, the hidden `Repeater` trait) is gone with that form:
@@ -32,7 +30,8 @@ Notable changes, following [Keep a Changelog](https://keepachangelog.com/) and
   reports a relative one (`Local`, `super::X`, `std::vec::Vec<u8>`) as an error naming it. A trait
   that used `marker` to carry a relative type spells it absolutely now (`crate::Local`); bare std
   prelude names (`Clone`, `Vec<u8>`, `Option<T>`) need `allow_std_prelude = true`. announce's own
-  `repeater` option is not supported by `#[decycle] use`, which rejects such a trait with an error.
+  `repeater` option is not supported by `#[decycle] use`. `allowed_paths` is no longer recognized
+  at all (an unknown option).
 - Removed from the public surface: `decycle::type_leak`, `decycle_impl::type_leak`,
   `decycle_impl::process_trait` (nothing remains for it to do) and the hidden
   `decycle::Repeater`.

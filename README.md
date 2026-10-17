@@ -20,7 +20,7 @@ traits with circular dependencies that would otherwise fail to compile.
 
 ```toml
 [dependencies]
-decycle = "0.6.0"
+decycle = "0.7.0"
 ```
 
 ### Cargo features
@@ -39,9 +39,9 @@ spelling is:
 
 ```toml
 [dependencies]
-decycle = { version = "0.6.0", default-features = false }
+decycle = { version = "0.7.0", default-features = false }
 # ... or, to use `#[decycle]` on traits outside a module:
-# decycle = { version = "0.6.0", default-features = false, features = ["announce"] }
+# decycle = { version = "0.7.0", default-features = false, features = ["announce"] }
 ```
 
 Note that turning `api` off does **not** shrink a normal native build: `decycle-macro` depends on

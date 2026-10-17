@@ -62,7 +62,7 @@ fn repetition_in_default_bodies_and_user_code() {
 }
 
 macro_rules! count_entries {
-    ([$($list:tt)*] $($key:ident)::+ ! => [$($meta:tt)*] { $($item:tt)* }) => {
+    (@announce_format "1" [$($list:tt)*] $($key:ident)::+ ! => [$($meta:tt)*] { $($item:tt)* }) => {
         const STAND_IN: &str = stringify!($($meta)* => $($item)*);
     };
 }

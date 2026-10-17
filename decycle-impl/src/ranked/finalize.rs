@@ -3100,8 +3100,9 @@ pub struct FinalizeArgs {
 
 impl Parse for FinalizeArgs {
     /// The wire form `__finalize!` receives: an announce trampoline input
-    /// `[decycle::__finalize!] ENTRY* REST`. Each ENTRY is one foreign `#[decycle]` trait,
-    /// newest first; REST is decycle's own header
+    /// `@announce_format "1" [decycle::__finalize!] ENTRY* REST` (the prefix is the version of
+    /// announce's wire format: optional here, and a different version is an error). Each ENTRY is
+    /// one foreign `#[decycle]` trait, newest first; REST is decycle's own header
     /// `"decycle" "VERSION" { traits, } { impls, } LEVEL BOOL [renames] {also_rank}?`.
     fn parse(input: ParseStream) -> Result<Self> {
         let announce_input: announce::helper::Input = input.parse()?;

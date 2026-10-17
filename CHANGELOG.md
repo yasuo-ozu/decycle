@@ -3,6 +3,23 @@
 Notable changes, following [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **Breaking: announce 0.2.** `decycle`, `decycle-macro`, `decycle-impl` and the re-export
+  `decycle::announce` take announce (and `announce-std`) 0.2.0. Every call of the trampoline chain now
+  starts with `@announce_format "1"`, which a trampoline made by announce 0.1 does not read: a trait
+  announced by announce 0.1 (or by decycle 0.6, which re-exports it) cannot be `#[decycle] use`d by
+  this version and fails with announce's "invalid trampoline input"; the crate that defines it has to
+  move to announce 0.2 too. `FinalizeArgs` accepts the prefix (`ContList::invoke` writes it), and a
+  `macro_rules!` callback that parses what the trampolines call has to accept it:
+  `(@announce_format "1" [$($list:tt)*] ..)`.
+- Several announcements of one trait make one trampoline in announce 0.2, so `#[decycle]` on a trait,
+  which expands to `#[announce]`, combines with an `#[announce(..)]` written beside it
+  (`decycle::check`), in either order, where announce 0.1 made a second trampoline (E0252). The
+  expansions of `#[decycle] mod` are unchanged. The MSRV stays 1.71 (announce 0.2 needs 1.57).
+
 ## [0.6.0] — 2026-10-15
 
 ### Changed

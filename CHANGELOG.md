@@ -107,11 +107,22 @@ as **0.8.0**, not as a 0.7 patch.
   (`process_module_with_graph`, which shared across every impl of the trait). The premises land on
   the member's generated impls, the natural type's impl included (`impl<T> Tr<T> for A where T:
   Clone`), which changes nothing it effectively requires: the stripped cyclic bound required them
-  already. Impls outside every cycle, and the impls of another cycle of the same trait, are left
-  alone. As in the ranked engine, a predicate is only given to an impl that declares every generic
-  parameter it names (a sibling's `U: Clone` does not reach an impl calling its parameter `T`), a
-  `Self`-mentioning one and an inline parameter bound (`impl<T: Clone>`) are not shared, and the
-  premises of a sibling of another trait in a cross-trait cycle are not shared either.
+  already. Impls outside every cycle, and the impls of another cycle, are left alone. The premises
+  travel along the cycle's bounds, whatever their trait (see **Fixed**): an impl receives those of
+  every impl its cyclic bounds reach, transitively, with the reached impl's generic parameters
+  mapped through the bound, so `impl<U> Size<U> for Term where U: Clone` gives `impl<T> Eval<T> for
+  Expr where Term: Size<T>` the bound `T: Clone`, and through `Term: Size<u8>` only `u8: Clone`.
+  Inline parameter bounds and the non-cyclic co-bounds of a cyclic bound (`Clone` in
+  `Term: Size<T> + Clone`) count as premises, and a premise naming `Self` is given with `Self`
+  spelled as the reached impl's self type (`Self: Debug` on `Term<R>` reaches `Expr<S>` as
+  `Term<S>: Debug`). A premise that cannot be said in the receiving impl's terms is skipped,
+  without a diagnostic (if it was needed, the error is the `E0277` there would have been without
+  it): one naming a lifetime of the reached impl that no argument of the bound fixes
+  (`impl<'u, T> .. where T: 'u`), one naming an item the receiving impl shadows with a parameter of
+  the same name, a projection `T::Out` whose `T` maps to a type that is no plain name, and one
+  behind a macro. Beside that, the impls of one trait in a cycle still take the union of each
+  other's premises by name, as in the ranked engine: a predicate is only given to an impl that
+  declares every generic parameter it names, and a `Self`-mentioning one is not.
 
 ### Removed
 
@@ -138,6 +149,24 @@ as **0.8.0**, not as a 0.7 patch.
 
 ### Fixed
 
+- **A cycle that alternates between traits shares its premises**, in both engines (`Expr: Eval`
+  needing `Term: Size`, which needs `Expr: Eval`; three traits or more alike). Premises were shared
+  among the impls of one trait only, so `Expr`, the cycle's only `Eval` impl, never received
+  `Term`'s `T: Clone`. With `structural` that was `E0277` on the generated impl (``the trait bound
+  `T: Clone` is not satisfied``); the ranked engine compiled it, but skipped the re-entry
+  registrations that need the premise, and a recursion past the floor panicked ("re-entry fn not
+  registered before the floor was reached"). That was the documented heterogeneous side-bound
+  limitation (`impl<T: Clone> Ca for A<T> where B<T>: Cb` beside `impl<T: Default> Cb for B<T>
+  where A<T>: Ca`), which now runs unbounded. Each impl now receives the premises of the impls its
+  cyclic bounds reach, whatever their trait, with the generic parameters mapped through the bound
+  (not matched by name), as described for the structural engine under **Changed**. The ranked
+  engine only carries a premise its registration check reads the same way, so it leaves out a
+  premise naming `Self`, and a premise with a trait bound that names a lifetime other than
+  `'static`, has a `for<..>` binder, names a const parameter or projects from a parameter
+  (`T::Out`), or has a parameter in `Fn(..)` sugar or an associated-item constraint of the bound;
+  a side bound of that kind still fails closed past the floor. A premise given to a parameter that
+  has inline bounds joins them (`impl<T: Clone + Default>`), so the generated impl does not trip
+  `clippy::multiple_bound_locations` on the user's impl header.
 - **The ranked engine's expansion is deterministic.** It emitted its per-trait items (the ranked
   twins and re-entry items, the dummy shadows, the inductive and the Final impls) in the iteration
   order of a `HashMap`, which `std` seeds per process: a module with several `#[decycle]` traits

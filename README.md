@@ -359,8 +359,11 @@ actionable panic that cannot corrupt or poison other cycles or threads:
   type argument is chosen inside the body and nothing in scope can spell it;
 - an impl whose cyclic bound targets a **bare type parameter**
   (`impl<T: Cb> Ca for Wrap<T>`), or a heterogeneous side-bound cycle whose registering impl
-  does not syntactically cover what a reachable sibling needs. Such a cycle is still unbounded
-  through its other impls.
+  does not syntactically cover what a reachable sibling needs. Each impl is given the side
+  bounds of the impls its cyclic bounds reach (whatever their trait, with the generic
+  parameters mapped through the bound), so this is left to side bounds that cannot be carried:
+  one naming `Self`, or a trait bound naming a lifetime, a `for<..>` or a const parameter. Such
+  a cycle is still unbounded through its other impls.
 
 **At the floor (`support_infinite_cycle = false`).** No runtime machinery is emitted at all —
 this is the zero-cost mode. Recursion simply stops at the configured `recurse_level`, panicking

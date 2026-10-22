@@ -259,7 +259,11 @@ pub use decycle_impl::structural;
 ///   through its other impls); and (c) a heterogeneous side-bound cycle
 ///   where the registering impl's own bounds don't cover every bound a
 ///   reachable sibling impl needs (its registration is skipped rather than
-///   risk naming an unprovable obligation). Such impls simply never
+///   risk naming an unprovable obligation) — each impl is given the side
+///   bounds of the impls its cyclic bounds reach, whatever their trait, so
+///   this is left to side bounds that cannot be carried over (one naming
+///   `Self`, or a trait bound naming a lifetime, a `for<..>` or a const
+///   parameter). Such impls simply never
 ///   register, compile cleanly, and panic (rather than corrupt memory) if
 ///   their floor is ever actually reached.
 /// - `support_infinite_cycle = false` emits no runtime machinery at all

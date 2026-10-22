@@ -150,16 +150,18 @@ fn expand(
         return Ok(pass_through(module));
     }
 
-    // The impls of one trait in one cycle share their non-cyclic premises. A member's generated
-    // terminator impl reaches a sibling through the public trait, which the sibling's natural impl
-    // discharges — and that impl demands the sibling's OWN leaf premises, which the member's
-    // `where`-clause need not state (a generated helper type's `Leaf: Parse<A>`, or simply members
-    // written with different leaf bounds). Plain Rust proves those through the cyclic bound itself;
-    // the unroll strips that bound, so the member needs them in its own environment. Scoped to the
-    // members of the cycle: an impl outside every cycle, and a disjoint cycle of the same trait,
-    // acquire nothing. Adding them does not change what a natural impl requires in effect — the
-    // stripped cyclic bound required them already, transitively (as far as the name-based matching
-    // of generic parameters, see `share_cycle_premises`, reads them right).
+    // The impls of one cycle share their non-cyclic premises. A member's generated terminator impl
+    // reaches the impls its cyclic bounds name through the public trait, which their natural impls
+    // discharge — and those demand their OWN leaf premises, which the member's `where`-clause need
+    // not state (a generated helper type's `Leaf: Parse<A>`, members written with different leaf
+    // bounds, or the impl of another trait in a cycle that alternates between traits). Plain Rust
+    // proves those through the cyclic bound itself; the unroll strips that bound, so the member needs
+    // them in its own environment. Scoped to the members of the cycle: an impl outside every cycle,
+    // and a disjoint cycle, acquire nothing. Adding them does not change what a natural impl requires
+    // in effect — the stripped cyclic bound required them already, transitively, at the instantiation
+    // the bound names, which is the one the premises are mapped to (see `share_cycle_premises`; the
+    // by-name pass kept beside it can over-state that, where two impls of one trait name different
+    // things alike).
     if share_cycle_premises(brace_items, &sccs, &model) {
         items = brace_items.clone();
         model = Model::collect(&items, nonce)?;
@@ -257,20 +259,57 @@ fn expand(
     })
 }
 
-/// Give the impls of each trait in each cycle (`sccs`) the union of each other's non-cyclic premises,
-/// in place; whether any impl changed. See `expand`.
+/// Give the impls of each cycle (`sccs`) the premises of the impls their cyclic bounds reach, in
+/// place; whether any impl changed. See `expand`.
 ///
-/// A premise is one of the `where`-predicates `reduce_generics` keeps on the generated impls: one
-/// carrying no bound that is an edge of the same cycle (a bound `X: Tr` where `X` names a member
-/// `M` with `(M, Tr)` in the SCC). The union, its scoping and its guards are the ranked engine's
-/// ([`crate::ranked::sharing::share_side_predicates_scoped`]): a predicate is only injected into an
-/// impl that declares every generic parameter it names (by name: a sibling's `U: Clone` does not
-/// reach an impl calling its parameter `T`), a `Self`-mentioning one is never shared, and an HRTB
-/// binder is renamed apart from the receiver's lifetimes. Inline parameter bounds
-/// (`impl<T: Clone>`) are not shared, as in the ranked engine, and neither are the premises of an
-/// impl of another trait in a cross-trait cycle.
+/// A premise is one of the `where`-predicates (or inline parameter bounds) `reduce_generics` keeps on
+/// the generated impls: one carrying no bound that is an edge of the same cycle (a bound `X: Tr`
+/// where `X` names a member `M` with `(M, Tr)` in the SCC). Two passes, both scoped to the members of
+/// one cycle:
+///
+/// - **along the bounds, across traits** ([`crate::premise_flow`]): an impl receives the premises of
+///   every impl its cyclic bounds reach, transitively and whatever their trait, with the reached
+///   impl's generic parameters mapped through the bound (`Term: Size<T>` reaching
+///   `impl<U> Size<U> for Term where U: Clone` gives `T: Clone`). A premise with no counterpart (a
+///   parameter the bound does not fix) is skipped. Computed on the impls as written, before the
+///   second pass adds anything.
+/// - **by name, per trait** (as before): the impls of one trait in the cycle take the union of each
+///   other's premises, through [`crate::ranked::sharing::share_side_predicates_scoped`]: a predicate
+///   is only injected into an impl that declares every generic parameter it names, a
+///   `Self`-mentioning one is never shared, and an HRTB binder is renamed apart from the receiver's
+///   lifetimes. It adds nothing the first pass gives when the parameters correspond by name, and it
+///   still covers a bound the first pass cannot match.
 fn share_cycle_premises(items: &mut [Item], sccs: &[Scc], model: &Model) -> bool {
     let adt_names: HashSet<String> = model.adts.keys().cloned().collect();
+    let in_scc = |im: &ItemImpl, scc: &Scc| {
+        impl_trait_key(im)
+            .zip(impl_self_ident(im))
+            .is_some_and(|(key, ty)| scc.contains(&ty.to_string(), &key))
+    };
+    let mut along_bounds: Vec<(usize, Vec<WherePredicate>)> = Vec::new();
+    for scc in sccs {
+        let (index, impls): (Vec<usize>, Vec<&ItemImpl>) = items
+            .iter()
+            .enumerate()
+            .filter_map(|(k, item)| match item {
+                Item::Impl(im) if in_scc(im, scc) => Some((k, im)),
+                _ => None,
+            })
+            .unzip();
+        let edges: Vec<Vec<crate::premise_flow::CycleEdge>> = impls
+            .iter()
+            .map(|im| cycle_edges(im, &impls, scc, &adt_names))
+            .collect();
+        let is_edge =
+            |im: &ItemImpl, pred: &WherePredicate| is_cycle_edge(im, pred, scc, &adt_names);
+        let add = crate::premise_flow::mapped_premises(
+            &impls,
+            &edges,
+            &is_edge,
+            crate::premise_flow::Respell::Any,
+        );
+        along_bounds.extend(index.into_iter().zip(add));
+    }
     let mut changed = false;
     for scc in sccs {
         let mut traits: Vec<&String> = scc.pairs.iter().map(|(_, tr)| tr).collect();
@@ -309,7 +348,78 @@ fn share_cycle_premises(items: &mut [Item], sccs: &[Scc], model: &Model) -> bool
                 .any(|(im, b)| im.to_token_stream().to_string() != *b);
         }
     }
+    for (k, add) in along_bounds {
+        if let Item::Impl(im) = &mut items[k] {
+            changed |= crate::premise_flow::add_premises(im, add);
+        }
+    }
     changed
+}
+
+/// The bounds of `im` that are edges of `scc`, for [`crate::premise_flow`]: one per member a bound
+/// names (`Box<Term<S>>: Size<T>` is the edge to `Term<S>`), with the impls of `impls` (the cycle's)
+/// that may discharge it.
+fn cycle_edges(
+    im: &ItemImpl,
+    impls: &[&ItemImpl],
+    scc: &Scc,
+    adt_names: &HashSet<String>,
+) -> Vec<crate::premise_flow::CycleEdge> {
+    let mut out = Vec::new();
+    for pred in im.generics.where_clause.iter().flat_map(|wc| &wc.predicates) {
+        let WherePredicate::Type(pt) = pred else {
+            continue;
+        };
+        let bounded = subst_self(&pt.bounded_ty, &im.self_ty);
+        let members = local_ref_paths(&bounded, adt_names);
+        let pred_binder: Vec<syn::Lifetime> = binder_lifetimes(pt.lifetimes.as_ref());
+        for bound in &pt.bounds {
+            let syn::TypeParamBound::Trait(tb) = bound else {
+                continue;
+            };
+            let Some(key) = trait_key(&tb.path) else {
+                continue;
+            };
+            for member in &members {
+                let Some(name) = bare_ident(&member.path).map(|i| i.to_string()) else {
+                    continue;
+                };
+                if !scc.contains(&name, &key) {
+                    continue;
+                }
+                let candidates = impls
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, j)| {
+                        impl_trait_key(j).as_deref() == Some(key.as_str())
+                            && impl_self_ident(j).is_some_and(|ty| ty == name)
+                    })
+                    .map(|(k, _)| k)
+                    .collect();
+                let mut binder = pred_binder.clone();
+                binder.extend(binder_lifetimes(tb.lifetimes.as_ref()));
+                out.push(crate::premise_flow::CycleEdge {
+                    target: Type::Path(member.clone()),
+                    trait_path: tb.path.clone(),
+                    binder,
+                    candidates,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The lifetimes a `for<..>` binds.
+fn binder_lifetimes(binder: Option<&syn::BoundLifetimes>) -> Vec<syn::Lifetime> {
+    binder
+        .into_iter()
+        .flat_map(|b| &b.lifetimes)
+        .filter_map(|p| match p {
+            GenericParam::Lifetime(l) => Some(l.lifetime.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Does `pred` (on `im`) carry a bound that is an edge of `scc` — the bounds `reduce_generics`

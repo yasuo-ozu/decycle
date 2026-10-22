@@ -52,9 +52,7 @@ pub fn path_is_depth_fragile(path: &Path) -> bool {
 /// Delegates to the shared minter so both engines produce the same shape; the suffix keeps it from
 /// colliding with a user parameter and is deterministic across compilations.
 fn arg_ident(ix: usize) -> Ident {
-    static RANDOM_SUFFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let suffix = RANDOM_SUFFIX.get_or_init(|| crate::name_suffix(crate::get_random()));
-    crate::arg_ident(ix, suffix)
+    crate::arg_ident(ix, crate::get_random())
 }
 
 /// Inserts a `Type` as a `GenericArgument::Type` at the given position

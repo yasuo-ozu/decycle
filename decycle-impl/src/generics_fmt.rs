@@ -11,7 +11,7 @@
 
 use proc_macro2::TokenStream;
 use template_quote::quote;
-use syn::{GenericParam, Generics};
+use syn::{GenericParam, Generics, Ident};
 
 /// How a *type* parameter's bounds are rendered when the param appears in a declaration.
 #[derive(Clone, Copy)]
@@ -96,4 +96,18 @@ pub(crate) fn wrap_angle(inner: &TokenStream) -> TokenStream {
     } else {
         quote!( < #inner > )
     }
+}
+
+/// The idents of `generics`' type and const parameters, in order — the arguments a turbofish names
+/// (lifetimes are left to inference).
+pub(crate) fn type_const_idents(generics: &Generics) -> Vec<Ident> {
+    generics
+        .params
+        .iter()
+        .filter_map(|p| match p {
+            GenericParam::Type(t) => Some(t.ident.clone()),
+            GenericParam::Const(c) => Some(c.ident.clone()),
+            _ => None,
+        })
+        .collect()
 }

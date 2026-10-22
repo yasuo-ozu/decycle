@@ -209,9 +209,9 @@ impl<'a> Graph<'a> {
     /// reaches it.
     ///
     /// Searched over `(node, ranks left)` with the crate's graph machinery (`crate::graph`, as for
-    /// the obligation graph in `crate::analysis` and `sharing_sources`). The top rank is capped at the
-    /// number of nodes: a chain never needs a longer run of cycle edges than that, so the answer is
-    /// the same, and the search stays small for a large `recurse_level`.
+    /// the obligation graph in `crate::analysis` and `sharing_sources`). The top rank is capped at
+    /// the number of nodes: a chain never needs a longer run of cycle edges than that, so the
+    /// answer is the same, and the search stays small for a large `recurse_level`.
     fn chain_back(
         &self,
         from: &str,

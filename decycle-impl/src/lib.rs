@@ -262,16 +262,22 @@ fn get_crate_identity() -> String {
     "decycle".to_string()
 }
 
+/// `prefix` followed by the suffix every generated identifier carries ([`name_suffix`] of `seed`):
+/// how both engines mint every name they generate.
+pub(crate) fn suffixed_ident(prefix: &str, seed: u64) -> proc_macro2::Ident {
+    proc_macro2::Ident::new(
+        &format!("{prefix}{}", name_suffix(seed)),
+        proc_macro2::Span::call_site(),
+    )
+}
+
 /// The fresh binding minted for a destructured / `mut` / `ref` parameter at position `ix`.
 ///
 /// Both engines normalise such a parameter to a plain ident so the forwarding call can pass it on,
 /// and both need that ident to be un-collidable with a user parameter. Shared so the two mint the
 /// same shape; the suffix comes from each engine's own seed (see [`name_suffix`]).
-pub(crate) fn arg_ident(ix: usize, suffix: &str) -> proc_macro2::Ident {
-    proc_macro2::Ident::new(
-        &format!("__decycle_arg{ix}_{suffix}"),
-        proc_macro2::Span::call_site(),
-    )
+pub(crate) fn arg_ident(ix: usize, seed: u64) -> proc_macro2::Ident {
+    suffixed_ident(&format!("__decycle_arg{ix}_"), seed)
 }
 
 /// Render the suffix that every generated identifier carries, in both engines.

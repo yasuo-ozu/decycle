@@ -146,22 +146,7 @@ fn subst_self_in_bounds(
 
 /// A `::<T, N>` turbofish for a method's own type/const generics (lifetimes inferred), or empty.
 fn method_turbofish(sig: &syn::Signature) -> TokenStream {
-    let args: Vec<TokenStream> = sig
-        .generics
-        .params
-        .iter()
-        .filter_map(|p| match p {
-            GenericParam::Type(t) => Some({
-                let id = &t.ident;
-                quote!(#id)
-            }),
-            GenericParam::Const(c) => Some({
-                let id = &c.ident;
-                quote!(#id)
-            }),
-            GenericParam::Lifetime(_) => None,
-        })
-        .collect();
+    let args = crate::generics_fmt::type_const_idents(&sig.generics);
     if args.is_empty() {
         quote!()
     } else {
@@ -1185,7 +1170,7 @@ fn normalize_sig(
                     syn::Pat::Ident(pi)
                         if pi.subpat.is_none() && pi.by_ref.is_none() && pi.mutability.is_none());
                 if !is_plain_ident {
-                    let fresh = arg_ident(i, nonce);
+                    let fresh = crate::arg_ident(i, nonce);
                     let orig = (*pt.pat).clone();
                     rebinds.push(quote! { let #orig = #fresh; });
                     *pt.pat = parse_quote!(#fresh);

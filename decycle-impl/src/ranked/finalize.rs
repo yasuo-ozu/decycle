@@ -1,9 +1,8 @@
-use crate::generics_fmt::{param_decl, DeclBounds};
+use crate::generics_fmt::{param_decl, type_const_idents, DeclBounds};
 use crate::helper::*;
 use proc_macro2::{Span, TokenStream};
 use proc_macro_error::*;
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::*;
@@ -22,10 +21,7 @@ macro_rules! name {
 }
 
 fn name(s: &str) -> Ident {
-    static RANDOM_SUFFIX: OnceLock<String> = OnceLock::new();
-
-    let suffix = RANDOM_SUFFIX.get_or_init(|| crate::name_suffix(crate::get_random()));
-    Ident::new(&format!("{}{}", s, suffix), Span::call_site())
+    crate::suffixed_ident(s, crate::get_random())
 }
 
 /// Rewrites single-segment trait paths that match the replacing table to their
@@ -358,14 +354,30 @@ fn requalify_foreign_premises(
 /// the literal `Self` keyword (E0411 — "cannot find type `Self` in this scope").
 fn subst_bare_self_in_generics(generics: &Generics, self_ty: &Type) -> Generics {
     let mut g = generics.clone();
-    syn::visit_mut::VisitMut::visit_generics_mut(&mut BareSelfSubst { self_ty }, &mut g);
+    syn::visit_mut::VisitMut::visit_generics_mut(&mut BareSelfSubst::new(self_ty), &mut g);
     g
 }
 
 struct BareSelfSubst<'a> {
     self_ty: &'a Type,
+    /// Leave a receiver's type (`self: Box<Self>`) as written ([`replace_self`]).
+    skip_receivers: bool,
+}
+impl<'a> BareSelfSubst<'a> {
+    fn new(self_ty: &'a Type) -> Self {
+        BareSelfSubst {
+            self_ty,
+            skip_receivers: false,
+        }
+    }
 }
 impl syn::visit_mut::VisitMut for BareSelfSubst<'_> {
+    fn visit_receiver_mut(&mut self, receiver: &mut Receiver) {
+        if !self.skip_receivers {
+            syn::visit_mut::visit_receiver_mut(self, receiver);
+        }
+    }
+
     fn visit_type_mut(&mut self, ty: &mut Type) {
         if let Type::Path(TypePath { qself: None, path }) = ty {
             if path.is_ident("Self") {
@@ -381,7 +393,7 @@ impl syn::visit_mut::VisitMut for BareSelfSubst<'_> {
 /// inside `ty` (`Self`, `Vec<Self>`, `(Self, u8)`) becomes `self_ty`.
 fn subst_bare_self_in_type(ty: &Type, self_ty: &Type) -> Type {
     let mut t = ty.clone();
-    syn::visit_mut::VisitMut::visit_type_mut(&mut BareSelfSubst { self_ty }, &mut t);
+    syn::visit_mut::VisitMut::visit_type_mut(&mut BareSelfSubst::new(self_ty), &mut t);
     t
 }
 
@@ -659,31 +671,14 @@ fn emit_impl_items_delegate(
     output
 }
 
+/// Every bare `Self` in `sig` replaced by `base_self_ty`, except in the receiver, which keeps its
+/// `Self` (`self: Box<Self>`).
 fn replace_self(sig: &mut Signature, base_self_ty: &Type) {
-    use syn::visit_mut::VisitMut;
-
-    struct SelfReplacer<'a> {
-        base_self_ty: &'a Type,
-    }
-
-    impl<'a> VisitMut for SelfReplacer<'a> {
-        fn visit_receiver_mut(&mut self, _receiver: &mut Receiver) {
-            // Skip visiting receiver to avoid replacing Self in receiver types
-        }
-
-        fn visit_type_mut(&mut self, ty: &mut Type) {
-            if let Type::Path(TypePath { qself: None, path }) = ty {
-                if path.is_ident("Self") {
-                    *ty = self.base_self_ty.clone();
-                    return;
-                }
-            }
-            syn::visit_mut::visit_type_mut(self, ty);
-        }
-    }
-
-    let mut replacer = SelfReplacer { base_self_ty };
-    replacer.visit_signature_mut(sig);
+    let mut replacer = BareSelfSubst {
+        self_ty: base_self_ty,
+        skip_receivers: true,
+    };
+    syn::visit_mut::VisitMut::visit_signature_mut(&mut replacer, sig);
 }
 
 /// Desugars every input-position `impl Trait` into a fresh method-level type parameter
@@ -946,18 +941,6 @@ fn nonlifetime_path_args(args: &PathArguments) -> Vec<GenericArgument> {
             .collect(),
         _ => Vec::new(),
     }
-}
-
-fn type_const_idents(generics: &Generics) -> Vec<Ident> {
-    generics
-        .params
-        .iter()
-        .filter_map(|p| match p {
-            GenericParam::Type(t) => Some(t.ident.clone()),
-            GenericParam::Const(c) => Some(c.ident.clone()),
-            _ => None,
-        })
-        .collect()
 }
 
 fn sig_has_impl_trait_input(sig: &Signature) -> bool {

@@ -92,10 +92,7 @@ impl ModuleScope {
             declared.insert(seg_name(ident));
         }
         let nonce = crate::identity_to_u64(&module.to_token_stream().to_string());
-        let marker = Ident::new(
-            &format!("__DecycleModule_{}", crate::name_suffix(nonce)),
-            Span::call_site(),
-        );
+        let marker = crate::suffixed_ident("__DecycleModule_", nonce);
         ModuleScope {
             path: path.clone(),
             declared,

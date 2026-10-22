@@ -48,14 +48,7 @@ pub(crate) use rho::*;
 /// crate, used to recognise `#[<crate>::decycle]` on inner items). For macro authors wrapping
 /// `#[decycle(structural)]`; most users should use the attribute.
 pub fn process_module(module: ItemMod, decycle: &Path) -> TokenStream {
-    match expand(module.clone(), decycle, None) {
-        Ok(ts) => ts,
-        Err(e) => {
-            // Re-emit the module verbatim alongside the error so downstream code still sees the defs.
-            let err = e.to_compile_error();
-            quote! { #err #module }
-        }
-    }
+    expand_or_fall_back(module, decycle, None)
 }
 
 /// [`process_module`] for a module whose absolute path is `module_path` — the programmatic form of
@@ -70,19 +63,35 @@ pub fn process_module(module: ItemMod, decycle: &Path) -> TokenStream {
 /// module is emitted into it (an error at the path otherwise).
 pub fn process_module_at(module: ItemMod, module_path: &Path, decycle: &Path) -> TokenStream {
     let scope = crate::module_path::ModuleScope::new(module_path, &module);
-    let mut module = module;
-    match expand(module.clone(), decycle, Some(&scope)) {
+    expand_or_fall_back(module, decycle, Some(&scope))
+}
+
+fn expand_or_fall_back(
+    module: ItemMod,
+    decycle: &Path,
+    scope: Option<&crate::module_path::ModuleScope>,
+) -> TokenStream {
+    match expand(module.clone(), decycle, scope) {
         Ok(ts) => ts,
         Err(e) => {
+            // Re-emit the module verbatim alongside the error so downstream code still sees the defs.
             let err = e.to_compile_error();
-            scope.qualify_module(&mut module);
-            let path_check = scope.path_check();
-            if let Some((_, items)) = &mut module.content {
-                items.push(Item::Verbatim(path_check));
-            }
+            let module = as_written(module, scope);
             quote! { #err #module }
         }
     }
+}
+
+/// `module` re-emitted as written: qualified, and with the check of its path, under
+/// `module = path`.
+fn as_written(mut module: ItemMod, scope: Option<&crate::module_path::ModuleScope>) -> TokenStream {
+    if let Some(scope) = scope {
+        scope.qualify_module(&mut module);
+        if let Some((_, items)) = &mut module.content {
+            items.push(Item::Verbatim(scope.path_check()));
+        }
+    }
+    module.to_token_stream()
 }
 
 /// `scope` is the `module = path` of the attribute, when given: the cycle is solved on the module as
@@ -96,15 +105,6 @@ fn expand(
     let qualify = |item: &Item| match scope {
         Some(scope) => scope.qualify_item(item),
         None => item.clone(),
-    };
-    let pass_through = |mut module: ItemMod| {
-        if let Some(scope) = scope {
-            scope.qualify_module(&mut module);
-            if let Some((_, items)) = &mut module.content {
-                items.push(Item::Verbatim(scope.path_check()));
-            }
-        }
-        module.to_token_stream()
     };
     let decycle_crate = decycle
         .segments
@@ -142,14 +142,14 @@ fn expand(
     // so a `structural` annotation on a module with nothing to unroll is a silent no-op, not an error.
     // (The ranked engine instead REQUIRES an annotated cycle and rejects this — `NO_DECYCLE_TRAITS_MSG`.)
     if decycle_traits.is_empty() {
-        return Ok(pass_through(module));
+        return Ok(as_written(module, scope));
     }
 
     let mut model = Model::collect(&items, nonce)?;
     let sccs = model.cyclic_sccs(&decycle_traits);
     // Annotated traits present but they form no cycle — the same silent no-op pass-through.
     if sccs.is_empty() {
-        return Ok(pass_through(module));
+        return Ok(as_written(module, scope));
     }
 
     // The impls of one cycle share their non-cyclic premises. A member's generated terminator impl

@@ -1,4 +1,5 @@
-//! How a `#[decycle]` module names its own items, as both engines (and [`crate::analysis`]) read it.
+//! How a `#[decycle]` module names its own items, as both engines (and [`crate::analysis`]) read
+//! it.
 //!
 //! A cycle participant — a routed trait, or a type implementing one — is named by its **bare** name
 //! or by the no-op `self::` form of it. Any other path (`crate::m::Term`, `super::Term`,

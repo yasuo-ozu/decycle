@@ -34,8 +34,8 @@ impl Scc {
 impl Model {
     /// Every cyclic SCC over the `#[decycle]`-annotated traits (`allowed_traits`, keyed by the bare
     /// name, `collect::trait_key`): the components of the graph over `(type, trait)` pairs that lie
-    /// on a cycle (more than one pair, or a lone self-looping pair), each pair-sorted, in the order of
-    /// their smallest pair. Impls of other traits are left untouched.
+    /// on a cycle (more than one pair, or a lone self-looping pair), each pair-sorted, in the order
+    /// of their smallest pair. Impls of other traits are left untouched.
     pub fn cyclic_sccs(&self, allowed_traits: &HashSet<String>) -> Vec<Scc> {
         let adt_names: HashSet<String> = self.adts.keys().cloned().collect();
         let participating = || {

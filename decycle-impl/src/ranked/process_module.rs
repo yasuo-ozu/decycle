@@ -477,7 +477,10 @@ pub fn process_module(
 /// a `#[decycle]` trait that names the trait or its self type by a path is the opt-out, re-emitted
 /// and qualified too) have each bare or `self::` name of a type or trait declared in the module
 /// spelled `<module_path>::X`, so an `#[announce]` on one of them sees absolute paths only. A check
-/// that `module_path` names this module is emitted into it (an error at the path otherwise).
+/// that `module_path` names this module is emitted into it (an error at the path otherwise). A
+/// bound that names one of the module's own types by a path (`<module_path>::C: Tr`) and is certain
+/// to overflow, because `C`'s impl leads back to it, is reported at the bound (through
+/// `proc_macro_error`), with the cycle in the module's types.
 pub fn process_module_at(
     module: ItemMod,
     module_path: &Path,
@@ -558,10 +561,31 @@ fn process_module_inner(
             (traits, working_list, renames)
         },
     );
+    let all_traits: HashSet<Ident> = working_list
+        .iter()
+        .filter_map(|path| path.segments.last().map(|seg| seg.ident.clone()))
+        .chain(traits.iter().map(|ItemTrait { ident, .. }| ident.clone()))
+        .collect();
     proc_macro_error::set_dummy(quote! {
         #{&module.vis} #{&module.unsafety} mod #{&module.ident} {
             #(for content in contents.iter()) { #{qualify(content)} }
             #path_check
+        }
+    });
+    // The fallback for an opt-out bound on a cycle (`crate::ranked::opt_out`), kept from the module
+    // as written: without the global bounds of the routed traits, so that the impls do not overflow
+    // on their own and the reported errors stand alone. Only `module = path` can report one, and
+    // only on a module whose own attributes cannot remove it (a `#[cfg]` that is off compiles).
+    let check_opt_outs =
+        scope.is_some() && module.attrs.iter().all(crate::ranked::opt_out::is_inert);
+    let quiet_dummy = check_opt_outs.then(|| {
+        quote! {
+            #{&module.vis} #{&module.unsafety} mod #{&module.ident} {
+                #(for content in contents.iter()) {
+                    #{crate::ranked::opt_out::quiet(qualify(content), &all_traits)}
+                }
+                #path_check
+            }
         }
     });
     if let Err(e) = growth {
@@ -636,11 +660,6 @@ fn process_module_inner(
             }
         }
     }
-    let all_traits: HashSet<Ident> = working_list
-        .iter()
-        .filter_map(|path| path.segments.last().map(|seg| seg.ident.clone()))
-        .chain(traits.iter().map(|ItemTrait { ident, .. }| ident.clone()))
-        .collect();
     // `impl Tr for self::Term` is `impl Tr for Term`: read (and re-emit) a self type in the bare
     // spelling, which is the one everything below matches a cycle member by.
     for item in contents.iter_mut() {
@@ -689,6 +708,20 @@ fn process_module_inner(
     for item in contents.iter() {
         if let Item::Impl(item_impl) = item {
             validate_impl_where_bounds(item_impl, &all_traits, &cycle_self_heads);
+        }
+    }
+    // A bound naming an own type by its path (the opt-out, left as written, as peeling left it) on
+    // a cycle overflows in rustc, on the generated `…Ranked` traits. Say so in the module's terms,
+    // at each such bound, after the fallback is made quiet. See `crate::ranked::opt_out`.
+    if let (Some(scope), Some(quiet_dummy)) = (&scope, quiet_dummy) {
+        let cycles =
+            crate::ranked::opt_out::opt_out_cycles(contents, scope, &all_traits, recurse_level);
+        if !cycles.is_empty() {
+            proc_macro_error::set_dummy(quiet_dummy);
+            for cycle in cycles {
+                emit_error!(cycle.at, "{}", cycle.message; help = "{}", cycle.help);
+            }
+            abort_if_dirty();
         }
     }
     let (raw_contents, contents): (Vec<_>, Vec<_>) = contents

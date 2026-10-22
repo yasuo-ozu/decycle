@@ -1,0 +1,8 @@
+error: decycle: `crate::m::C` names `C` of this module by its path, so this bound is left as written, but `C`'s impl of `Loop` leads back to this impl (`A` → `C` → `A`): rustc cannot prove that cycle (E0275)
+
+         = help: write `C` to make the bound part of the cycle decycle breaks
+
+  --> tests/ui/module_absolute_bound_peeled.rs:10:31
+   |
+10 |     impl Loop for A where (B, crate::m::C): Loop {
+   |                               ^^^^^^^^^^^

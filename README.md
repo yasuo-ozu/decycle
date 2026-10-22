@@ -542,6 +542,23 @@ resolve in one pass.
     bound is read as the obligations of its parts (a wrapper implements the trait when its type
     arguments do): `(B, crate::m::C): Eval` is the edge `B: Eval` plus the premise
     `crate::m::C: Eval`, as written.
+  - With `module`, the ranked engine reports such a cycle itself, in the module's terms, when it
+    is certain: a bound (or a peeled part of one) that names one of the module's own structs,
+    enums or unions by its path (`crate::m::C`, or `super::m::C` resolved against the module
+    path), where `C`'s impl leads back to the impl carrying the bound through impls without
+    generics:
+
+    ```text
+    error: decycle: `crate::m::C` names `C` of this module by its path, so this bound is left as
+           written, but `C`'s impl of `Loop` leads back to this impl (`A` → `C` → `A`): rustc
+           cannot prove that cycle (E0275)
+             = help: write `C` to make the bound part of the cycle decycle breaks
+    ```
+
+    Every such bound is reported, and nothing else: the module is emitted without the bounds that
+    would overflow on their own. A chain through a generic impl (`impl<T> Eval for Wrap<T>`),
+    a type with arguments, an impl under `#[cfg]` or another trait is left to rustc, as is a chain
+    of more bare bounds than `recurse_level`, which reaches the rank floor first and compiles.
   - `recurse_level`: expansion depth (default 10, must be at least 1)
   - `support_infinite_cycle`: enables/disable infinite cycle handling (default true)
   - `decycle`: override the path used to refer to this crate

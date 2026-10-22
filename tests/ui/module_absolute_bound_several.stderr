@@ -1,0 +1,26 @@
+error: decycle: `crate::m::B` names `B` of this module by its path, so this bound is left as written, but `B`'s impl of `Loop` leads back to this impl (`A` → `B` → `A`): rustc cannot prove that cycle (E0275)
+
+         = help: write `B` to make the bound part of the cycle decycle breaks
+
+  --> tests/ui/module_absolute_bound_several.rs:20:9
+   |
+20 |         crate::m::B: Loop,
+   |         ^^^^^^^^^^^
+
+error: decycle: `crate::m::A` names `A` of this module by its path, so this bound is left as written, but `A`'s impl of `Loop` leads back to this impl (`B` → `A` → `B`): rustc cannot prove that cycle (E0275)
+
+         = help: write `A` to make the bound part of the cycle decycle breaks
+
+  --> tests/ui/module_absolute_bound_several.rs:30:9
+   |
+30 |         crate::m::A: Loop,
+   |         ^^^^^^^^^^^
+
+error: decycle: `crate::m::C` names `C` of this module by its path, so this bound is left as written, but it bounds `C`'s own impl of `Loop` (`C` → `C`): rustc cannot prove that cycle (E0275)
+
+         = help: write `C` to make the bound part of the cycle decycle breaks
+
+  --> tests/ui/module_absolute_bound_several.rs:39:9
+   |
+39 |         crate::m::C: Loop,
+   |         ^^^^^^^^^^^

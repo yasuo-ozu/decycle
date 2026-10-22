@@ -41,6 +41,36 @@ as **0.8.0**, not as a 0.7 patch.
   Without `module` nothing changes, except for the spelling rules below. The programmatic forms are
   `ranked::process_module_at` and `structural::process_module_at`.
 
+- **With `module = path`, the ranked engine reports an opt-out bound on a cycle itself**, in the
+  module's terms, where rustc would report `E0275` on the engine's internals (``overflow evaluating
+  the requirement `A: ranked_traits…::LoopRanked…<((((((_,),),),),),)>` ``). A bound that names one
+  of the module's own structs, enums or unions by its path, `<module>::C` or a `super::m::C` that is
+  the same path once `super` is resolved against the module path, directly
+  (`where crate::m::C: Loop`) or as a part a peeled wrapper keeps (`(B, crate::m::C): Loop`), is
+  checked as if it were bare. When `C`'s impl leads back to the impl carrying the bound, the error
+  is at the bound, with the cycle:
+
+  ```text
+  error: decycle: `crate::m::C` names `C` of this module by its path, so this bound is left as written, but `C`'s impl of `Loop` leads back to this impl (`A` → `C` → `A`): rustc cannot prove that cycle (E0275)
+           = help: write `C` to make the bound part of the cycle decycle breaks
+  ```
+
+  Every such bound of the module is reported, and nothing else: the module emitted after the errors
+  drops the bounds of the `#[decycle]` traits that name no generic parameter, which rustc would
+  otherwise report as overflowing on their own. Only a certain overflow is reported, and only one
+  that the module states: the chain must run through impls without generic parameters, for types
+  declared in the module and named without arguments, each the only impl of the trait for its type
+  and carrying no attribute but lint levels and docs (no `#[cfg]`, no attribute macro), along
+  bounds that name the same trait bare. Anything else on the way (a generic impl such as
+  `impl<T> Loop for Wrap<T> where T: Loop`, whose answer depends on `T`, a type with arguments,
+  another trait, an associated-type constraint, a `for<..>` binder), a module under an attribute
+  that is not inert, and every module without `module` are left to rustc as before. The rank chain
+  is taken into account: a chain back with more bare bounds than `recurse_level` reaches the rank
+  floor first and compiles, so it is not reported (a call that reaches the floor on it fails
+  closed at run time, "re-entry fn not registered"). The structural engine is unchanged: its
+  `E0275` already names the module's types (`A: m::Loop`), and it does not peel a wrapped bound
+  into parts.
+
 - **A `#[decycle]` trait may have another `#[decycle]` trait of the module as a supertrait**
   (`trait Eval: Base`, or `self::Base`) with the ranked engine, which used to reject it ("a
   #[decycle] trait cannot be a supertrait of another #[decycle] trait"; a path-spelled supertrait
@@ -68,10 +98,11 @@ as **0.8.0**, not as a 0.7 patch.
   or `self::`-qualified: the trait of an impl, the trait and the types of a bound, and the self type
   of an impl. Anything the module writes as another path (`crate::m::X`, `super::X`,
   `crate::other::X`, `::krate::m::X`) names the item itself, the opt-out: it is left as written, so
-  a cycle through it fails to compile, never at run time. With the structural engine that is
-  rustc's own overflow (`E0275`) on the impls as written; with the ranked engine it is `E0275` too,
-  which can name the engine's `…Ranked` traits (and, in a module with several `#[decycle]` traits,
-  an `E0277` on internal names). In detail:
+  a cycle through it fails to compile, not at run time (but for a ranked chain back longer than
+  `recurse_level`, see **Added**). With the structural engine that is rustc's own overflow
+  (`E0275`) on the impls as written; with the ranked engine it is `E0275` too, which can name the
+  engine's `…Ranked` traits (and, in a module with several `#[decycle]` traits, an `E0277` on
+  internal names), unless `module = path` lets decycle report it first (see **Added**). In detail:
   - **structural**: the trait of an impl (`impl crate::m::Eval for X`, `impl super::Eval for X`),
     the trait and the types of a bound (`where Y: super::Eval`, `where crate::m::Term: Eval`) and
     the self type of an impl (`impl Eval for crate::m::Term`) used to be matched by their last

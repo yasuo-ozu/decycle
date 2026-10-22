@@ -49,6 +49,9 @@ pub(crate) struct ModuleScope {
     /// Types and traits declared directly in the module: struct, enum, union, type alias, trait and
     /// trait alias. These are what [`ModuleScope::qualify_item`] makes absolute.
     declared: HashSet<String>,
+    /// The nominal types among them (struct, enum, union): the ones a path can name with no doubt
+    /// about which type it is, unlike an alias. See [`ModuleScope::own_type_by_path`].
+    nominal: HashSet<String>,
     /// The nonce-named marker item [`ModuleScope::path_check`] declares in the module.
     marker: Ident,
 }
@@ -71,21 +74,23 @@ impl ModuleScope {
     /// `::..`), carries generic arguments, or does not end in the module's own name.
     pub(crate) fn new(path: &Path, module: &ItemMod) -> Self {
         check_module_path(path, &module.ident);
-        let declared = module
-            .content
-            .iter()
-            .flat_map(|(_, items)| items)
-            .filter_map(|item| match item {
-                Item::Struct(it) => Some(&it.ident),
-                Item::Enum(it) => Some(&it.ident),
-                Item::Union(it) => Some(&it.ident),
-                Item::Type(it) => Some(&it.ident),
-                Item::Trait(it) => Some(&it.ident),
-                Item::TraitAlias(it) => Some(&it.ident),
-                _ => None,
-            })
-            .map(seg_name)
-            .collect();
+        let mut declared = HashSet::new();
+        let mut nominal = HashSet::new();
+        for item in module.content.iter().flat_map(|(_, items)| items) {
+            let (ident, is_nominal) = match item {
+                Item::Struct(it) => (&it.ident, true),
+                Item::Enum(it) => (&it.ident, true),
+                Item::Union(it) => (&it.ident, true),
+                Item::Type(it) => (&it.ident, false),
+                Item::Trait(it) => (&it.ident, false),
+                Item::TraitAlias(it) => (&it.ident, false),
+                _ => continue,
+            };
+            if is_nominal {
+                nominal.insert(seg_name(ident));
+            }
+            declared.insert(seg_name(ident));
+        }
         let nonce = crate::identity_to_u64(&module.to_token_stream().to_string());
         let marker = Ident::new(
             &format!("__DecycleModule_{}", crate::name_suffix(nonce)),
@@ -94,8 +99,52 @@ impl ModuleScope {
         ModuleScope {
             path: path.clone(),
             declared,
+            nominal,
             marker,
         }
+    }
+
+    /// The name of the module's own struct, enum or union that `path` names **by a path**:
+    /// `<module>::X`, or `super::<name>::X`, which is the same path once `super` is resolved
+    /// against the module path. `None` for every other path: bare `X` and `self::X` are the
+    /// module's name for the item, not a path to it; a path to another module, to a re-export or
+    /// to an import, or one with generic arguments, does not provably name this module's `X`.
+    ///
+    /// The comparison is by segment name (`$crate` reads as `crate`, `r#X` as `X`), and only proves
+    /// something together with [`ModuleScope::path_check`], which rejects a module path that is
+    /// not this module's.
+    pub(crate) fn own_type_by_path(&self, path: &Path) -> Option<String> {
+        if path.segments.iter().any(|seg| !seg.arguments.is_none()) {
+            return None;
+        }
+        let module: Vec<String> = self
+            .path
+            .segments
+            .iter()
+            .map(|s| seg_name(&s.ident))
+            .collect();
+        let written: Vec<String> = path.segments.iter().map(|s| seg_name(&s.ident)).collect();
+        let resolved = match written.split_first() {
+            // `super::m::X` inside `crate::..::m`: `super` is the module path without its last
+            // segment. (A second `super` stays a `super` and matches nothing; the ranked engine
+            // rejects that spelling anyway.)
+            Some((first, rest)) if first == "super" && path.leading_colon.is_none() => {
+                let parent = &module[..module.len() - 1];
+                if parent.is_empty() {
+                    return None;
+                }
+                parent.iter().chain(rest).cloned().collect()
+            }
+            _ if path.leading_colon.is_some() != self.path.leading_colon.is_some() => return None,
+            _ => written,
+        };
+        let (name, prefix) = resolved.split_last()?;
+        (prefix == module.as_slice() && self.nominal.contains(name)).then(|| name.clone())
+    }
+
+    /// Is `ident` (bare) the name of a struct, enum or union declared directly in the module?
+    pub(crate) fn declares_nominal(&self, ident: &Ident) -> bool {
+        self.nominal.contains(&seg_name(ident))
     }
 
     /// The check that `path` is this module's own: a nonce-named marker item in the module, and a
@@ -540,6 +589,57 @@ mod tests {
             }
         };
         assert_eq!(qualified(module), items(&expected));
+    }
+
+    #[test]
+    fn a_path_to_an_own_type_is_the_module_path_and_a_declared_nominal_type() {
+        let module: ItemMod = parse_quote! {
+            mod m {
+                pub struct C;
+                pub enum E {}
+                pub type Alias = C;
+                pub trait Tr {}
+                use crate::other::Imported;
+            }
+        };
+        let own = |module_path: Path, path: Path| {
+            ModuleScope::new(&module_path, &module).own_type_by_path(&path)
+        };
+        let at_m = |path: Path| own(parse_quote!(crate::m), path);
+        assert_eq!(at_m(parse_quote!(crate::m::C)).as_deref(), Some("C"));
+        assert_eq!(at_m(parse_quote!(crate::m::r#E)).as_deref(), Some("E"));
+        assert_eq!(at_m(parse_quote!(super::m::C)).as_deref(), Some("C"));
+        // The module's own spellings, other modules, aliases, traits, imports, arguments.
+        let others: [Path; 12] = [
+            parse_quote!(C),
+            parse_quote!(self::C),
+            parse_quote!(crate::C),
+            parse_quote!(crate::other::C),
+            parse_quote!(crate::m::inner::C),
+            parse_quote!(::krate::m::C),
+            parse_quote!(super::C),
+            parse_quote!(super::super::m::C),
+            parse_quote!(crate::m::Alias),
+            parse_quote!(crate::m::Tr),
+            parse_quote!(crate::m::Imported),
+            parse_quote!(crate::m::C<u8>),
+        ];
+        for path in others {
+            assert_eq!(at_m(path.clone()), None, "{}", path.to_token_stream());
+        }
+        // `super` is resolved against the module path, and a leading `::` must match it.
+        let nested = parse_quote!(crate::outer::m);
+        assert_eq!(own(nested, parse_quote!(super::m::C)).as_deref(), Some("C"));
+        let rooted = || parse_quote!(::krate::m);
+        assert_eq!(
+            own(rooted(), parse_quote!(::krate::m::C)).as_deref(),
+            Some("C")
+        );
+        assert_eq!(
+            own(rooted(), parse_quote!(super::m::C)).as_deref(),
+            Some("C")
+        );
+        assert_eq!(own(rooted(), parse_quote!(krate::m::C)), None);
     }
 
     #[test]

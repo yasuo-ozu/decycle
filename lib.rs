@@ -117,13 +117,14 @@ pub use decycle_impl::structural;
 /// `where crate::m::Term: Eval`) is the item itself, the opt-out: it is left as written, and a cycle
 /// through it fails to compile as it would without `#[decycle]` — with `structural`, rustc's own
 /// overflow (`E0275`); with the ranked engine an `E0275` too, which may name its internal `…Ranked`
-/// traits. A wrapped bound is read as the obligations of its parts (a wrapper implements the trait
-/// when its type arguments do): `(B, crate::m::C): Eval` is the edge `B: Eval` and the premise
-/// `crate::m::C: Eval`, as written. An item that [`#[announce]`](https://docs.rs/announce) re-reads
-/// elsewhere, on the other hand, must spell every path absolutely. `module = path` gives the
-/// module's own absolute path — starting with `crate` (or `$crate` from a `macro_rules!`, or a
-/// leading `::` through `extern crate self as ..`), without generic arguments, and ending in the
-/// module's name. The cycle is still solved on the module as written, and once it is:
+/// traits (but see the last point below). A wrapped bound is read as the obligations of its parts
+/// (a wrapper implements the trait when its type arguments do): `(B, crate::m::C): Eval` is the
+/// edge `B: Eval` and the premise `crate::m::C: Eval`, as written. An item that
+/// [`#[announce]`](https://docs.rs/announce) re-reads elsewhere, on the other hand, must spell every
+/// path absolutely. `module = path` gives the module's own absolute path — starting with `crate`
+/// (or `$crate` from a `macro_rules!`, or a leading `::` through `extern crate self as ..`),
+/// without generic arguments, and ending in the module's name. The cycle is still solved on the
+/// module as written, and once it is:
 ///
 /// - in the items emitted as written (structs, enums, unions, type aliases, traits, fns, consts,
 ///   statics, and the impls an engine does not take over), a bare or `self::` name of a type or
@@ -137,6 +138,16 @@ pub use decycle_impl::structural;
 /// - the path is checked against the module: a path that is not this module's — one naming another
 ///   module, which would otherwise quietly retarget a name to that module's item, or one naming no
 ///   module — is an error at the `module` argument.
+/// - with the ranked engine, an opt-out bound on a cycle is reported in the module's terms, when the
+///   overflow is certain: a bound (or a peeled part of one) that names one of the module's own
+///   structs, enums or unions by its path (`crate::m::C`, or `super::m::C` resolved against the
+///   module path), where `C`'s impl leads back to the impl carrying the bound through impls without
+///   generics, is an error at the bound — ``decycle: `crate::m::C` names `C` of this module by its
+///   path, so this bound is left as written, but `C`'s impl of `Loop` leads back to this impl (`A`
+///   → `C` → `A`): rustc cannot prove that cycle (E0275)``, with the help to write `C` — and only
+///   these errors are reported. A chain through a generic impl, a type with arguments, an impl
+///   under `#[cfg]` or another trait is left to rustc, as is a chain of more bare bounds than
+///   `recurse_level`, which reaches the rank floor first and compiles.
 ///
 /// ```rust
 /// #[decycle::decycle(module = crate::ast)]

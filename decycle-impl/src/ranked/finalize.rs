@@ -197,14 +197,7 @@ fn remove_cyclic_bounds(
 ) -> Generics {
     // Needed unconditionally now: a bare-param target counts as a cycle participant either way
     // (`keep_bareparam` only decides whether such a bound is RETAINED, not whether it is cyclic).
-    let param_idents: std::collections::HashSet<Ident> = generics
-        .params
-        .iter()
-        .filter_map(|p| match p {
-            GenericParam::Type(t) => Some(t.ident.clone()),
-            _ => None,
-        })
-        .collect();
+    let param_idents = crate::names::type_param_idents(generics);
     let self_heads = cycle_self_heads(replacing_table);
     let mut g = generics.clone();
     replace_constraints(&mut g, |ty, trait_path| {
@@ -215,7 +208,7 @@ fn remove_cyclic_bounds(
         // deliberately-qualified reference was stripped too — and that is the caller's only way to
         // say "this is an ordinary leaf premise, not an edge".
         let mut probe = trait_path.clone();
-        crate::helper::strip_leading_self(&mut probe);
+        crate::names::strip_leading_self(&mut probe);
         let last_names_cyclic = probe
             .segments
             .last()
@@ -305,14 +298,7 @@ fn requalify_foreign_premises(
     generics: &mut Generics,
     replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
 ) {
-    let param_idents: std::collections::HashSet<Ident> = generics
-        .params
-        .iter()
-        .filter_map(|p| match p {
-            GenericParam::Type(t) => Some(t.ident.clone()),
-            _ => None,
-        })
-        .collect();
+    let param_idents = crate::names::type_param_idents(generics);
     let self_heads = cycle_self_heads(replacing_table);
     let Some(wc) = &mut generics.where_clause else {
         return;
@@ -1173,15 +1159,7 @@ fn cyclic_where_bounds(
     impl_: &ItemImpl,
     replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
 ) -> Vec<CyclicBound> {
-    let param_idents: std::collections::HashSet<Ident> = impl_
-        .generics
-        .params
-        .iter()
-        .filter_map(|p| match p {
-            GenericParam::Type(t) => Some(t.ident.clone()),
-            _ => None,
-        })
-        .collect();
+    let param_idents = crate::names::type_param_idents(&impl_.generics);
     let mut out = Vec::new();
     let Some(wc) = &impl_.generics.where_clause else {
         return out;
@@ -1381,15 +1359,7 @@ fn bound_target_floor_is_unsized(
     };
     let mut decision: Option<bool> = None;
     for cand in impls {
-        let pattern_vars: std::collections::HashSet<Ident> = cand
-            .generics
-            .params
-            .iter()
-            .filter_map(|p| match p {
-                GenericParam::Type(t) => Some(t.ident.clone()),
-                _ => None,
-            })
-            .collect();
+        let pattern_vars = crate::names::type_param_idents(&cand.generics);
         let cand_targs = cand
             .trait_
             .as_ref()
@@ -2034,15 +2004,7 @@ fn reachable_side_bounds_ok(
         };
         let mut matched_any = false;
         for cand in impls {
-            let pattern_vars: std::collections::HashSet<Ident> = cand
-                .generics
-                .params
-                .iter()
-                .filter_map(|p| match p {
-                    GenericParam::Type(t) => Some(t.ident.clone()),
-                    _ => None,
-                })
-                .collect();
+            let pattern_vars = crate::names::type_param_idents(&cand.generics);
             let cand_targs = cand
                 .trait_
                 .as_ref()
@@ -3686,7 +3648,7 @@ fn ranked_supertrait(
     replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
 ) -> Option<Ident> {
     let mut probe = path.clone();
-    crate::helper::strip_leading_self(&mut probe);
+    crate::names::strip_leading_self(&mut probe);
     if probe.leading_colon.is_some() || probe.segments.len() != 1 {
         return None;
     }
@@ -3697,15 +3659,7 @@ fn ranked_supertrait(
         .map_or(&[][..], |(_, _, impls)| &impls[..]);
     let implemented_here = own_impls.iter().all(|im| {
         sup_impls.iter().any(|cand| {
-            let vars: std::collections::HashSet<Ident> = cand
-                .generics
-                .params
-                .iter()
-                .filter_map(|p| match p {
-                    GenericParam::Type(t) => Some(t.ident.clone()),
-                    _ => None,
-                })
-                .collect();
+            let vars = crate::names::type_param_idents(&cand.generics);
             unify_type_pattern(&vars, &cand.self_ty, &im.self_ty).is_some()
         })
     });

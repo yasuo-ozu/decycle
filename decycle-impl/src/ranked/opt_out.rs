@@ -51,7 +51,7 @@
 //! fallback drops the global bounds of the `#[decycle]` traits ([`quiet`]): the impls hold
 //! unconditionally, the bodies still type-check, and the new errors stand alone.
 
-use crate::helper::strip_leading_self;
+use crate::names::strip_leading_self;
 use crate::module_path::ModuleScope;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use syn::visit::Visit;
@@ -93,7 +93,7 @@ pub(crate) fn opt_out_cycles(
         let Some(trait_name) = adopted_trait(im, routed) else {
             continue;
         };
-        let Some(head) = crate::helper::local_type_head_ident(&im.self_ty) else {
+        let Some(head) = crate::names::local_type_head_ident(&im.self_ty) else {
             continue;
         };
         let concrete = is_concrete(im, &head, scope);
@@ -118,7 +118,7 @@ pub(crate) fn opt_out_cycles(
         let Some(trait_name) = adopted_trait(im, routed) else {
             continue;
         };
-        let Some(head) = crate::helper::local_type_head_ident(&im.self_ty) else {
+        let Some(head) = crate::names::local_type_head_ident(&im.self_ty) else {
             continue;
         };
         let head = crate::helper::unraw(&head);

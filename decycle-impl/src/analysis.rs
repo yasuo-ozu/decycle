@@ -19,15 +19,12 @@
 //!        Stmt -Direct-> Expr   (the bound named `Expr` itself)
 //! ```
 
-use crate::helper::strip_leading_self;
+use crate::names::{is_routed_bound, routed_ident};
 use proc_macro2::Ident;
 use safegraph::graph::Graph;
 use safegraph::VecGraph;
 use std::collections::{HashMap, HashSet};
-use syn::visit::Visit;
-use syn::{
-    Item, ItemImpl, ItemMod, Path, TraitBound, Type, TypeParamBound, UseTree, WherePredicate,
-};
+use syn::{Item, ItemImpl, ItemMod, Path, Type, UseTree, WherePredicate};
 
 /// How a cyclic where-bound names the participant it reaches.
 ///
@@ -210,22 +207,16 @@ fn participants(items: &[Item], routed: &HashSet<Ident>) -> HashSet<Ident> {
 /// The head ident of the impl's self type, as a node — read as the engines do: a self type spelled
 /// by a path (`impl Tr for crate::m::Term`) names the item itself, the opt-out, and is no node.
 fn self_head(im: &ItemImpl) -> Option<Ident> {
-    crate::helper::local_type_head_ident(&im.self_ty)
+    crate::names::local_type_head_ident(&im.self_ty)
 }
 
 /// Does this impl's trait path name a routed trait in the form the engines adopt — a single segment
 /// after `self::`-normalisation? A crate-rooted or `super::` spelling is the documented opt-out.
 fn impls_routed_trait(im: &ItemImpl, routed: &HashSet<Ident>) -> bool {
-    let Some((_, path, _)) = im.trait_.as_ref() else {
-        return false;
-    };
-    path_names_routed(path, routed)
-}
-
-fn path_names_routed(path: &Path, routed: &HashSet<Ident>) -> bool {
-    let mut path = path.clone();
-    strip_leading_self(&mut path);
-    path.segments.len() == 1 && routed.contains(&path.segments[0].ident)
+    im.trait_
+        .as_ref()
+        .and_then(|(_, path, _)| routed_ident(path))
+        .is_some_and(|ident| routed.contains(ident))
 }
 
 /// The participants reached by this impl's cyclic where-bounds, with how each was reached.
@@ -242,15 +233,7 @@ fn bound_edges(
     // above promises such bounds are not represented, and the engine's own matchers
     // (`remove_cyclic_bounds` / `cyclic_where_bounds` in `ranked/finalize.rs`) already consult
     // exactly this set.
-    let param_idents: HashSet<Ident> = im
-        .generics
-        .params
-        .iter()
-        .filter_map(|p| match p {
-            syn::GenericParam::Type(t) => Some(t.ident.clone()),
-            _ => None,
-        })
-        .collect();
+    let param_idents = crate::names::type_param_idents(&im.generics);
     let mut out = Vec::new();
     for pred in &where_clause.predicates {
         let WherePredicate::Type(pt) = pred else {
@@ -290,15 +273,9 @@ fn bound_edges(
     out
 }
 
-fn is_routed_bound(bound: &TypeParamBound, routed: &HashSet<Ident>) -> bool {
-    let TypeParamBound::Trait(TraitBound { path, .. }) = bound else {
-        return false;
-    };
-    path_names_routed(path, routed)
-}
-
-/// The participant `path` names — but only when the path can actually *denote* one: a bare ident,
-/// or its no-op `self::`-qualified form.
+/// The participant `ty`'s head names — but only when its path can actually *denote* one: a bare
+/// ident, or its no-op `self::`-qualified form (`crate::names::bare_ident`). `None` for a non-path
+/// type (`&Stmt`, `(A, B)`) or a `<T as Tr>::X` qself.
 ///
 /// A path rooted anywhere else (`crate::other::Stmt`, `super::Stmt`, `::dep::Stmt`) reaches a
 /// DIFFERENT item that merely shares its last segment with a participant, so a bound on it is an
@@ -309,52 +286,20 @@ fn is_routed_bound(bound: &TypeParamBound, routed: &HashSet<Ident>) -> bool {
 /// `{Expr, Stmt}` over the LOCAL `Stmt` that no engine would ever break.
 ///
 /// The returned ident is cloned from the source, never rebuilt, so a raw identifier survives.
-fn local_participant(path: &Path, participants: &HashSet<Ident>) -> Option<Ident> {
-    if !crate::helper::path_names_local_ident(path, participants) {
-        return None;
-    }
-    let mut probe = path.clone();
-    strip_leading_self(&mut probe);
-    probe.segments.last().map(|s| s.ident.clone())
-}
-
-/// [`local_participant`] applied to the *head* of `ty` — `None` for a non-path type (`&Stmt`,
-/// `(A, B)`) or a `<T as Tr>::X` qself, as `helper::type_head_ident` has it.
 fn local_participant_head(ty: &Type, participants: &HashSet<Ident>) -> Option<Ident> {
-    match ty {
-        Type::Path(syn::TypePath { qself: None, path }) => local_participant(path, participants),
-        _ => None,
-    }
+    crate::names::local_type_head_ident(ty).filter(|head| participants.contains(head))
 }
 
-/// Participant idents appearing anywhere inside `ty`, outermost first, without repeats.
+/// Participant idents appearing anywhere inside `ty`, outermost first, without repeats. A foreign
+/// wrapper still has its arguments visited: `crate::other::Wrap<Stmt>` reaches the local `Stmt`.
 fn nested_participants(ty: &Type, participants: &HashSet<Ident>) -> Vec<Ident> {
-    struct V<'a> {
-        participants: &'a HashSet<Ident>,
-        seen: HashSet<String>,
-        out: Vec<Ident>,
-    }
-    impl Visit<'_> for V<'_> {
-        fn visit_type_path(&mut self, tp: &syn::TypePath) {
-            if tp.qself.is_none() {
-                if let Some(ident) = local_participant(&tp.path, self.participants) {
-                    if self.seen.insert(ident.to_string()) {
-                        self.out.push(ident);
-                    }
-                }
-            }
-            // A foreign wrapper still has its arguments visited: `crate::other::Wrap<Stmt>`
-            // reaches the local `Stmt`.
-            syn::visit::visit_type_path(self, tp);
-        }
-    }
-    let mut v = V {
-        participants,
-        seen: HashSet::new(),
-        out: Vec::new(),
-    };
-    v.visit_type(ty);
-    v.out
+    let mut seen: HashSet<String> = HashSet::new();
+    crate::names::bare_named_in(ty, &|i| participants.contains(i))
+        .into_iter()
+        .filter_map(|tp| crate::names::bare_ident(&tp.path))
+        .filter(|ident| seen.insert(ident.to_string()))
+        .cloned()
+        .collect()
 }
 
 /// Assemble a graph from nodes and `(from, to, kind)` edges given by node **position**. Edges

@@ -160,61 +160,31 @@ impl Graph {
     }
 }
 
-/// Local ADT idents appearing anywhere in `ty` (peeling references/containers/tuples).
+/// Local ADT idents appearing anywhere in `ty` (peeling references/containers/tuples), outermost
+/// first, without repeats.
 ///
 /// A local ADT is named by its bare (or `self::`-qualified) name, as in the ranked engine: a path
 /// the module writes (`crate::m::Stmt`, `super::Stmt`) names the item itself, the opt-out, and is no
 /// edge of the cycle. The arguments of any path are still visited, so `crate::other::Wrap<Stmt>`
-/// names `Stmt`.
+/// names `Stmt`. See [`crate::names::BareNamed`].
 pub(crate) fn local_refs(ty: &Type, adt_names: &HashSet<String>) -> Vec<String> {
-    struct Refs<'a> {
-        adt_names: &'a HashSet<String>,
-        out: Vec<String>,
-    }
-    impl<'ast> syn::visit::Visit<'ast> for Refs<'_> {
-        fn visit_type_path(&mut self, tp: &'ast syn::TypePath) {
-            if tp.qself.is_none() {
-                if let Some(ident) = bare_ident(&tp.path) {
-                    let s = ident.to_string();
-                    if self.adt_names.contains(&s) && !self.out.contains(&s) {
-                        self.out.push(s);
-                    }
-                }
-            }
-            syn::visit::visit_type_path(self, tp);
+    let mut out: Vec<String> = Vec::new();
+    for tp in local_ref_paths(ty, adt_names) {
+        let name = bare_ident(&tp.path).map(|i| i.to_string());
+        if let Some(name) = name.filter(|name| !out.contains(name)) {
+            out.push(name);
         }
     }
-    let mut refs = Refs {
-        adt_names,
-        out: Vec::new(),
-    };
-    syn::visit::Visit::visit_type(&mut refs, ty);
-    refs.out
+    out
 }
 
 /// The occurrences of local ADTs in `ty`, as [`local_refs`] finds them: each path naming one, with
 /// its arguments (`Term<S>` in `Box<Term<S>>`).
 pub(crate) fn local_ref_paths(ty: &Type, adt_names: &HashSet<String>) -> Vec<syn::TypePath> {
-    struct Refs<'a> {
-        adt_names: &'a HashSet<String>,
-        out: Vec<syn::TypePath>,
-    }
-    impl<'ast> syn::visit::Visit<'ast> for Refs<'_> {
-        fn visit_type_path(&mut self, tp: &'ast syn::TypePath) {
-            if tp.qself.is_none()
-                && bare_ident(&tp.path).is_some_and(|i| self.adt_names.contains(&i.to_string()))
-            {
-                self.out.push(tp.clone());
-            }
-            syn::visit::visit_type_path(self, tp);
-        }
-    }
-    let mut refs = Refs {
-        adt_names,
-        out: Vec::new(),
-    };
-    syn::visit::Visit::visit_type(&mut refs, ty);
-    refs.out
+    crate::names::bare_named_in(ty, &|i| adt_names.contains(&i.to_string()))
+        .into_iter()
+        .cloned()
+        .collect()
 }
 
 /// Visit every path-segment ident within `ty`, descending references/containers/tuples/generic args,

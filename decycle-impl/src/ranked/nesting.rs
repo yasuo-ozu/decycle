@@ -447,11 +447,11 @@ impl LiftRelative<'_> {
 
     /// Is `path` the spelling that marks a cycle edge — the bare name of a routed trait, or its
     /// no-op `self::`-qualified form? Only those participate in ranking (the same bare-or-`self::`
-    /// rule `peel::is_bare_cyclic_bound` applies), so only those must survive un-aliased for the
+    /// rule `crate::names::is_routed_bound` applies), so only those must survive un-aliased for the
     /// downstream rewrites to recognise them. A longer-qualified reference (`super::x::Tr`)
     /// deliberately names the original, un-ranked trait and is lifted like any other premise.
     fn spells_cycle_edge(&self, path: &Path) -> bool {
-        crate::helper::path_names_local_ident(path, self.cyclic_traits)
+        crate::names::path_names_local_ident(path, self.cyclic_traits)
     }
 
     /// Lift a path written in **value position** — an expression, a struct literal, or a pattern.

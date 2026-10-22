@@ -57,22 +57,6 @@ pub(crate) struct Model {
     pub nonce: u64,
 }
 
-/// The ident a path names a cycle participant by: its bare name, or the no-op `self::` form. Any
-/// other path (`crate::m::Tr`, `super::Term`, `crate::other::B`) names the item itself, the
-/// opt-out, and takes no part in the cycle — as in the ranked engine.
-pub(crate) fn bare_ident(path: &syn::Path) -> Option<&Ident> {
-    let mut segments = path.segments.iter();
-    if path.leading_colon.is_some() {
-        return None;
-    }
-    let mut first = segments.next()?;
-    // A leading, argument-less `self` is a no-op prefix (`helper::strip_leading_self`).
-    if first.ident == "self" && first.arguments.is_none() {
-        first = segments.next()?;
-    }
-    segments.next().is_none().then_some(&first.ident)
-}
-
 impl Model {
     /// The declaration of `name` in trait `trait_key`, when that trait is declared in this module.
     pub fn trait_method_sig(&self, trait_key: &str, name: &Ident) -> Option<&syn::Signature> {
@@ -160,13 +144,7 @@ pub(crate) fn trait_key(path: &syn::Path) -> Option<String> {
 /// `self::`) path: `impl Tr for crate::other::B` names the item itself, the opt-out, and is no
 /// member even beside a local `B`.
 pub(crate) fn impl_self_ident(im: &ItemImpl) -> Option<Ident> {
-    let Type::Path(tp) = &*im.self_ty else {
-        return None;
-    };
-    if tp.qself.is_some() {
-        return None;
-    }
-    bare_ident(&tp.path).cloned()
+    crate::names::local_type_head_ident(&im.self_ty)
 }
 
 fn impl_self_args(im: &ItemImpl) -> Vec<GenericArgument> {

@@ -36,6 +36,9 @@ mod rho;
 #[cfg(test)]
 mod tests;
 
+// The bare-name rule a participant is read by, shared with the ranked engine.
+use crate::names::bare_ident;
+
 pub(crate) use analyze::*;
 pub(crate) use codegen::*;
 pub(crate) use collect::*;

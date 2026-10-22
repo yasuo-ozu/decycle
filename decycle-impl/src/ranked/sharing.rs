@@ -21,7 +21,7 @@
 use proc_macro2::Ident;
 use std::collections::{HashMap, HashSet};
 use syn::visit_mut::VisitMut;
-use syn::{ItemImpl, TypeParamBound, WherePredicate};
+use syn::{ItemImpl, WherePredicate};
 use template_quote::quote;
 
 /// Apply the union to one trait's impls — see the module docs.
@@ -253,14 +253,9 @@ fn is_bare_trait_pred(pred: &WherePredicate, routed_traits: &HashSet<Ident>) -> 
     let WherePredicate::Type(pt) = pred else {
         return false;
     };
-    pt.bounds.iter().any(|b| match b {
-        TypeParamBound::Trait(tb) => {
-            let mut path = tb.path.clone();
-            crate::helper::strip_leading_self(&mut path);
-            path.segments.len() == 1 && routed_traits.contains(&path.segments[0].ident)
-        }
-        _ => false,
-    })
+    pt.bounds
+        .iter()
+        .any(|b| crate::names::is_routed_bound(b, routed_traits))
 }
 
 /// Is the predicate's bounded type one the ranked chain descends — `Self`, one of the impl's own type

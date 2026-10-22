@@ -52,6 +52,8 @@ use syn::{
 };
 use template_quote::ToTokens;
 
+use crate::names::strip_parens;
+
 /// One cyclic bound of an impl, as this pass follows it: the bound `trait_path` on `target`, a cycle
 /// member's type. A wrapped bound (`Box<Term<S>>: Size<T>`) is followed to the member inside it
 /// (`Term<S>`), as the engines read it: a wrapper implements the trait when its arguments do.
@@ -638,18 +640,9 @@ fn match_header(j: &ItemImpl, vars: &Params, edge: &CycleEdge, receiver: &Params
 }
 
 fn last_args_of_type(ty: &Type) -> Option<&PathArguments> {
-    match strip(ty) {
+    match strip_parens(ty) {
         Type::Path(TypePath { qself: None, path }) => Some(&path.segments.last()?.arguments),
         _ => None,
-    }
-}
-
-/// See through `(T)` and invisible groups.
-fn strip(ty: &Type) -> &Type {
-    match ty {
-        Type::Paren(p) => strip(&p.elem),
-        Type::Group(g) => strip(&g.elem),
-        other => other,
     }
 }
 
@@ -674,7 +667,7 @@ impl Matcher<'_> {
     }
 
     fn ty(&mut self, p: &Type, t: &Type) -> bool {
-        let (p, t) = (strip(p), strip(t));
+        let (p, t) = (strip_parens(p), strip_parens(t));
         if let Some(var) = self.vars.type_var(p) {
             return self.bind(var, Value::Type(t.clone()));
         }
@@ -709,8 +702,8 @@ impl Matcher<'_> {
     fn path(&mut self, p: &Path, t: &Path) -> bool {
         // `self::Foo` is `Foo`.
         let (mut p, mut t) = (p.clone(), t.clone());
-        crate::helper::strip_leading_self(&mut p);
-        crate::helper::strip_leading_self(&mut t);
+        crate::names::strip_leading_self(&mut p);
+        crate::names::strip_leading_self(&mut t);
         if p.leading_colon.is_some() != t.leading_colon.is_some()
             || p.segments.len() != t.segments.len()
         {
@@ -1099,7 +1092,7 @@ mod tests {
     /// without whitespace.
     fn run(impls: &[ItemImpl], respell: Respell) -> Vec<Vec<String>> {
         let refs: Vec<&ItemImpl> = impls.iter().collect();
-        let head = |ty: &Type| crate::helper::local_type_head_ident(strip(ty));
+        let head = |ty: &Type| crate::names::local_type_head_ident(strip_parens(ty));
         let trait_of = |im: &ItemImpl| {
             im.trait_
                 .as_ref()

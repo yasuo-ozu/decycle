@@ -3,6 +3,8 @@
 
 use super::*;
 use crate::generics_fmt::{params_decl, params_use, wrap_angle, DeclBounds};
+// See through `(T)` and invisible groups, so the shape checks below match on the real type.
+use crate::names::strip_parens;
 
 /// An expression that reinterprets the receiver `self` into `target`-space (a same-layout type).
 /// `&self`/`&mut self` use a pointer cast; any other receiver — owned `self`, or a custom type such as
@@ -416,7 +418,7 @@ fn canon_self(impl_ty: &Type, decl_ty: &Type, self_ty: &Type) -> Type {
         }
         _ => {}
     }
-    let decl = strip_group(decl_ty);
+    let decl = strip_parens(decl_ty);
     if is_plain_self(decl) {
         return if same_spelling(impl_ty, self_ty) {
             parse_quote!(Self)
@@ -556,7 +558,7 @@ fn canon_self_bounds(
 /// crate deliberately does not enable, so compare rendered tokens: `A<T>` and `A < T >` both render
 /// as `A < T >`, and groups are stripped first so a macro-wrapped type still matches.
 fn same_spelling(a: &Type, b: &Type) -> bool {
-    strip_group(a).to_token_stream().to_string() == strip_group(b).to_token_stream().to_string()
+    strip_parens(a).to_token_stream().to_string() == strip_parens(b).to_token_stream().to_string()
 }
 
 /// The trait is `#[decycle] use`-imported, so its declaration is not available to canonicalize
@@ -978,16 +980,6 @@ fn nat_method(f: &syn::ImplItemFn, cx: &ImplCx) -> syn::Result<TokenStream> {
     }
 }
 
-/// See through `(T)` and the invisible groups a macro-expanded type can be wrapped in, so the
-/// trait-object checks below match on the real shape.
-fn strip_group(ty: &Type) -> &Type {
-    match ty {
-        Type::Group(g) => strip_group(&g.elem),
-        Type::Paren(p) => strip_group(&p.elem),
-        other => other,
-    }
-}
-
 /// Re-wrap a `&dyn Fn(..)`-shaped argument that mentions `Self` into `target`-space.
 ///
 /// The type-punning cast is unsound for trait objects: `dyn Fn(&A) -> R` and `dyn Fn(&ATerm) -> R`
@@ -1013,7 +1005,7 @@ fn dyn_fn_adapter(
     // Only `&dyn ..` is in scope here; `Box<dyn ..>`/`&mut dyn ..` fall through to the reject
     // below via `mentions_self` on their inner object.
     let Type::Reference(r) = ty else {
-        return match strip_group(ty) {
+        return match strip_parens(ty) {
             Type::TraitObject(_) => Err(syn::Error::new(
                 ty.span(),
                 "#[decycle(structural)]: a by-value or boxed trait object mentioning `Self` \
@@ -1024,7 +1016,7 @@ fn dyn_fn_adapter(
             _ => Ok(None),
         };
     };
-    let Type::TraitObject(to) = strip_group(&r.elem) else {
+    let Type::TraitObject(to) = strip_parens(&r.elem) else {
         return Ok(None);
     };
     if r.mutability.is_some() {
@@ -1346,7 +1338,7 @@ impl ProjCtx {
 
 /// Is `ty` (through parens/groups) exactly the plain `Self` path?
 fn is_plain_self(ty: &Type) -> bool {
-    matches!(strip_group(ty),
+    matches!(strip_parens(ty),
         Type::Path(tp) if tp.qself.is_none() && tp.path.is_ident("Self"))
 }
 

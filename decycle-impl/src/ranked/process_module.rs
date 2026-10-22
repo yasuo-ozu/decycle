@@ -133,12 +133,10 @@ pub(crate) fn is_local_impl_bound_target(ty: &Type, impl_type_params: &HashSet<I
 /// Does `im` implement a routed trait in the spelling the engine takes over — a single segment after
 /// `self::`-normalisation?
 fn impls_routed_trait(im: &ItemImpl, all_traits: &HashSet<Ident>) -> bool {
-    let Some((_, trait_path, _)) = im.trait_.as_ref() else {
-        return false;
-    };
-    let mut tp = trait_path.clone();
-    crate::helper::strip_leading_self(&mut tp);
-    tp.segments.len() == 1 && all_traits.contains(&tp.segments[0].ident)
+    im.trait_
+        .as_ref()
+        .and_then(|(_, trait_path, _)| crate::names::routed_ident(trait_path))
+        .is_some_and(|ident| all_traits.contains(ident))
 }
 
 /// `impl Tr for self::Term` → `impl Tr for Term`, the spelling a cycle member is matched by — unless
@@ -148,7 +146,7 @@ fn bare_self_type(im: &mut ItemImpl) {
         return;
     };
     let mut bare = path.clone();
-    crate::helper::strip_leading_self(&mut bare);
+    crate::names::strip_leading_self(&mut bare);
     let shadowed = bare.segments.len() == 1
         && im
             .generics
@@ -166,9 +164,7 @@ fn self_ty_spelled_by_path(ty: &Type) -> bool {
     let Type::Path(TypePath { qself: None, path }) = ty else {
         return false;
     };
-    let mut probe = path.clone();
-    crate::helper::strip_leading_self(&mut probe);
-    probe.leading_colon.is_some() || probe.segments.len() > 1
+    crate::names::bare_ident(path).is_none()
 }
 
 fn has_assoc_constraints(path: &Path) -> bool {
@@ -211,15 +207,7 @@ fn validate_impl_where_bounds(
     all_traits: &HashSet<Ident>,
     cycle_self_heads: &HashSet<Ident>,
 ) {
-    let impl_type_params: HashSet<Ident> = item_impl
-        .generics
-        .params
-        .iter()
-        .filter_map(|param| match param {
-            GenericParam::Type(ty) => Some(ty.ident.clone()),
-            _ => None,
-        })
-        .collect();
+    let impl_type_params = crate::names::type_param_idents(&item_impl.generics);
 
     let Some(where_clause) = &item_impl.generics.where_clause else {
         return;
@@ -241,7 +229,7 @@ fn validate_impl_where_bounds(
             };
             let mut path = path.clone();
             let was_self_qualified = path.segments.len() > 1;
-            crate::helper::strip_leading_self(&mut path);
+            crate::names::strip_leading_self(&mut path);
             // Single-segment match only (after self::-normalization) — a multi-segment
             // path (`some::mod::Foo`) merely sharing a last segment with a #[decycle]
             // trait is a DIFFERENT item; matching on the last segment alone was a false
@@ -281,7 +269,7 @@ fn validate_impl_where_bounds(
                 // different item from the local `Stmt`, and reading it as rank-lowerable skipped
                 // the abort below and let `finalize` rank-lower a foreign type — a wall of
                 // unprovable `TrRanked<…>` errors in place of one legible rejection.
-                let head_ok = crate::helper::local_type_head_ident(bounded_ty)
+                let head_ok = crate::names::local_type_head_ident(bounded_ty)
                     .is_some_and(|h| cycle_self_heads.contains(&h));
                 // F6: the earlier wording ("...on non-local type") described what the check
                 // rejects, but the check doesn't actually key on locality — a bound on a
@@ -335,15 +323,7 @@ fn ranked_cycle_edges(
     adopted_heads: &HashSet<Ident>,
     is_edge: &dyn Fn(&ItemImpl, &WherePredicate) -> bool,
 ) -> Vec<crate::premise_flow::CycleEdge> {
-    let type_params: HashSet<Ident> = im
-        .generics
-        .params
-        .iter()
-        .filter_map(|p| match p {
-            GenericParam::Type(t) => Some(t.ident.clone()),
-            _ => None,
-        })
-        .collect();
+    let type_params = crate::names::type_param_idents(&im.generics);
     let binder_of = |b: Option<&BoundLifetimes>| -> Vec<Lifetime> {
         b.into_iter()
             .flat_map(|b| &b.lifetimes)
@@ -353,12 +333,7 @@ fn ranked_cycle_edges(
             })
             .collect()
     };
-    let trait_ident_of = |path: &Path| -> Option<Ident> {
-        let mut path = path.clone();
-        crate::helper::strip_leading_self(&mut path);
-        (path.leading_colon.is_none() && path.segments.len() == 1)
-            .then(|| path.segments[0].ident.clone())
-    };
+    let trait_ident_of = |path: &Path| crate::names::bare_ident(path).cloned();
     let mut out = Vec::new();
     for pred in im.generics.where_clause.iter().flat_map(|wc| &wc.predicates) {
         let WherePredicate::Type(pt) = pred else {
@@ -373,7 +348,7 @@ fn ranked_cycle_edges(
             }
             other => other.clone(),
         };
-        let Some(head) = crate::helper::local_type_head_ident(&target) else {
+        let Some(head) = crate::names::local_type_head_ident(&target) else {
             continue;
         };
         if type_params.contains(&head) || !adopted_heads.contains(&head) {
@@ -395,7 +370,7 @@ fn ranked_cycle_edges(
                         .as_ref()
                         .and_then(|(_, path, _)| trait_ident_of(path))
                         .is_some_and(|t| t == trait_ident)
-                        && crate::helper::local_type_head_ident(&j.self_ty)
+                        && crate::names::local_type_head_ident(&j.self_ty)
                             .is_some_and(|h| h == head)
                 })
                 .map(|(k, _)| k)
@@ -450,15 +425,7 @@ fn sharing_sources(members: &[&ItemImpl], trait_ident: &Ident) -> Vec<Vec<usize>
     let mut edges: Vec<(String, String)> = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
     for (i, im) in members.iter().enumerate() {
-        let impl_type_params: HashSet<Ident> = im
-            .generics
-            .params
-            .iter()
-            .filter_map(|param| match param {
-                GenericParam::Type(ty) => Some(ty.ident.clone()),
-                _ => None,
-            })
-            .collect();
+        let impl_type_params = crate::names::type_param_idents(&im.generics);
         let Some(where_clause) = &im.generics.where_clause else {
             continue;
         };
@@ -470,12 +437,8 @@ fn sharing_sources(members: &[&ItemImpl], trait_ident: &Ident) -> Vec<Vec<usize>
                 continue;
             }
             let names_this_trait = pt.bounds.iter().any(|b| {
-                let TypeParamBound::Trait(TraitBound { path, .. }) = b else {
-                    return false;
-                };
-                let mut path = path.clone();
-                crate::helper::strip_leading_self(&mut path);
-                path.segments.len() == 1 && path.segments[0].ident == *trait_ident
+                matches!(b, TypeParamBound::Trait(TraitBound { path, .. })
+                    if crate::names::routed_ident(path) == Some(trait_ident))
             });
             if !names_this_trait {
                 continue;
@@ -490,7 +453,7 @@ fn sharing_sources(members: &[&ItemImpl], trait_ident: &Ident) -> Vec<Vec<usize>
             // sibling's own leaf premises into `A` — `A<NotClone>: Tr` stopped holding, while
             // renaming the foreign type made the identical program compile. Same rule as
             // `peel::cycle_types_within`.
-            let Some(head) = crate::helper::local_type_head_ident(&pt.bounded_ty) else {
+            let Some(head) = crate::names::local_type_head_ident(&pt.bounded_ty) else {
                 continue;
             };
             let head = head.to_string();
@@ -780,15 +743,7 @@ fn process_module_inner(
     // validation below only rejects heads that genuinely cannot be made rankable.
     for item in contents.iter_mut() {
         if let Item::Impl(im) = item {
-            let impl_type_params: HashSet<Ident> = im
-                .generics
-                .params
-                .iter()
-                .filter_map(|param| match param {
-                    GenericParam::Type(ty) => Some(ty.ident.clone()),
-                    _ => None,
-                })
-                .collect();
+            let impl_type_params = crate::names::type_param_idents(&im.generics);
             crate::ranked::peel::peel_cyclic_bounds(im, &all_traits, &cycle_self_heads, &|ty| {
                 is_local_impl_bound_target(ty, &impl_type_params)
             });
@@ -836,7 +791,7 @@ fn process_module_inner(
                 if adopts(item_impl) {
                     let mut normalized_impl = item_impl.clone();
                     let trait_path = &mut normalized_impl.trait_.as_mut().unwrap().1;
-                    crate::helper::strip_leading_self(trait_path);
+                    crate::names::strip_leading_self(trait_path);
                     return (None, Some(normalized_impl));
                 }
             }

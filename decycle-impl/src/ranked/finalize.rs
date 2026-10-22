@@ -399,10 +399,22 @@ fn subst_bare_self_in_type(ty: &Type, self_ty: &Type) -> Type {
     t
 }
 
+/// What the methods of a leaf impl (`impl XxxRanked<rank> for T`, [`emit_impl_items_leaf`]) do.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LeafBody {
+    /// The floor with `support_infinite_cycle`: re-enter the original impl at full height through
+    /// the fn pointer the registry holds.
+    Reentry,
+    /// The floor without it: `unimplemented!("decycle: cycle limit reached")`.
+    Limit,
+    /// The twin of a floor at [`decoy_rank`], which no call resolves to: `unreachable!`.
+    Decoy,
+}
+
 fn emit_impl_items_leaf(
     impl_: &ItemImpl,
     trait_: &ItemTrait,
-    support_infinite_cycle: bool,
+    body: LeafBody,
     decycle: &Path,
 ) -> TokenStream {
     let mut output = TokenStream::new();
@@ -457,7 +469,7 @@ fn emit_impl_items_leaf(
                     input.reduce_pat(param_ix);
                 }
 
-                if support_infinite_cycle {
+                if body == LeafBody::Reentry {
                     // Call-argument position: `variable()` emits only the bare ident for a
                     // `Pat::Ident` (dropping `mut`/`by_ref`/subpatterns, which aren't valid
                     // expression syntax), matching the delegate path's `FnArgScheme::variable`
@@ -548,10 +560,16 @@ fn emit_impl_items_leaf(
                             }
                         }
                     });
-                } else {
+                } else if body == LeafBody::Limit {
                     output.extend(quote! {
                         #defaultness #sig {
                             ::core::unimplemented!("decycle: cycle limit reached")
+                        }
+                    });
+                } else {
+                    output.extend(quote! {
+                        #defaultness #sig {
+                            ::core::unreachable!("decycle: the decoy rank is never selected")
                         }
                     });
                 }
@@ -3265,6 +3283,34 @@ fn floor_rank() -> Type {
     parse_quote!(())
 }
 
+/// The ident of the decoy rank, an uninhabited `pub enum Decoy<suffix> {}` declared in
+/// `ranked_traits` beside the ranked traits.
+fn decoy_rank_name() -> Ident {
+    name!("Decoy")
+}
+
+/// The decoy rank, spelled from inside `ranked_traits`. Every floor impl (`impl XxxRanked<()> for
+/// T`) gets a twin at this rank with the same `#[cfg]`s, generics, where-clause and associated
+/// items, and with `unreachable!` method bodies ([`LeafBody::Decoy`]).
+///
+/// The twin keeps the floor from being selected by elimination. A call whose rank nothing pins
+/// leaves the rank to inference: `self.base()` in an impl of another trait with no `Self: Base`
+/// bound, or `(B, crate::other::Leaf).step(..)` through a pair impl of the module whose `Leaf` has
+/// no ranked impl. Where the step impl (`XxxRanked<(R,)>`) is ruled out, the floor used to be the
+/// one impl left, so the call compiled against it and failed at run time, though no frame had
+/// registered anything for it: "re-entry fn not registered", or "cycle limit reached" when bounded.
+/// Every solver rules the step impl out for the pair; for `self.base()` the old solver reports
+/// `E0283` on its own, but the next-generation one rules it out through the caller's where-bounds.
+/// With the twin, two impls are left, which every solver reports as `E0283` at the call. A rank
+/// that is pinned (by a where-bound, a supertrait, or the `Self: XxxRanked<..>` bounds decycle
+/// emits) is unaffected: no rank decycle spells, `()` or `(R,)`, unifies with the decoy, and
+/// nothing outside the generated module names it. A ranked supertrait holds at the decoy as it does
+/// at the floor, through the supertrait's own twin for the same self type.
+fn decoy_rank() -> Type {
+    let decoy = decoy_rank_name();
+    parse_quote!(#decoy)
+}
+
 /// One rank step: `rank_succ(&R) = (R,)`. Compose it to spell concrete ranks the same way decycle
 /// does. Semver-committed.
 fn rank_succ(rank: &Type) -> Type {
@@ -3914,6 +3960,12 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
 
     let _output = TokenStream::new();
     let initial_rank = initial_rank(args.recurse_level);
+    // What the floor's methods do; its decoy twin's are `LeafBody::Decoy` either way.
+    let floor_body = if args.support_infinite_cycle {
+        LeafBody::Reentry
+    } else {
+        LeafBody::Limit
+    };
 
     // Build the TraitReplacer table: maps trait ident → (rank_loc, ranked_path)
     // Every iteration below that emits tokens goes through `in_order`, never the `HashMap`.
@@ -3942,6 +3994,11 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                 // for ImplSelfTy
                 #[allow(unused)]
                 use super::super::*;
+
+                // The rank of each floor's twin (see `decoy_rank`).
+                #[allow(unused)]
+                #[doc(hidden)]
+                pub enum #{decoy_rank_name()} {}
 
                 #(for (trait_, rank_loc, impls) in in_order.iter().copied()) {
 
@@ -3981,13 +4038,20 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                             // unused in this copy — self-allow for downstream `#![deny(warnings)]`.)
                             // Replicate the source impl's `#[cfg]`s so a cfg-gated impl's leaf strips
                             // with it instead of referencing a removed self type (E0412).
-                            #(for a in &crate::extract_cfg_attrs(&impl_.attrs)) { #a }
-                            #[allow(unused_variables, unused_mut)]
-                            impl #{impl_.generics.impl_generics()}
-                            #{name!("{}Ranked", &trait_.ident)}
-                            #{impl_.trait_.as_ref().unwrap().1.ty_generics().insert(*rank_loc, parse_quote![()])}
-                            for #{&impl_.self_ty} #{&g.where_clause} {
-                                #{emit_impl_items_leaf(impl_, trait_, args.support_infinite_cycle, &decycle_path)}
+                            // Emitted twice: the floor at `()`, then its twin at the decoy rank
+                            // (`decoy_rank`), identical but for the rank and the method bodies.
+                            #(for (rank, body) in [
+                                (floor_rank(), floor_body),
+                                (decoy_rank(), LeafBody::Decoy),
+                            ]) {
+                                #(for a in &crate::extract_cfg_attrs(&impl_.attrs)) { #a }
+                                #[allow(unused_variables, unused_mut)]
+                                impl #{impl_.generics.impl_generics()}
+                                #{name!("{}Ranked", &trait_.ident)}
+                                #{impl_.trait_.as_ref().unwrap().1.ty_generics().insert(*rank_loc, rank)}
+                                for #{&impl_.self_ty} #{&g.where_clause} {
+                                    #{emit_impl_items_leaf(impl_, trait_, body, &decycle_path)}
+                                }
                             }
                         }
 
@@ -4493,6 +4557,43 @@ mod tests {
         // `initial_rank(1)`.
         let fin = squish(&quote!(#sm::#rm::#ranked_ca<((),)>).to_string());
         assert!(hay.contains(&fin), "Final initial rank is not spelled `((),)`:\n{}", out);
+    }
+
+    /// Every floor has its decoy twin (`decoy_rank`) in both modes: the same header at the decoy
+    /// rank, with the where-clause the floor keeps (a non-cyclic side bound here), and the decoy
+    /// rank is declared once.
+    #[test]
+    fn floor_has_decoy_twin() {
+        for support_infinite_cycle in [true, false] {
+            let (mut args, ca_trait, cb_trait) = d1_cycle_args(support_infinite_cycle);
+            args.contents[0] = parse_quote! {
+                impl Ca for A where B: Cb, A: ::core::fmt::Debug {
+                    fn ca(&self, n: usize) -> usize {
+                        if n == 0 { 0 } else { B.cb(n - 1) + 1 }
+                    }
+                }
+            };
+            let out = finalize(args).to_string();
+            let hay = squish(&out);
+            let decoy = super::decoy_rank_name();
+            let decl = squish(&quote!(pub enum #decoy {}).to_string());
+            assert_eq!(hay.matches(&decl).count(), 1, "decoy rank not declared once:\n{}", out);
+            let ranked_ca = super::ranked_trait_name(&ca_trait.ident);
+            let ranked_cb = super::ranked_trait_name(&cb_trait.ident);
+            for (floor, twin) in [
+                (
+                    quote!(#ranked_ca<()> for A where A: ::core::fmt::Debug),
+                    quote!(#ranked_ca<#decoy> for A where A: ::core::fmt::Debug),
+                ),
+                (quote!(#ranked_cb<()> for B), quote!(#ranked_cb<#decoy> for B)),
+            ] {
+                let (floor, twin) = (squish(&floor.to_string()), squish(&twin.to_string()));
+                assert!(hay.contains(&floor), "no floor `{}`:\n{}", floor, out);
+                assert!(hay.contains(&twin), "no decoy twin `{}`:\n{}", twin, out);
+            }
+            let body = squish("\"decycle: the decoy rank is never selected\"");
+            assert_eq!(hay.matches(&body).count(), 2, "decoy bodies:\n{}", out);
+        }
     }
 
     /// A hand-emitted registration (via `fingerprint_expr` + `emit_registration`/`reentry_*_name`)

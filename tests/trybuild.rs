@@ -23,6 +23,14 @@
 //! ```text
 //! TRYBUILD=overwrite cargo +1.96.0 test --test trybuild -- --ignored
 //! ```
+//!
+//! The pinned toolchain runs the old trait solver only. `ranked_floor_by_elimination*.rs` pin what
+//! must hold on every solver, and their snapshots hold on nightly too, whose default is the
+//! next-generation solver. Check them there by hand:
+//!
+//! ```text
+//! cargo +nightly test --test trybuild -- --ignored ui_compile_fail trybuild=ranked_floor_by_elimination
+//! ```
 
 #[test]
 fn ui_pass() {

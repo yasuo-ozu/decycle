@@ -330,6 +330,16 @@ mod cycle {
     impl BRanked<()> for Right {
         fn b(&self) -> usize { unimplemented!("decycle: cycle limit reached") }
     }
+
+    // The floor's twin at a rank no other rank unifies with, so that a call whose rank
+    // nothing pins is ambiguous (E0283) instead of resolving to the floor.
+    enum Decoy {}
+    impl ARanked<Decoy> for Left {
+        fn a(&self) -> usize { unreachable!() }
+    }
+    impl BRanked<Decoy> for Right {
+        fn b(&self) -> usize { unreachable!() }
+    }
 }
 # fn main() {}
 ```
@@ -364,6 +374,23 @@ actionable panic that cannot corrupt or poison other cycles or threads:
   parameters mapped through the bound), so this is left to side bounds that cannot be carried:
   one naming `Self`, or a trait bound naming a lifetime, a `for<..>` or a const parameter. Such
   a cycle is still unbounded through its other impls.
+
+**Calls whose rank nothing pins.** In an impl's body, a call of a `#[decycle]` trait's method
+resolves to the ranked twin at the rank the impl's bounds give it. A call on a type the impl has no
+bound for has no such rank — `self.base()` in `impl Eval for Expr` with no `Self: Base` bound — and
+is a compile error, `E0283` ("type annotations needed", on `…BaseRanked…<_>`). Pin it with any of:
+
+- a bound: `impl Eval for Expr where Term: Base, Self: Base`;
+- a supertrait: `trait Eval: Base`, whose ranked twin carries `Base`'s at the same rank;
+- a call by path, through the public trait: `crate::m::Base::base(self)`.
+
+The same holds for a call through an impl of the module whose ranked step cannot apply: a pair impl
+`impl<X: Loop, Y: Loop> Loop for (X, Y)` called as `(B, crate::other::Leaf).step(n)`, with `Leaf`'s
+impl outside the module (a bound `(B, crate::other::Leaf): Loop` is read as the bounds of its parts,
+so it pins nothing). Call the pair by path, `<(B, Leaf) as crate::m::Loop>::step(&(B, Leaf), n)`,
+which needs `Leaf`'s impl in the module too, or the pair impl moved out of it. (Before 0.8 both
+shapes could compile, the first only on the next-generation trait solver, and then panic at the
+floor: "re-entry fn not registered", or "cycle limit reached" when bounded.)
 
 **At the floor (`support_infinite_cycle = false`).** No runtime machinery is emitted at all —
 this is the zero-cost mode. Recursion simply stops at the configured `recurse_level`, panicking

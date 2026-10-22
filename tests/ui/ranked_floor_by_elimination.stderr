@@ -1,0 +1,17 @@
+error[E0283]: type annotations needed
+  --> tests/ui/ranked_floor_by_elimination.rs:46:18
+   |
+46 |             self.base()
+   |                  ^^^^
+   |
+note: multiple `impl`s satisfying `m::Expr: ranked_traits8909385c15d27adc::BaseRanked8909385c15d27adc<_>` found
+  --> tests/ui/ranked_floor_by_elimination.rs:13:1
+   |
+13 | #[decycle]
+   | ^^^^^^^^^^
+   = note: this error originates in the attribute macro `decycle` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: try using a fully qualified path to specify the expected types
+   |
+46 -             self.base()
+46 +             <m::Expr as ranked_traits8909385c15d27adc::BaseRanked8909385c15d27adc<Rank8909385c15d27adc>>::base(self)
+   |

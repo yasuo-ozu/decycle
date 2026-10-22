@@ -138,6 +138,28 @@ as **0.8.0**, not as a 0.7 patch.
 
 ### Fixed
 
+- **A floor reached by elimination is a compile error (`E0283`) instead of a run-time panic.** In
+  a ranked module, a call of a `#[decycle]` trait's method whose rank nothing pins leaves the rank
+  of the ranked twin to inference: one on a type the impl has no bound for (`self.base()` in an impl
+  of another trait, with no `Self: Base`), or one through an impl of the module whose step impl
+  cannot apply (a pair impl `impl<X: Loop, Y: Loop> Loop for (X, Y)` called as
+  `(B, crate::other::Leaf).step(n)`, with `Leaf`'s impl outside the module). Where the step impl
+  (`XxxRanked<(R,)>`) was ruled out, the floor (`XxxRanked<()>`) was the one impl left and was
+  selected, though no frame had registered anything for it: the call compiled and panicked at run
+  time, "re-entry fn not registered" (or "cycle limit reached" with
+  `support_infinite_cycle = false`). Every solver rules the step impl out for the pair. For
+  `self.base()`, the old solver (stable's) reported `E0283` already, but the next-generation
+  solver, nightly's default since rust-lang/rust#160619 (2026-08-21) and planned for stabilisation,
+  rules it out through the caller's where-bounds. Each floor now has a twin at an uninhabited rank
+  no other rank unifies with, so two impls are left and every solver reports the call as ambiguous.
+  A pinned rank is unaffected. On nightly, a call of the first shape that ran because an earlier
+  frame had happened to register its callee now fails to compile as well. Pin the call with a bound
+  (`Self: Base`), a supertrait (`trait Eval: Base`) or a call by path
+  (`crate::m::Base::base(self)`); see the README for the pair.
+  `tests/ui/ranked_floor_by_elimination*.rs` pin both shapes, blessed on the old solver; to check
+  them on the next one, run
+  `cargo +nightly test --test trybuild -- --ignored ui_compile_fail trybuild=ranked_floor_by_elimination`
+  (it passes with the same snapshots).
 - **The ranked engine's expansion is deterministic.** It emitted its per-trait items (the ranked
   twins and re-entry items, the dummy shadows, the inductive and the Final impls) in the iteration
   order of a `HashMap`, which `std` seeds per process: a module with several `#[decycle]` traits

@@ -1,0 +1,17 @@
+error[E0283]: type annotations needed
+  --> tests/ui/ranked_floor_by_elimination_tuple.rs:35:60
+   |
+35 |             if n == 0 { 0 } else { (B, crate::other::Leaf).step(n - 1) }
+   |                                                            ^^^^
+   |
+note: multiple `impl`s satisfying `(B, Leaf): ranked_traits8909385c15d27adc::LoopRanked8909385c15d27adc<_>` found
+  --> tests/ui/ranked_floor_by_elimination_tuple.rs:17:1
+   |
+17 | #[decycle]
+   | ^^^^^^^^^^
+   = note: this error originates in the attribute macro `decycle` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: try using a fully qualified path to specify the expected types
+   |
+35 -             if n == 0 { 0 } else { (B, crate::other::Leaf).step(n - 1) }
+35 +             if n == 0 { 0 } else { <(B, Leaf) as ranked_traits8909385c15d27adc::LoopRanked8909385c15d27adc<Rank8909385c15d27adc>>::step(&(B, crate::other::Leaf), n - 1) }
+   |

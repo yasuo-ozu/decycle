@@ -280,7 +280,10 @@ fn bare_param_bound_compiles_and_fails_closed() {
 // ---------------------------------------------------------------------------------------------
 // Heterogeneous side-bound cycle (`impl<T> Ca for A<T> where B<T>: Cb`): the registering impl's
 // bounds don't cover the sibling obligation at every instantiation, so a deep crossing fails
-// closed. A shallow, within-level call is exercised (positively) in `unbounded_reentry.rs`.
+// closed. The side bounds here name `Self` (`Self: Send` on `A`, `Self: Sync` on `B`), which the
+// ranked engine does not carry from one impl to the other. With side bounds that it carries
+// (`T: Clone` on `A`, `T: Default` on `B`), each impl now receives the other's, across the two
+// traits, and the same cycle runs past the floor: `unbounded_reentry.rs`.
 // ---------------------------------------------------------------------------------------------
 
 #[decycle(recurse_level = 3)]
@@ -299,6 +302,7 @@ mod hetero_side_bounds {
     impl<T: Clone> Ca for A<T>
     where
         B<T>: Cb,
+        Self: Send,
     {
         fn ca(&self, n: usize) -> usize {
             if n == 0 {
@@ -311,6 +315,7 @@ mod hetero_side_bounds {
     impl<T: Default> Cb for B<T>
     where
         A<T>: Ca,
+        Self: Sync,
     {
         fn cb(&self, n: usize) -> usize {
             if n == 0 {

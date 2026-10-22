@@ -192,6 +192,31 @@ pub(crate) fn local_refs(ty: &Type, adt_names: &HashSet<String>) -> Vec<String> 
     refs.out
 }
 
+/// The occurrences of local ADTs in `ty`, as [`local_refs`] finds them: each path naming one, with
+/// its arguments (`Term<S>` in `Box<Term<S>>`).
+pub(crate) fn local_ref_paths(ty: &Type, adt_names: &HashSet<String>) -> Vec<syn::TypePath> {
+    struct Refs<'a> {
+        adt_names: &'a HashSet<String>,
+        out: Vec<syn::TypePath>,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for Refs<'_> {
+        fn visit_type_path(&mut self, tp: &'ast syn::TypePath) {
+            if tp.qself.is_none()
+                && bare_ident(&tp.path).is_some_and(|i| self.adt_names.contains(&i.to_string()))
+            {
+                self.out.push(tp.clone());
+            }
+            syn::visit::visit_type_path(self, tp);
+        }
+    }
+    let mut refs = Refs {
+        adt_names,
+        out: Vec::new(),
+    };
+    syn::visit::Visit::visit_type(&mut refs, ty);
+    refs.out
+}
+
 /// Visit every path-segment ident within `ty`, descending references/containers/tuples/generic args,
 /// and also into fn-pointer, `dyn` and `impl Trait` types (so a `Self` inside `fn(&Self)` /
 /// `dyn Fn(&Self)` / `impl Fn(&Self)` is seen).

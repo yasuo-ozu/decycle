@@ -1,13 +1,23 @@
-//! Carry the premises of a cycle's impls along its cyclic bounds, whatever their trait, with the
-//! generic parameters mapped through each bound — both engines.
+//! Share the premises of a cycle's impls between them — both engines, through [`share_premises`].
 //!
 //! An impl's generated code reaches each impl its cyclic bounds name through the public trait, and
 //! that impl demands its own premises. Plain Rust proves them through the cyclic bound itself; the
 //! engines strip (structural) or rank (ranked) that bound, so the impl needs them in its own
-//! environment. [`crate::ranked::sharing`] gives the impls of one trait each other's premises by
-//! *name*; that never reaches an impl of another trait in a cycle that alternates between traits
-//! (`Expr: Eval` needing `Term: Size`), and it cannot map a parameter that is named differently on
-//! the two sides. This pass follows the bounds instead:
+//! environment. Two passes give them, each scoped by the engine (which impls are a cycle's, and
+//! which bounds are its edges, `is_edge`, are the engine's to say):
+//!
+//! - **by name** ([`share_side_predicates_scoped`]): the impls of one trait take the union of each
+//!   other's premises, computed from their *real* predicates rather than re-derived from field
+//!   types, so an obligation a caller introduced by hand (or through a generated helper type) is
+//!   covered too. A cycle's own edges are never shared: the ranked engine ranks them, and copying
+//!   one onto a sibling would rank-lower it there as well; the structural engine strips them. Which
+//!   impls an impl may inherit from (`sources`) is the engine's too: an impl of the same trait that
+//!   shares no obligation path — a standalone acyclic impl, or a member of a *different*, disjoint
+//!   cycle — receives nothing, so it does not silently acquire premises (`C<T>` acquiring
+//!   `T: Clone`) that reject code valid without the macro.
+//! - **along the bounds** ([`mapped_premises`]): by name never reaches an impl of another trait in
+//!   a cycle that alternates between traits (`Expr: Eval` needing `Term: Size`), and it cannot map
+//!   a parameter that is named differently on the two sides. This pass follows the bounds instead:
 //!
 //! - an impl `J` is reached by the bound `X: Tr<..>` of an impl `I` when `X` names `J`'s self type
 //!   and `Tr` its trait, and `J`'s header **matches** the bound: `J`'s self-type and trait arguments,
@@ -47,12 +57,12 @@ use syn::visit::Visit;
 use syn::visit_mut::VisitMut;
 use syn::{
     BoundLifetimes, Expr, GenericArgument, GenericParam, ItemImpl, Lifetime, LifetimeParam, Path,
-    PathArguments, PredicateLifetime, PredicateType, Token, TraitBoundModifier, Type,
+    PathArguments, PredicateLifetime, PredicateType, Token, TraitBound, TraitBoundModifier, Type,
     TypeParamBound, TypePath, WherePredicate,
 };
-use template_quote::ToTokens;
+use template_quote::{quote, ToTokens};
 
-use crate::names::strip_parens;
+use crate::names::{bare_ident, local_type_head_ident, strip_parens};
 
 /// One cyclic bound of an impl, as this pass follows it: the bound `trait_path` on `target`, a cycle
 /// member's type. A wrapped bound (`Box<Term<S>>: Size<T>`) is followed to the member inside it
@@ -67,6 +77,53 @@ pub(crate) struct CycleEdge {
     /// The impls of the group (indices) that may discharge the bound: those of its trait for the
     /// member's type. Each one whose header matches the bound is reached.
     pub candidates: Vec<usize>,
+}
+
+impl CycleEdge {
+    /// The edge the bound `tb` of the predicate `pt` makes to the member `target` (`Self`
+    /// resolved), which the impls of `impls` of the bound's trait for the member's head may
+    /// discharge — both read by their bare names ([`crate::names`]), as both engines take an impl
+    /// over.
+    pub(crate) fn new(
+        target: Type,
+        pt: &PredicateType,
+        tb: &TraitBound,
+        impls: &[&ItemImpl],
+    ) -> Self {
+        let trait_ident = bare_ident(&tb.path);
+        let head = local_type_head_ident(&target);
+        let candidates = impls
+            .iter()
+            .enumerate()
+            .filter(|(_, j)| {
+                trait_ident.is_some()
+                    && j.trait_.as_ref().and_then(|(_, path, _)| bare_ident(path)) == trait_ident
+                    && head.is_some()
+                    && local_type_head_ident(&j.self_ty) == head
+            })
+            .map(|(k, _)| k)
+            .collect();
+        let binder = binder_lifetimes(pt.lifetimes.as_ref())
+            .chain(binder_lifetimes(tb.lifetimes.as_ref()))
+            .collect();
+        CycleEdge {
+            target,
+            trait_path: tb.path.clone(),
+            binder,
+            candidates,
+        }
+    }
+}
+
+/// The lifetimes a `for<..>` binds.
+fn binder_lifetimes(binder: Option<&BoundLifetimes>) -> impl Iterator<Item = Lifetime> + '_ {
+    binder
+        .into_iter()
+        .flat_map(|b| &b.lifetimes)
+        .filter_map(|p| match p {
+            GenericParam::Lifetime(l) => Some(l.lifetime.clone()),
+            _ => None,
+        })
 }
 
 /// How the impl receiving a premise may spell it.
@@ -89,11 +146,46 @@ pub(crate) enum Respell {
     TypeParams,
 }
 
+/// Share the premises of `impls`, in place, by both passes (see the module docs); whether any impl
+/// changed.
+///
+/// `edges[i]` are the cyclic bounds of `impls[i]`, and `is_edge` tells a cyclic bound from a
+/// premise, as the engine reads them. `by_name` are the groups of the by-name pass: the indices
+/// (into `impls`, ascending) of the impls of one trait, with each one's `sources`, indexed the same
+/// way ([`share_side_predicates_scoped`]). The premises along the bounds are computed on the impls
+/// as written, before the by-name pass adds to them, and added after it.
+pub(crate) fn share_premises(
+    impls: &mut [&mut ItemImpl],
+    edges: &[Vec<CycleEdge>],
+    is_edge: &dyn Fn(&ItemImpl, &WherePredicate) -> bool,
+    respell: Respell,
+    by_name: &[(Vec<usize>, Vec<Vec<usize>>)],
+) -> bool {
+    let along_bounds = {
+        let written: Vec<&ItemImpl> = impls.iter().map(|im| &**im).collect();
+        mapped_premises(&written, edges, is_edge, respell)
+    };
+    let mut changed = false;
+    for (members, sources) in by_name {
+        let mut group: Vec<&mut ItemImpl> = impls
+            .iter_mut()
+            .enumerate()
+            .filter(|(k, _)| members.contains(k))
+            .map(|(_, im)| &mut **im)
+            .collect();
+        changed |= share_side_predicates_scoped(&mut group, is_edge, sources);
+    }
+    for (im, add) in impls.iter_mut().zip(along_bounds) {
+        changed |= add_premises(im, add);
+    }
+    changed
+}
+
 /// The premises each impl of `impls` receives along `edges` (`edges[i]` the cyclic bounds of
 /// `impls[i]`), in its own terms, without the ones it states already. `is_edge` tells a cyclic bound
 /// from a premise, as the engine reads them; neither a cyclic bound nor a premise that would read as
 /// one in the receiving impl is shared.
-pub(crate) fn mapped_premises(
+fn mapped_premises(
     impls: &[&ItemImpl],
     edges: &[Vec<CycleEdge>],
     is_edge: &dyn Fn(&ItemImpl, &WherePredicate) -> bool,
@@ -164,7 +256,7 @@ pub(crate) fn mapped_premises(
 /// bounds joins them (`impl<T: Clone>` given `T: Default` becomes `impl<T: Clone + Default>`): a
 /// parameter bounded in both places trips `clippy::multiple_bound_locations` in the user's crate,
 /// on the user's own impl header. Anything else goes to the `where`-clause.
-pub(crate) fn add_premises(im: &mut ItemImpl, premises: Vec<WherePredicate>) -> bool {
+fn add_premises(im: &mut ItemImpl, premises: Vec<WherePredicate>) -> bool {
     let mut have: HashSet<String> = inline_bound_predicates(im).iter().map(key).collect();
     for pred in im
         .generics
@@ -435,6 +527,203 @@ impl Visit<'_> for Names {
         }
         syn::visit::visit_type_param_bound(self, b);
     }
+}
+
+// ----- by name ------------------------------------------------------------------------------
+
+/// The by-name pass over one trait's impls — see the module docs; whether any impl changed.
+///
+/// A cycle member's body reaches its siblings through the *public* trait (`Vec<Expr<S>>: Unparse<A>`
+/// ⇒ `Expr<S>: Unparse<A>`), which decycle discharges through `Expr`'s delegating impl — and that
+/// impl carries `Expr`'s **own** leaf bounds. A sibling (or a `#[group]` substruct) whose leaf set is
+/// smaller therefore cannot prove it from its own `where`-clause. Sharing the union closes that gap;
+/// it is the same idea as the `#[predicate_unparse(<leaf union>)]` injection the direct
+/// `Unparse`/`Spanned` path uses, computed from the real predicates rather than re-derived from field
+/// types (so a `#[group]`'s `Fill` obligation is covered too).
+///
+/// `sources[i]` lists the indices (into `impls`) of the impls whose premises `impls[i]` may inherit —
+/// the impls it can actually reach, as computed by the caller from the obligation edges.
+/// `is_edge(im, pred)` says whether a predicate of `im` is an edge of the cycle rather than a premise
+/// — never shared (see the ranked engine's `is_ranked_edge` and the structural engine's
+/// `is_cycle_edge`).
+///
+/// A predicate is only injected into an impl that declares every generic parameter it mentions, so a
+/// cycle whose members carry *different* parameters stays well-formed.
+fn share_side_predicates_scoped(
+    impls: &mut [&mut ItemImpl],
+    is_edge: &dyn Fn(&ItemImpl, &WherePredicate) -> bool,
+    sources: &[Vec<usize>],
+) -> bool {
+    debug_assert_eq!(impls.len(), sources.len());
+    let mut changed = false;
+    // Per-impl data up front — the injection loop below holds the mutable borrow.
+    let param_sets: Vec<HashSet<String>> = impls.iter().map(|im| impl_param_idents(im)).collect();
+    let shareable: Vec<Vec<WherePredicate>> = impls
+        .iter()
+        .map(|im| {
+            im.generics
+                .where_clause
+                .iter()
+                .flat_map(|wc| wc.predicates.iter())
+                // Skip the cycle's edges: those are the engine's to rank or strip.
+                .filter(|p| !is_edge(im, p))
+                // `Self` is impl-relative: `Self: Debug` on `impl Tr for A` says *A* is `Debug`, so
+                // copying it onto `impl Tr for B` silently asserts something about a different type
+                // (and fails if B is not `Debug`). Only impl-independent premises can be shared.
+                .filter(|p| !Names::of_predicate(p).idents.contains("Self"))
+                .cloned()
+                .collect()
+        })
+        .collect();
+    for (i, im) in impls.iter_mut().enumerate() {
+        // The union this impl may inherit, from its sources only.
+        let mut union: Vec<WherePredicate> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for j in sources[i].iter() {
+            for p in &shareable[*j] {
+                if seen.insert(quote!(#p).to_string()) {
+                    union.push(p.clone());
+                }
+            }
+        }
+        if union.is_empty() {
+            continue;
+        }
+        // Idents that are a generic parameter of this impl or of one of its sources — used below to
+        // tell a parameter apart from a concrete type name. Scoped to the receiver's own slice of the
+        // group on purpose: it was previously a `thread_local!` that accumulated and was never
+        // cleared, so parameters leaked between separate `#[decycle]` expansions compiled on the same
+        // thread, making unrelated idents look param-like and silently suppressing predicate sharing.
+        let group_params: HashSet<String> = sources[i]
+            .iter()
+            .flat_map(|j| param_sets[*j].iter())
+            .chain(param_sets[i].iter())
+            .cloned()
+            .collect();
+        let params = &param_sets[i];
+        let lifetimes: HashSet<String> = im
+            .generics
+            .params
+            .iter()
+            .filter_map(|p| match p {
+                syn::GenericParam::Lifetime(l) => Some(l.lifetime.ident.to_string()),
+                _ => None,
+            })
+            .collect();
+        let have: HashSet<String> = im
+            .generics
+            .where_clause
+            .iter()
+            .flat_map(|wc| wc.predicates.iter())
+            .map(|p| quote!(#p).to_string())
+            .collect();
+        let mut add: Vec<WherePredicate> = Vec::new();
+        for p in &union {
+            if have.contains(&quote!(#p).to_string()) {
+                continue;
+            }
+            // Every *declared* parameter the predicate names must exist here too. An ident that is
+            // not a parameter anywhere (a concrete type, a trait) is not a constraint.
+            let idents = pred_idents(p);
+            let missing = idents
+                .iter()
+                .any(|i| !params.contains(i) && group_params.contains(i));
+            if missing {
+                continue;
+            }
+            // A shared HRTB predicate (`for<'a> <G as EmptyGroup>::Fill<Sub<'a, ..>>: …`) can carry a
+            // binder lifetime that the receiving impl already declares as a parameter — a `#[group]`
+            // substruct's impl declares exactly the lifetime its own predicate binds. Rename the
+            // binder rather than shadowing it (E0496); an HRTB binder name is not observable.
+            add.push(freshen_binder_lifetimes(p.clone(), &lifetimes));
+        }
+        if add.is_empty() {
+            continue;
+        }
+        let wc = im
+            .generics
+            .where_clause
+            .get_or_insert_with(|| syn::parse_quote!(where));
+        for p in add {
+            wc.predicates.push(p);
+        }
+        changed = true;
+    }
+    changed
+}
+
+/// The generic-parameter idents an impl declares — used to decide whether a sibling's predicate can be
+/// injected into it (see [`share_side_predicates_scoped`]).
+pub(crate) fn impl_param_idents(item_impl: &ItemImpl) -> HashSet<String> {
+    item_impl
+        .generics
+        .params
+        .iter()
+        .map(|p| match p {
+            syn::GenericParam::Type(t) => t.ident.to_string(),
+            syn::GenericParam::Const(c) => c.ident.to_string(),
+            // Lifetimes count too. Leaving them out let a predicate naming a SIBLING's lifetime
+            // (`where &'a str: Clone`) past the "declares everything it mentions" guard and into
+            // an impl with no `'a` of its own — E0261 on code that is valid without the macro.
+            // `freshen_binder_lifetimes` does not help: it renames `for<>` binders, not free
+            // lifetimes.
+            syn::GenericParam::Lifetime(l) => l.lifetime.ident.to_string(),
+        })
+        .collect()
+}
+
+/// Every single-segment ident appearing anywhere in a predicate.
+fn pred_idents(pred: &WherePredicate) -> HashSet<String> {
+    struct V(HashSet<String>);
+    impl syn::visit::Visit<'_> for V {
+        fn visit_ident(&mut self, i: &proc_macro2::Ident) {
+            self.0.insert(i.to_string());
+        }
+        // `'static` and `'_` are always in scope, so they must not count as something the
+        // receiving impl has to declare — otherwise, now that `impl_param_idents` reports
+        // lifetimes, an ordinary `T: 'static` co-bound would never be shared. Deliberately does
+        // not recurse: the default impl would feed the bare ident to `visit_ident`.
+        fn visit_lifetime(&mut self, lt: &syn::Lifetime) {
+            if lt.ident != "static" && lt.ident != "_" {
+                self.0.insert(lt.ident.to_string());
+            }
+        }
+    }
+    let mut v = V(HashSet::new());
+    syn::visit::Visit::visit_where_predicate(&mut v, pred);
+    v.0
+}
+
+/// Rename a predicate's `for<'a, …>` binder lifetimes that collide with `taken`.
+fn freshen_binder_lifetimes(mut pred: WherePredicate, taken: &HashSet<String>) -> WherePredicate {
+    let WherePredicate::Type(pt) = &mut pred else {
+        return pred;
+    };
+    let mut rename: HashMap<String, syn::Lifetime> = HashMap::new();
+    if let Some(bl) = &mut pt.lifetimes {
+        for p in bl.lifetimes.iter_mut() {
+            if let syn::GenericParam::Lifetime(l) = p {
+                let old = l.lifetime.ident.to_string();
+                if taken.contains(&old) {
+                    let fresh =
+                        syn::Lifetime::new(&format!("'{}__decycle_hr", old), l.lifetime.ident.span());
+                    rename.insert(l.lifetime.to_string(), fresh.clone());
+                    l.lifetime = fresh;
+                }
+            }
+        }
+    }
+    // The binder itself is renamed above; only the predicate's type and bounds are rewritten.
+    if !rename.is_empty() {
+        let mut r = RenameLifetimes(&rename);
+        if let WherePredicate::Type(pt) = &mut pred {
+            r.visit_type_mut(&mut pt.bounded_ty);
+            for b in pt.bounds.iter_mut() {
+                r.visit_type_param_bound_mut(b);
+            }
+        }
+    }
+    pred
 }
 
 // ----- premises -------------------------------------------------------------------------------

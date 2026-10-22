@@ -266,21 +266,22 @@ fn expand(
 ///
 /// A premise is one of the `where`-predicates (or inline parameter bounds) `reduce_generics` keeps on
 /// the generated impls: one carrying no bound that is an edge of the same cycle (a bound `X: Tr`
-/// where `X` names a member `M` with `(M, Tr)` in the SCC). Two passes, both scoped to the members of
-/// one cycle:
+/// where `X` names a member `M` with `(M, Tr)` in the SCC). Both passes of [`crate::premise_flow`],
+/// scoped to the members of one cycle:
 ///
-/// - **along the bounds, across traits** ([`crate::premise_flow`]): an impl receives the premises of
-///   every impl its cyclic bounds reach, transitively and whatever their trait, with the reached
-///   impl's generic parameters mapped through the bound (`Term: Size<T>` reaching
+/// - **along the bounds, across traits**: an impl receives the premises of every impl its cyclic
+///   bounds reach, transitively and whatever their trait, with the reached impl's generic
+///   parameters mapped through the bound (`Term: Size<T>` reaching
 ///   `impl<U> Size<U> for Term where U: Clone` gives `T: Clone`). A premise with no counterpart (a
 ///   parameter the bound does not fix) is skipped. Computed on the impls as written, before the
 ///   second pass adds anything.
 /// - **by name, per trait** (as before): the impls of one trait in the cycle take the union of each
-///   other's premises, through [`crate::ranked::sharing::share_side_predicates_scoped`]: a predicate
-///   is only injected into an impl that declares every generic parameter it names, a
-///   `Self`-mentioning one is never shared, and an HRTB binder is renamed apart from the receiver's
-///   lifetimes. It adds nothing the first pass gives when the parameters correspond by name, and it
-///   still covers a bound the first pass cannot match.
+///   other's premises: a predicate is only injected into an impl that declares every generic
+///   parameter it names, a `Self`-mentioning one is never shared, and an HRTB binder is renamed
+///   apart from the receiver's lifetimes. It adds nothing the first pass gives when the parameters
+///   correspond by name, and it still covers a bound the first pass cannot match.
+///
+/// The cycles have no impl in common, so each one is shared on its own.
 fn share_cycle_premises(items: &mut [Item], sccs: &[Scc], model: &Model) -> bool {
     let adt_names: HashSet<String> = model.adts.keys().cloned().collect();
     let in_scc = |im: &ItemImpl, scc: &Scc| {
@@ -288,72 +289,46 @@ fn share_cycle_premises(items: &mut [Item], sccs: &[Scc], model: &Model) -> bool
             .zip(impl_self_ident(im))
             .is_some_and(|(key, ty)| scc.contains(&ty.to_string(), &key))
     };
-    let mut along_bounds: Vec<(usize, Vec<WherePredicate>)> = Vec::new();
-    for scc in sccs {
-        let (index, impls): (Vec<usize>, Vec<&ItemImpl>) = items
-            .iter()
-            .enumerate()
-            .filter_map(|(k, item)| match item {
-                Item::Impl(im) if in_scc(im, scc) => Some((k, im)),
-                _ => None,
-            })
-            .unzip();
-        let edges: Vec<Vec<crate::premise_flow::CycleEdge>> = impls
-            .iter()
-            .map(|im| cycle_edges(im, &impls, scc, &adt_names))
-            .collect();
-        let is_edge =
-            |im: &ItemImpl, pred: &WherePredicate| is_cycle_edge(im, pred, scc, &adt_names);
-        let add = crate::premise_flow::mapped_premises(
-            &impls,
-            &edges,
-            &is_edge,
-            crate::premise_flow::Respell::Any,
-        );
-        along_bounds.extend(index.into_iter().zip(add));
-    }
     let mut changed = false;
     for scc in sccs {
+        let mut impls: Vec<&mut ItemImpl> = items
+            .iter_mut()
+            .filter_map(|item| match item {
+                Item::Impl(im) if in_scc(im, scc) => Some(im),
+                _ => None,
+            })
+            .collect();
+        let edges: Vec<Vec<crate::premise_flow::CycleEdge>> = {
+            let written: Vec<&ItemImpl> = impls.iter().map(|im| &**im).collect();
+            written
+                .iter()
+                .map(|im| cycle_edges(im, &written, scc, &adt_names))
+                .collect()
+        };
         let mut traits: Vec<&String> = scc.pairs.iter().map(|(_, tr)| tr).collect();
         traits.sort();
         traits.dedup();
-        for trait_name in traits {
-            let mut group: Vec<&mut ItemImpl> = items
-                .iter_mut()
-                .filter_map(|item| match item {
-                    Item::Impl(im)
-                        if impl_trait_key(im).as_deref() == Some(trait_name.as_str())
-                            && impl_self_ident(im)
-                                .is_some_and(|ty| scc.contains(&ty.to_string(), trait_name)) =>
-                    {
-                        Some(im)
-                    }
-                    _ => None,
-                })
-                .collect();
-            if group.len() < 2 {
-                continue;
-            }
-            let before: Vec<String> = group
-                .iter()
-                .map(|im| im.to_token_stream().to_string())
-                .collect();
-            let everyone: Vec<Vec<usize>> = (0..group.len())
-                .map(|i| (0..group.len()).filter(|j| *j != i).collect())
-                .collect();
-            let is_edge =
-                |im: &ItemImpl, pred: &WherePredicate| is_cycle_edge(im, pred, scc, &adt_names);
-            crate::ranked::sharing::share_side_predicates_scoped(&mut group, &is_edge, &everyone);
-            changed |= group
-                .iter()
-                .zip(&before)
-                .any(|(im, b)| im.to_token_stream().to_string() != *b);
-        }
-    }
-    for (k, add) in along_bounds {
-        if let Item::Impl(im) = &mut items[k] {
-            changed |= crate::premise_flow::add_premises(im, add);
-        }
+        let by_name: Vec<(Vec<usize>, Vec<Vec<usize>>)> = traits
+            .into_iter()
+            .filter_map(|trait_name| {
+                let members: Vec<usize> = (0..impls.len())
+                    .filter(|k| impl_trait_key(impls[*k]).as_deref() == Some(trait_name.as_str()))
+                    .collect();
+                let everyone = (0..members.len())
+                    .map(|i| (0..members.len()).filter(|j| *j != i).collect())
+                    .collect();
+                (members.len() >= 2).then_some((members, everyone))
+            })
+            .collect();
+        let is_edge =
+            |im: &ItemImpl, pred: &WherePredicate| is_cycle_edge(im, pred, scc, &adt_names);
+        changed |= crate::premise_flow::share_premises(
+            &mut impls,
+            &edges,
+            &is_edge,
+            crate::premise_flow::Respell::Any,
+            &by_name,
+        );
     }
     changed
 }
@@ -374,7 +349,6 @@ fn cycle_edges(
         };
         let bounded = subst_self(&pt.bounded_ty, &im.self_ty);
         let members = local_ref_paths(&bounded, adt_names);
-        let pred_binder: Vec<syn::Lifetime> = binder_lifetimes(pt.lifetimes.as_ref());
         for bound in &pt.bounds {
             let syn::TypeParamBound::Trait(tb) = bound else {
                 continue;
@@ -386,42 +360,18 @@ fn cycle_edges(
                 let Some(name) = bare_ident(&member.path).map(|i| i.to_string()) else {
                     continue;
                 };
-                if !scc.contains(&name, &key) {
-                    continue;
+                if scc.contains(&name, &key) {
+                    out.push(crate::premise_flow::CycleEdge::new(
+                        Type::Path(member.clone()),
+                        pt,
+                        tb,
+                        impls,
+                    ));
                 }
-                let candidates = impls
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, j)| {
-                        impl_trait_key(j).as_deref() == Some(key.as_str())
-                            && impl_self_ident(j).is_some_and(|ty| ty == name)
-                    })
-                    .map(|(k, _)| k)
-                    .collect();
-                let mut binder = pred_binder.clone();
-                binder.extend(binder_lifetimes(tb.lifetimes.as_ref()));
-                out.push(crate::premise_flow::CycleEdge {
-                    target: Type::Path(member.clone()),
-                    trait_path: tb.path.clone(),
-                    binder,
-                    candidates,
-                });
             }
         }
     }
     out
-}
-
-/// The lifetimes a `for<..>` binds.
-fn binder_lifetimes(binder: Option<&syn::BoundLifetimes>) -> Vec<syn::Lifetime> {
-    binder
-        .into_iter()
-        .flat_map(|b| &b.lifetimes)
-        .filter_map(|p| match p {
-            GenericParam::Lifetime(l) => Some(l.lifetime.clone()),
-            _ => None,
-        })
-        .collect()
 }
 
 /// Does `pred` (on `im`) carry a bound that is an edge of `scc` — the bounds `reduce_generics`

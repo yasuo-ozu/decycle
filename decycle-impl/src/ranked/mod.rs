@@ -6,7 +6,6 @@ pub(crate) mod helper;
 mod nesting;
 mod opt_out;
 pub(crate) mod peel;
-pub(crate) mod sharing;
 pub(crate) mod process_module;
 
 pub use process_module::{process_module, process_module_at};

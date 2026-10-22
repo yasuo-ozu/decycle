@@ -296,6 +296,63 @@ fn validate_impl_where_bounds(
     }
 }
 
+/// The ranked engine's edges, for [`crate::premise_flow`]: a predicate with a bound naming
+/// a routed trait in the bare (or `self::`-qualified) spelling, on a target the rank chain descends.
+///
+/// `routed_traits` is the full set of `#[decycle]`-routed trait idents: a cross-trait edge (`X: Tr2`
+/// inside an impl of `Tr`) is stripped downstream exactly like an own-trait one
+/// (`remove_cyclic_bounds` keys on every routed trait). `participants` are the head idents of the
+/// impls the engine takes over — the targets `remove_cyclic_bounds` reads a bare bound as an edge
+/// on, besides `Self` and the impl's own type parameters. A bare bound on any other target
+/// (`crate::other::Leaf: Tr`, `u8: Tr`, or the parts `peel` keeps of a wrapped bound) is no edge but
+/// a premise on the original trait, which `finalize` keeps un-lowered, and it is shared like any
+/// other premise. (Not sharing it left a sibling unable to prove what the rank chain reaching this
+/// impl demands, so its re-entry fn was never registered, and a recursion past the floor panicked.)
+fn is_ranked_edge(
+    im: &ItemImpl,
+    pred: &WherePredicate,
+    routed_traits: &HashSet<Ident>,
+    participants: &HashSet<Ident>,
+) -> bool {
+    is_bare_trait_pred(pred, routed_traits)
+        && targets_participant(pred, participants, &crate::premise_flow::impl_param_idents(im))
+}
+
+/// Does the predicate carry a bound the engine treats as a cycle edge — a bare (or
+/// `self::`-qualified, which peel/validate normalise the same way) reference to **any** routed
+/// trait? Matching only the group's own trait missed two spellings of the same edge: `B: self::Tr`
+/// (identical to `B: Tr` everywhere else in the engine) and a cross-trait `X: Tr2`, which
+/// `remove_cyclic_bounds` strips and rank-lowers exactly like an own-trait bound.
+fn is_bare_trait_pred(pred: &WherePredicate, routed_traits: &HashSet<Ident>) -> bool {
+    let WherePredicate::Type(pt) = pred else {
+        return false;
+    };
+    pt.bounds
+        .iter()
+        .any(|b| crate::names::is_routed_bound(b, routed_traits))
+}
+
+/// Is the predicate's bounded type one the ranked chain descends — `Self`, one of the impl's own type
+/// parameters (`params`), or a type whose head is a participant? The same test as
+/// `finalize::remove_cyclic_bounds`, which keys the head by its last segment.
+fn targets_participant(
+    pred: &WherePredicate,
+    heads: &HashSet<Ident>,
+    params: &HashSet<String>,
+) -> bool {
+    let WherePredicate::Type(pt) = pred else {
+        return false;
+    };
+    if let syn::Type::Path(syn::TypePath { qself: None, path }) = &pt.bounded_ty {
+        if path.is_ident("Self")
+            || (path.segments.len() == 1 && params.contains(&path.segments[0].ident.to_string()))
+        {
+            return true;
+        }
+    }
+    crate::helper::type_head_ident(&pt.bounded_ty).is_some_and(|h| heads.contains(&h))
+}
+
 /// The cyclic bounds of `im` for [`crate::premise_flow`]: each bound (`is_edge`) naming a routed
 /// trait on an adopted head (the head of a peeled bound is the member it obligates; `Self` is `im`'s
 /// own self type), with the impls of `impls` of that trait for that head, which may discharge it. A
@@ -308,16 +365,6 @@ fn ranked_cycle_edges(
     is_edge: &dyn Fn(&ItemImpl, &WherePredicate) -> bool,
 ) -> Vec<crate::premise_flow::CycleEdge> {
     let type_params = crate::names::type_param_idents(&im.generics);
-    let binder_of = |b: Option<&BoundLifetimes>| -> Vec<Lifetime> {
-        b.into_iter()
-            .flat_map(|b| &b.lifetimes)
-            .filter_map(|p| match p {
-                GenericParam::Lifetime(l) => Some(l.lifetime.clone()),
-                _ => None,
-            })
-            .collect()
-    };
-    let trait_ident_of = |path: &Path| crate::names::bare_ident(path).cloned();
     let mut out = Vec::new();
     for pred in im.generics.where_clause.iter().flat_map(|wc| &wc.predicates) {
         let WherePredicate::Type(pt) = pred else {
@@ -342,38 +389,17 @@ fn ranked_cycle_edges(
             let TypeParamBound::Trait(tb) = bound else {
                 continue;
             };
-            let Some(trait_ident) = trait_ident_of(&tb.path).filter(|t| all_traits.contains(t))
-            else {
+            if !crate::names::bare_ident(&tb.path).is_some_and(|t| all_traits.contains(t)) {
                 continue;
-            };
-            let candidates = impls
-                .iter()
-                .enumerate()
-                .filter(|(_, j)| {
-                    j.trait_
-                        .as_ref()
-                        .and_then(|(_, path, _)| trait_ident_of(path))
-                        .is_some_and(|t| t == trait_ident)
-                        && crate::names::local_type_head_ident(&j.self_ty)
-                            .is_some_and(|h| h == head)
-                })
-                .map(|(k, _)| k)
-                .collect();
-            let mut binder = binder_of(pt.lifetimes.as_ref());
-            binder.extend(binder_of(tb.lifetimes.as_ref()));
-            out.push(crate::premise_flow::CycleEdge {
-                target: target.clone(),
-                trait_path: tb.path.clone(),
-                binder,
-                candidates,
-            });
+            }
+            out.push(crate::premise_flow::CycleEdge::new(target.clone(), pt, tb, impls));
         }
     }
     out
 }
 
 /// For each impl of one routed trait, which of its siblings' premises it may inherit — the
-/// obligation-reachability scoping behind [`crate::ranked::sharing::share_side_predicates`].
+/// obligation-reachability scoping of [`crate::premise_flow`]'s by-name pass.
 ///
 /// `members` are the adopted impls of `trait_ident`, in group order; the result is indexed the same
 /// way: `sources[i]` lists the indices of the members whose premises member `i`'s rank chain can
@@ -780,7 +806,7 @@ fn process_module_inner(
     // of the trait", so a standalone acyclic impl silently inherited a cycle's premises (`C<T>`
     // acquiring `T: Clone` rejects code that is valid without the macro), and two disjoint cycles of
     // one trait unioned each other's. Scope each impl's inheritance to the impls its own cyclic
-    // bounds (transitively) obligate instead — see `sharing_sources` and `crate::ranked::sharing`.
+    // bounds (transitively) obligate instead — see `sharing_sources` and `crate::premise_flow`.
     // The heads `finalize` reads a bare bound as an edge on (`remove_cyclic_bounds`): those of the
     // impls taken over. A bare bound on any other type is a premise, shared like one.
     let adopted_heads: HashSet<Ident> = contents
@@ -788,7 +814,7 @@ fn process_module_inner(
         .filter_map(|im| type_head_ident(&im.self_ty))
         .collect();
     let is_edge = |im: &ItemImpl, pred: &WherePredicate| {
-        crate::ranked::sharing::is_ranked_edge(im, pred, &all_traits, &adopted_heads)
+        is_ranked_edge(im, pred, &all_traits, &adopted_heads)
     };
     // The same premises, carried along every cyclic bound, whatever its trait, with the reached
     // impl's parameters mapped through the bound (`crate::premise_flow`). The by-name union below
@@ -797,38 +823,41 @@ fn process_module_inner(
     // registrations then failed `reachable_side_bounds_ok` and were skipped, and a recursion past the
     // floor panicked ("re-entry fn not registered"). Computed on the impls as written, before the
     // by-name union adds to them.
-    let along_bounds = {
+    let (edges, by_name) = {
         let impls: Vec<&ItemImpl> = contents.iter().collect();
         let edges: Vec<Vec<crate::premise_flow::CycleEdge>> = impls
             .iter()
             .map(|im| ranked_cycle_edges(im, &impls, &all_traits, &adopted_heads, &is_edge))
             .collect();
-        crate::premise_flow::mapped_premises(
-            &impls,
-            &edges,
-            &is_edge,
-            crate::premise_flow::Respell::TypeParams,
-        )
-    };
-    for trait_ident in &all_traits {
-        let is_member = |im: &ItemImpl| {
-            im.trait_.as_ref().is_some_and(|(_, path, _)| {
-                path.leading_colon.is_none()
-                    && path.segments.len() == 1
-                    && path.segments[0].ident == *trait_ident
+        let by_name: Vec<(Vec<usize>, Vec<Vec<usize>>)> = all_traits
+            .iter()
+            .filter_map(|trait_ident| {
+                let is_member = |im: &ItemImpl| {
+                    im.trait_.as_ref().is_some_and(|(_, path, _)| {
+                        path.leading_colon.is_none()
+                            && path.segments.len() == 1
+                            && path.segments[0].ident == *trait_ident
+                    })
+                };
+                let members: Vec<usize> =
+                    (0..impls.len()).filter(|k| is_member(impls[*k])).collect();
+                (members.len() >= 2).then(|| {
+                    let group: Vec<&ItemImpl> = members.iter().map(|k| impls[*k]).collect();
+                    let sources = sharing_sources(&group, trait_ident);
+                    (members, sources)
+                })
             })
-        };
-        let members: Vec<&ItemImpl> = contents.iter().filter(|im| is_member(im)).collect();
-        if members.len() < 2 {
-            continue;
-        }
-        let sources = sharing_sources(&members, trait_ident);
-        let mut group: Vec<&mut ItemImpl> = contents.iter_mut().filter(|im| is_member(im)).collect();
-        crate::ranked::sharing::share_side_predicates_scoped(&mut group, &is_edge, &sources);
-    }
-    for (im, add) in contents.iter_mut().zip(along_bounds) {
-        crate::premise_flow::add_premises(im, add);
-    }
+            .collect();
+        (edges, by_name)
+    };
+    let mut impls: Vec<&mut ItemImpl> = contents.iter_mut().collect();
+    crate::premise_flow::share_premises(
+        &mut impls,
+        &edges,
+        &is_edge,
+        crate::premise_flow::Respell::TypeParams,
+        &by_name,
+    );
 
     // Restricted to types this module DEFINES: a foreign self type (`impl Tr for &str`) is reachable
     // by one path only, so it is neither ambiguous nor bindable as `use self::…`.

@@ -1,0 +1,8 @@
+error: `module` must name the module it is on: it ends in `other`, but the module is `m`
+
+         = help: write this module's own path, ending in `m`
+
+ --> tests/ui/module_last_segment_mismatch.rs:3:36
+  |
+3 | #[decycle::decycle(module = crate::other)]
+  |                                    ^^^^^

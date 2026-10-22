@@ -1,0 +1,8 @@
+error: `module` is the path of a module, which takes no generic arguments
+
+         = help: write the module path alone: `module = crate::..::m`
+
+ --> tests/ui/module_generic_args.rs:2:37
+  |
+2 | #[decycle::decycle(module = crate::m<u8>)]
+  |                                     ^^^^

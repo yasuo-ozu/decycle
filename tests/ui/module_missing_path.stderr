@@ -1,0 +1,11 @@
+error[E0433]: cannot find `nowhere` in `crate`
+ --> tests/ui/module_missing_path.rs:3:36
+  |
+3 | #[decycle::decycle(module = crate::nowhere::r)]
+  |                                    ^^^^^^^ could not find `nowhere` in the crate root
+
+error[E0433]: cannot find `nowhere` in `crate`
+  --> tests/ui/module_missing_path.rs:34:48
+   |
+34 | #[decycle::decycle(structural, module = crate::nowhere::s)]
+   |                                                ^^^^^^^ could not find `nowhere` in the crate root

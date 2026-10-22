@@ -1127,7 +1127,12 @@ impl syn::visit_mut::VisitMut for RenameLifetimes<'_> {
 /// The impl's cyclic `where`-predicates for every single-segment decycle-trait bound whose
 /// target is not a bare type parameter of the impl (a bare-param target's *original*-trait
 /// obligation is not provable inside the rank-rewritten impl, so such bounds are skipped —
-/// their non-generic-method coverage then relies on rule 1 of the callee's own frames). C1: a
+/// their non-generic-method coverage then relies on rule 1 of the callee's own frames). A bound
+/// whose target is no participant at all (`crate::other::Leaf: Cb`, `u8: Cb` — no impl taken over
+/// has that head) is skipped too: it is a premise on the original trait, which
+/// `remove_cyclic_bounds` keeps as a side bound, not an edge. Walked as an edge, it found no impl
+/// to descend into, so `reachable_side_bounds_ok` failed for every impl reaching it, their
+/// re-entry fns went unregistered, and a recursion past the floor panicked at run time. C1: a
 /// `for<'a> B<'a>: Cb` (or `B: for<'a> Cb<'a>`) HRTB binder is fresh-renamed and carried on the
 /// returned `CyclicBound` so `build_shared_registrations` can declare it at the register-once
 /// fn instead of silently dropping it (which previously left `'a` undeclared → E0261).
@@ -1163,6 +1168,7 @@ fn cyclic_where_bounds(
     let Some(wc) = &impl_.generics.where_clause else {
         return out;
     };
+    let self_heads = cycle_self_heads(replacing_table);
     let mut hr_counter = 0usize; // distinct fresh names across all HRTB bounds of this impl
     for pred in &wc.predicates {
         let WherePredicate::Type(pt) = pred else {
@@ -1190,6 +1196,12 @@ fn cyclic_where_bounds(
                     // `Self` means "this impl's self type" only INSIDE the impl; every consumer
                     // of the returned target reads it from outside (see the doc comment).
                     let mut target = subst_bare_self_in_type(&pt.bounded_ty, &impl_.self_ty);
+                    // A premise, not an edge: see the doc comment.
+                    if !crate::helper::type_head_ident(&target)
+                        .is_some_and(|h| self_heads.contains(&h))
+                    {
+                        continue;
+                    }
                     if !rename.is_empty() {
                         syn::visit_mut::VisitMut::visit_type_mut(
                             &mut RenameLifetimes { rename: &rename },
@@ -3396,16 +3408,34 @@ fn type_contains_self(ty: &Type) -> bool {
     finder.0
 }
 
+/// The entries of `replacing_table` in the order the traits are declared (`traits`, the module's
+/// own order, then the `#[decycle] use`s'). Every iteration that emits tokens, or picks which of
+/// several errors is reported, goes through this rather than through the `HashMap`, whose order is
+/// randomized per process: iterating the map made the expansion of one module differ between
+/// compilations (the items of `ranked_traits` and `shadowing_module`, and the Final impls, in
+/// another order each time), which defeats reproducible builds and incremental compilation, and
+/// made two expansions of the same module within one process differ too.
+fn in_declaration_order<'a>(
+    traits: &[ItemTrait],
+    replacing_table: &'a HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+) -> Vec<&'a (ItemTrait, usize, Vec<ItemImpl>)> {
+    let mut seen = std::collections::HashSet::new();
+    traits
+        .iter()
+        .filter(|trait_| seen.insert(trait_.ident.clone()))
+        .filter_map(|trait_| replacing_table.get(&trait_.ident))
+        .collect()
+}
+
 /// Check for `type Assoc = Self;` in impl blocks where the trait's associated type
 /// has a bound referencing a `#[decycle]` trait. This creates an infinite recursive
 /// definition because the ranked trait's associated type bound refers to the original
 /// trait, causing a cycle through the Final impl.
-fn check_assoc_type_self(
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
-) {
-    let decycle_idents: std::collections::HashSet<&Ident> = replacing_table.keys().collect();
+fn check_assoc_type_self(in_order: &[&(ItemTrait, usize, Vec<ItemImpl>)]) {
+    let decycle_idents: std::collections::HashSet<&Ident> =
+        in_order.iter().map(|(trait_, _, _)| &trait_.ident).collect();
 
-    for (trait_, _, impls) in replacing_table.values() {
+    for (trait_, _, impls) in in_order.iter().copied() {
         for trait_item in &trait_.items {
             let TraitItem::Type(TraitItemType {
                 ident: assoc_ident,
@@ -3481,10 +3511,8 @@ fn check_assoc_type_self(
 /// (impl headers, where-predicates, `impl Trait` bounds, supertraits, and paths inside user
 /// bodies) — the last of which decycle deliberately never reads. Rejecting the declaration is the
 /// honest boundary; the workaround is one line (drop the default, spell the argument).
-fn check_no_defaulted_trait_generics(
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
-) {
-    for (trait_, _, _) in replacing_table.values() {
+fn check_no_defaulted_trait_generics(in_order: &[&(ItemTrait, usize, Vec<ItemImpl>)]) {
+    for (trait_, _, _) in in_order.iter().copied() {
         check_no_defaulted_generics_of(trait_);
     }
 }
@@ -3563,30 +3591,169 @@ pub fn check_trait_structural(trait_: &ItemTrait) {
     check_no_impl_trait_output_in(trait_);
 }
 
-/// A `#[decycle]` trait listed as a supertrait of ANOTHER `#[decycle]` trait — both in the
-/// same `replacing_table` batch — makes the ranked-trait definitions mutually referential
-/// in a way the rank-rewriting scheme can't discharge (E0283 at the use site: the
-/// supertrait bound resolves to the shadowed dummy trait, not the ranked one). Short-term:
-/// reject it outright rather than emit something that fails downstream with a confusing
-/// error.
-fn check_no_decycle_supertraits(
+/// The supertraits of the ranked twin `XxxRanked<.., Rank, ..>`: a supertrait that is itself a
+/// trait of this batch, named bare (or `self::`), becomes ITS ranked twin at the same `Rank`
+/// (`trait EvalRanked<Rank>: BaseRanked<Rank>`); every other supertrait is kept as written.
+///
+/// Kept as written, `Base` would name the real trait (`ranked_traits` glob-imports the module), and
+/// the impls would still prove it — through `Base`'s Final impl, restarting its own rank chain. But a
+/// bound `X: EvalRanked<Rank>` would then imply only `X: Base`, which a body re-emitted inside
+/// `shadowing_module` cannot use: there the bare `Base` is the empty dummy, so `x.base()` resolves
+/// only through `BaseRanked<_>`, at no rank any bound pins (E0275/E0283). Ranked, the supertrait
+/// carries the rank down: `X: EvalRanked<Rank>` implies `X: BaseRanked<Rank>`, the inductive
+/// impl's own `Self: EvalRanked<(Rank,)>` bound implies the `Self: BaseRanked<(Rank,)>` its
+/// supertrait demands, and a bare-param bound `T: EvalRanked<Rank>` implies the `T: BaseRanked<Rank>`
+/// a generic impl's `Base` needs. The leaf `EvalRanked<()>` needs `BaseRanked<()>`, which the leaf
+/// of `Base` provides for the same self type.
+fn ranked_supertraits(
+    trait_: &ItemTrait,
     replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
-) {
-    let decycle_idents: std::collections::HashSet<&Ident> = replacing_table.keys().collect();
-
-    for (trait_, _, _) in replacing_table.values() {
-        for bound in &trait_.supertraits {
-            let TypeParamBound::Trait(TraitBound { path, .. }) = bound else {
-                continue;
-            };
-            if path.segments.len() == 1 && decycle_idents.contains(&path.segments[0].ident) {
-                abort!(
-                    path,
-                    "a #[decycle] trait cannot be a supertrait of another #[decycle] trait"
-                );
+) -> Punctuated<TypeParamBound, Token![+]> {
+    let replacer = TraitReplacer {
+        table: replacing_table
+            .iter()
+            .map(|(ident, (_, rank_loc, _))| {
+                let ranked: Path = parse_quote!(#{name!("{}Ranked", ident)});
+                (ident.clone(), (*rank_loc, ranked))
+            })
+            .collect(),
+        rank_type: parse_quote!(#{name!("Rank")}),
+    };
+    let mut supertraits = trait_.supertraits.clone();
+    for bound in supertraits.iter_mut() {
+        if let TypeParamBound::Trait(TraitBound { path, .. }) = bound {
+            if ranked_supertrait(path, trait_, replacing_table).is_some() {
+                replacer.try_replace_path(path);
             }
         }
     }
+    supertraits
+}
+
+/// The trait of this batch a supertrait bound of `trait_` names, when [`ranked_supertraits`] ranks
+/// it: named bare (or `self::`), and implemented here for the self type of every impl of `trait_`
+/// — the ranked twin of the supertrait exists only for those. (A supertrait implemented elsewhere,
+/// outside the module or by an opt-out impl, stays the real trait, as written.)
+fn ranked_supertrait(
+    path: &Path,
+    trait_: &ItemTrait,
+    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+) -> Option<Ident> {
+    let mut probe = path.clone();
+    crate::helper::strip_leading_self(&mut probe);
+    if probe.leading_colon.is_some() || probe.segments.len() != 1 {
+        return None;
+    }
+    let sup = &probe.segments[0].ident;
+    let (_, _, sup_impls) = replacing_table.get(sup)?;
+    let own_impls = replacing_table
+        .get(&trait_.ident)
+        .map_or(&[][..], |(_, _, impls)| &impls[..]);
+    let implemented_here = own_impls.iter().all(|im| {
+        sup_impls.iter().any(|cand| {
+            let vars: std::collections::HashSet<Ident> = cand
+                .generics
+                .params
+                .iter()
+                .filter_map(|p| match p {
+                    GenericParam::Type(t) => Some(t.ident.clone()),
+                    _ => None,
+                })
+                .collect();
+            unify_type_pattern(&vars, &cand.self_ty, &im.self_ty).is_some()
+        })
+    });
+    implemented_here.then(|| sup.clone())
+}
+
+/// The re-entry registrations of `impl_`'s supertraits, for `Self`, in its inductive frame.
+///
+/// A ranked supertrait (`EvalRanked<Rank>: BaseRanked<Rank>`) lets this frame's body call a
+/// supertrait method (`self.base()`) at the frame's own rank, entering the supertrait's chain
+/// there — possibly one step above its floor, where the floor looks up the supertrait's re-entry fn
+/// for the next type. A cyclic bound `X: Base` would have registered it (rule 2); the supertrait is
+/// such an edge on `Self`, implied rather than written, so it is registered here, like rule 1 does
+/// for the impl's own trait: every non-generic method of every supertrait the ranked twin reaches
+/// (transitively), for `Self`. Under the same conditions as rule 1 — no bare-param cyclic bound
+/// (`Self: Base` is then not provable inside the frame) and every side bound reachable through the
+/// supertrait's chain among the impl's own — and only for a supertrait whose arguments do not name
+/// the trait's own parameters.
+fn build_supertrait_registrations(
+    trait_: &ItemTrait,
+    impl_: &ItemImpl,
+    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+    decycle: &Path,
+) -> TokenStream {
+    let mut out = TokenStream::new();
+    if impl_has_bare_param_cyclic_bound(impl_, replacing_table) {
+        return out;
+    }
+    let rt = quote!(#{name!("ranked_traits")});
+    let self_unsized = impl_self_may_be_unsized(impl_);
+    let mut seen: std::collections::HashSet<Ident> = Default::default();
+    let mut queue: Vec<&ItemTrait> = vec![trait_];
+    while let Some(sub) = queue.pop() {
+        let sub_params: std::collections::HashSet<String> = sub
+            .generics
+            .params
+            .iter()
+            .filter_map(|p| match p {
+                GenericParam::Type(t) => Some(t.ident.to_string()),
+                GenericParam::Const(c) => Some(c.ident.to_string()),
+                GenericParam::Lifetime(_) => None,
+            })
+            .collect();
+        for bound in &sub.supertraits {
+            let TypeParamBound::Trait(TraitBound { path, .. }) = bound else {
+                continue;
+            };
+            let Some(sup) = ranked_supertrait(path, sub, replacing_table) else {
+                continue;
+            };
+            if !seen.insert(sup.clone()) {
+                continue;
+            }
+            let (sup_trait, _, _) = &replacing_table[&sup];
+            queue.push(sup_trait);
+            let targs = nonlifetime_path_args(&path.segments.last().unwrap().arguments);
+            let names_sub_param = targs.iter().any(|a| {
+                quote!(#a)
+                    .to_string()
+                    .split_whitespace()
+                    .any(|t| sub_params.contains(t))
+            });
+            if names_sub_param
+                || !reachable_side_bounds_ok(impl_, &impl_.self_ty, &sup, &targs, replacing_table)
+            {
+                continue;
+            }
+            for item in &sup_trait.items {
+                let TraitItem::Fn(tf) = item else { continue };
+                if method_is_generic(&tf.sig) {
+                    continue;
+                }
+                let fp = fingerprint_expr(
+                    decycle,
+                    &quote!(Self),
+                    self_unsized,
+                    &sup_trait.generics,
+                    &targs,
+                    None,
+                );
+                out.extend(emit_registration(
+                    decycle,
+                    &rt,
+                    &sup,
+                    &tf.sig.ident,
+                    &quote!(Self),
+                    &targs,
+                    &[],
+                    fp,
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// Run the ranked `#[decycle]` expansion and return the rewritten module tokens.
@@ -3596,69 +3763,6 @@ fn check_no_decycle_supertraits(
 /// obligations the plain scan can't rank on its own — and call this to get the expanded output.
 /// The `#[decycle]` attribute ultimately routes here; call it directly only when building macro
 /// tooling on top of decycle. Stable and semver-committed.
-/// [`finalize`], with the caller's obligation graph.
-///
-/// The same relationship [`super::process_module_with_graph`] has to [`super::process_module`], at the
-/// lower level: `graph`'s nodes are the participants, and `emit_contracts` re-spells `args.contents`
-/// from them (see [`super::contract`]) before any of the ranking machinery reads a trait path. It also
-/// peels wrapped cyclic bounds, the other graph-dependent normalisation `process_module` would have
-/// done.
-///
-/// This is the entry point for a wrapper macro that has already split the module itself — it holds
-/// `FinalizeArgs` rather than an `ItemMod`, so it cannot go through `process_module_with_graph`, but it
-/// has the same reason to state its cycle instead of encoding it in spelling.
-///
-/// With `emit_contracts = false` this is exactly [`finalize`]: the node set is only consulted by those
-/// two passes, since everything below already works off `replacing_table`.
-pub fn finalize_with_graph(
-    mut args: FinalizeArgs,
-    graph: &crate::safegraph::VecGraph<Ident, crate::analysis::EdgeKind>,
-    emit_contracts: bool,
-) -> TokenStream {
-    if emit_contracts {
-        use crate::safegraph::graph::Graph;
-        let participants: std::collections::HashSet<Ident> = graph.nodes().cloned().collect();
-        let all_traits: std::collections::HashSet<Ident> = args
-            .traits
-            .iter()
-            .map(|t| t.ident.clone())
-            .chain(
-                args.working_list
-                    .iter()
-                    .filter_map(|p| p.segments.last().map(|s| s.ident.clone())),
-            )
-            .collect();
-        // `contract_from_graph` works over `Item`s; wrap and unwrap the impls around it.
-        let mut items: Vec<Item> = args.contents.drain(..).map(Item::Impl).collect();
-        crate::ranked::contract::contract_from_graph(&mut items, &all_traits, &participants);
-        args.contents = items
-            .into_iter()
-            .filter_map(|it| match it {
-                Item::Impl(im) => Some(im),
-                _ => None,
-            })
-            .collect();
-        // Peel too: a wrapped cyclic bound (`Box<Stmt>: Tr`) has no rankable head, and this entry
-        // point bypasses `process_module`, where that pass normally runs. Both are pre-ranking
-        // normalisations that only a participant set makes possible, so they belong together here.
-        for im in args.contents.iter_mut() {
-            let impl_type_params: std::collections::HashSet<Ident> = im
-                .generics
-                .params
-                .iter()
-                .filter_map(|p| match p {
-                    GenericParam::Type(t) => Some(t.ident.clone()),
-                    _ => None,
-                })
-                .collect();
-            crate::ranked::peel::peel_cyclic_bounds(im, &all_traits, &participants, &|ty| {
-                crate::ranked::process_module::is_local_impl_bound_target(ty, &impl_type_params)
-            });
-        }
-    }
-    finalize(args)
-}
-
 pub fn finalize(args: FinalizeArgs) -> TokenStream {
     // Apply this module's own use-site renames (`#[decycle] use path::T as R;`) BEFORE
     // indexing traits by ident: the `ItemTrait` arriving through the macro ping-pong
@@ -3740,9 +3844,8 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
         })
         .collect();
 
-    check_assoc_type_self(&replacing_table);
-    check_no_decycle_supertraits(&replacing_table);
-    check_no_defaulted_trait_generics(&replacing_table);
+    check_assoc_type_self(&in_declaration_order(&traits, &replacing_table));
+    check_no_defaulted_trait_generics(&in_declaration_order(&traits, &replacing_table));
 
     // C2: enroll each foreign-typed but in-module-impl'd concrete impl (e.g.
     // `impl __UnparseDyn for Group<Substruct,O,C>`) into its trait's ranked set. The
@@ -3813,6 +3916,9 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
     let initial_rank = initial_rank(args.recurse_level);
 
     // Build the TraitReplacer table: maps trait ident → (rank_loc, ranked_path)
+    // Every iteration below that emits tokens goes through `in_order`, never the `HashMap`.
+    let in_order = in_declaration_order(&traits, &replacing_table);
+
     let trait_replacer_table: HashMap<Ident, (usize, Path)> = replacing_table
         .iter()
         .map(|(ident, (_, rank_loc, _))| {
@@ -3837,7 +3943,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                 #[allow(unused)]
                 use super::super::*;
 
-                #(for (trait_, rank_loc, impls) in replacing_table.values()) {
+                #(for (trait_, rank_loc, impls) in in_order.iter().copied()) {
 
                     // pub trait MyTraitRanked<'a, Rank, T>
                     //
@@ -3856,7 +3962,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                     #(if !ranked_generics.params.is_empty()) {
                         < #(for p in &ranked_generics.params), { #{param_decl(p, DeclBounds::Keep)} } >
                     }
-                    #{trait_.colon_token} #{&trait_.supertraits} {
+                    #{trait_.colon_token} #{ranked_supertraits(trait_, &replacing_table)} {
                         #(for item in &trait_.items) { #{process_trait_item_for_ranked(item)} }
                     }
                     }
@@ -3896,9 +4002,9 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
             // This prevents method calls in the inductive step body from resolving
             // to the Final impls (which would reset rank to InitialRank).
             // Local definitions shadow glob imports in Rust.
-            #(for trait_ in replacing_table.keys()) {
+            #(for (trait_, _, _) in in_order.iter().copied()) {
                 #[allow(non_camel_case_types)]
-                trait #trait_ {}
+                trait #{&trait_.ident} {}
             }
 
             // F2: also shadow a renamed trait's ORIGINAL name (see `renamed_original_dummies`
@@ -3914,7 +4020,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
             #[allow(unused)]
             use #{name!("ranked_traits")}::*;
 
-            #(for (trait_, rank_loc, impls) in replacing_table.values()) {
+            #(for (trait_, rank_loc, impls) in in_order.iter().copied()) {
                 #(for (impl_ix, impl_) in impls.iter().enumerate()) {
 
                     #[allow(unused)]
@@ -4089,6 +4195,12 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                                         rule1_ok,
                                         &decycle_path,
                                     );
+                                    let super_regs = build_supertrait_registrations(
+                                        trait_,
+                                        impl_,
+                                        &replacing_table,
+                                        &decycle_path,
+                                    );
                                     // Rule 2 for GENERIC cyclic methods: the shared
                                     // register-once fn below declares only the impl's own
                                     // generics, so a callee's method type arguments can only be
@@ -4112,6 +4224,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                                         {
                                             let #scope_guard = #decycle_path::__reentry::scope();
                                             #rule1_regs
+                                            #super_regs
                                             #rule2_generic_regs
                                             #register_once_fn
                                             #(if !call_targs.is_empty()) { ::<#(#call_targs),*> }
@@ -4140,7 +4253,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
 
         // Final impls: implement original traits by delegating to ranked traits.
         // These are outside shadowing_module so original trait names are visible.
-        #(for (trait_, rank_loc, impls) in replacing_table.values()) {
+        #(for (trait_, rank_loc, impls) in in_order.iter().copied()) {
             #(for impl_ in impls) {
                 // C4: the Final header PRESERVES a bare-param cyclic bound (`impl<T: Cb> …`)
                 // instead of stripping it — the real, un-ranked `T: Cb` is what lets C4's

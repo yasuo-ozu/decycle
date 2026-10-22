@@ -1,0 +1,31 @@
+error[E0277]: the trait bound `u8: m::Loop` is not satisfied
+  --> tests/ui/peel_wrapped_unsatisfied.rs:17:13
+   |
+17 |         (B, u8): Loop,
+   |             ^^^^^^^^^ the trait `m::Loop` is not implemented for `u8`
+   |
+help: the following other types implement trait `m::Loop`
+  --> tests/ui/peel_wrapped_unsatisfied.rs:5:1
+   |
+ 5 | #[decycle::decycle]
+   | ^^^^^^^^^^^^^^^^^^^
+   | |
+   | `A`
+   | `B`
+   = note: this error originates in the attribute macro `decycle::decycle` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the trait bound `u8: m::Loop` is not satisfied
+ --> tests/ui/peel_wrapped_unsatisfied.rs:5:1
+  |
+5 | #[decycle::decycle]
+  | ^^^^^^^^^^^^^^^^^^^ the trait `m::Loop` is not implemented for `u8`
+  |
+help: the following other types implement trait `m::Loop`
+ --> tests/ui/peel_wrapped_unsatisfied.rs:5:1
+  |
+5 | #[decycle::decycle]
+  | ^^^^^^^^^^^^^^^^^^^
+  | |
+  | `A`
+  | `B`
+  = note: this error originates in the attribute macro `decycle::decycle` (in Nightly builds, run with -Z macro-backtrace for more info)

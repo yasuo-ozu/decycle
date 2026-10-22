@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use syn::visit_mut::VisitMut;
 use syn::*;
 
-// ===== Shared, code-free analysis =====
-pub mod analysis;
+// ===== Shared, code-free analysis (the obligation graph `growth` reads the cycle members off) =====
+mod analysis;
 
 // ===== Ranked engine (default) =====
 pub mod ranked;
@@ -14,19 +14,26 @@ pub mod ranked;
 pub use ranked::finalize;
 pub(crate) use ranked::helper;
 #[doc(hidden)]
-pub use ranked::process_module;
-#[doc(hidden)]
 pub use ranked::{check_trait, check_trait_structural};
+#[doc(hidden)]
+pub use ranked::{process_module, process_module_at};
 
 // ===== Structural unroll (`#[decycle(structural)]`) =====
 pub mod structural;
 // Aliased root re-export kept for `decycle-macro` (the public name is `structural::process_module`).
 #[doc(hidden)]
-pub use structural::process_module as process_module_structural;
+pub use structural::{
+    process_module as process_module_structural, process_module_at as process_module_structural_at,
+};
 
 // Rendering `syn::Generics` to token form, shared by both engines.
 mod generics_fmt;
 mod growth;
+// `#[decycle(module = path)]`: qualifying the items re-emitted as written, and checking the path.
+mod module_path;
+// For `decycle-macro`, which reports an invalid `module = path` after expanding without it.
+#[doc(hidden)]
+pub use module_path::{module_path_error, ModulePathError};
 
 /// Emitted by both engines when a `#[decycle]` module contains no trait (nor `#[decycle] use`)
 /// annotated with `#[decycle]` — nothing marks a cycle participant, so there is nothing to break.
@@ -34,7 +41,6 @@ pub(crate) const NO_DECYCLE_TRAITS_MSG: &str =
     "cannot detect traits nor `use` statement annotated with #[decycle]";
 
 pub use proc_macro_error;
-pub use safegraph;
 
 #[derive(Clone)]
 struct GenericRenamer {
@@ -130,9 +136,9 @@ pub(crate) fn randomize_impl_generics(
 ///
 /// Arguments are not inspected. Everything that *acts* on the marker goes through
 /// [`is_decycle_attribute`], which rejects them; this bare predicate exists for the read-only
-/// [`analysis`] module, whose whole contract is to inspect a module without diagnosing it — and
-/// which, unlike the engines, is routinely called outside a `#[proc_macro_error]` entry point,
-/// where `abort!` could only panic.
+/// [`analysis`] module (and `growth`), whose whole contract is to inspect a module without
+/// diagnosing it — its unit tests run it outside a `#[proc_macro_error]` entry point, where
+/// `abort!` could only panic.
 fn names_decycle_attribute(attr: &Attribute, decycle_crate: &Ident) -> bool {
     let path = attr.path();
     path.is_ident("decycle")

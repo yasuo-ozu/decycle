@@ -6,15 +6,18 @@ use syn::parse::{Parse, ParseStream};
 use syn::*;
 use template_quote::quote;
 
-use decycle_impl::process_module;
-use decycle_impl::process_module_structural;
 use decycle_impl::{check_trait, check_trait_structural};
+use decycle_impl::{process_module, process_module_at};
+use decycle_impl::{process_module_structural, process_module_structural_at};
 
 struct Args {
     decycle: Option<Path>,
     recurse_level: Option<usize>,
     support_infinite_cycle: Option<bool>,
     structural: bool,
+    /// `module = path`: the absolute path of the annotated module. Checked against the module
+    /// (absolute, no generic arguments, ending in its name) by `decycle_impl::module_path_error`.
+    module: Option<Path>,
     /// First repeated keyword seen: the SECOND occurrence's span, plus the keyword name. A repeat
     /// used to silently last-win; it is now rejected — but only AFTER the item is processed and
     /// `set_dummy` holds a valid expansion, so the abort does not cascade (see `reject_duplicate`).
@@ -38,6 +41,7 @@ impl Parse for Args {
             recurse_level: None,
             support_infinite_cycle: None,
             structural: false,
+            module: None,
             duplicate: None,
         };
         syn::custom_keyword!(decycle);
@@ -47,6 +51,7 @@ impl Parse for Args {
         syn::custom_keyword!(recurse_level);
         syn::custom_keyword!(support_infinite_cycle);
         syn::custom_keyword!(structural);
+        syn::custom_keyword!(module);
         while !input.is_empty() {
             let lookahead = input.lookahead1();
             if lookahead.peek(structural) {
@@ -85,6 +90,15 @@ impl Parse for Args {
                     "`alter_macro_name` was an option of `#[decycle]` on a trait, which was removed in 0.6";
                     help = "nothing replaces it: `#[decycle] use` the trait by its own name"
                 )
+            } else if lookahead.peek(module) {
+                let kw: module = input.parse()?;
+                input.parse::<Token![=]>()?;
+                let value = input.parse()?;
+                if args.module.is_some() {
+                    args.note_duplicate(kw.span, "module");
+                } else {
+                    args.module = Some(value);
+                }
             } else if lookahead.peek(recurse_level) {
                 let kw: recurse_level = input.parse()?;
                 input.parse::<Token![=]>()?;
@@ -106,7 +120,7 @@ impl Parse for Args {
             } else {
                 abort!(
                     input.span(),
-                    "keyword arguments should be one of 'decycle', 'recurse_level', 'support_infinite_cycle', 'structural'"
+                    "keyword arguments should be one of 'decycle', 'module', 'recurse_level', 'support_infinite_cycle', 'structural'"
                 )
             }
             if input.parse::<Token![,]>().is_err() {
@@ -213,6 +227,14 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
                 "#[decycle] requires an inline module with at least one item"
             )
         }
+        // An invalid `module = path` is reported after the module is expanded WITHOUT it, so the
+        // dummy is a valid expansion and the error stays alone (a raw module whose impls bound each
+        // other would add an `E0275` per bound).
+        let module_path_error = args
+            .module
+            .as_ref()
+            .and_then(|path| decycle_impl::module_path_error(path, &module.ident));
+        let module_path = args.module.as_ref().filter(|_| module_path_error.is_none());
         let ret = if args.structural {
             // The structural unroll has no rank floor, so the depth/infinite knobs don't apply.
             if args.recurse_level.is_some() || args.support_infinite_cycle.is_some() {
@@ -221,7 +243,12 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
                     "recurse_level / support_infinite_cycle are not supported with `structural`"
                 )
             }
-            process_module_structural(module, &decycle_path)
+            match module_path {
+                Some(module_path) => {
+                    process_module_structural_at(module, module_path, &decycle_path)
+                }
+                None => process_module_structural(module, &decycle_path),
+            }
         } else {
             let recurse_level = args.recurse_level.unwrap_or(10);
             if recurse_level == 0 {
@@ -232,11 +259,25 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
                 )
             }
             let support_infinite_cycle = args.support_infinite_cycle.unwrap_or(true);
-            process_module(module, &decycle_path, recurse_level, support_infinite_cycle)
+            match module_path {
+                Some(module_path) => process_module_at(
+                    module,
+                    module_path,
+                    &decycle_path,
+                    recurse_level,
+                    support_infinite_cycle,
+                ),
+                None => {
+                    process_module(module, &decycle_path, recurse_level, support_infinite_cycle)
+                }
+            }
         };
         // Process FIRST so the dummy fallback is the (valid) expanded module, THEN reject unsupported
         // args — matching the original ordering so an unsupported-arg abort doesn't cascade.
         set_dummy(quote!(#ret));
+        if let Some(err) = module_path_error {
+            abort!(err.at, "{}", err.message; help = "{}", err.help)
+        }
         reject_duplicate(&args);
         ret.into()
     } else if let Ok(item_trait) = parse::<ItemTrait>(input.clone()) {
@@ -251,6 +292,8 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
             Some("recurse_level")
         } else if args.support_infinite_cycle.is_some() {
             Some("support_infinite_cycle")
+        } else if args.module.is_some() {
+            Some("module")
         } else {
             None
         };

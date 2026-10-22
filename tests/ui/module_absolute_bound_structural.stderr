@@ -1,0 +1,29 @@
+error[E0275]: overflow evaluating the requirement `A: m::Loop`
+  --> tests/ui/module_absolute_bound_structural.rs:17:9
+   |
+17 |         crate::m::B: Loop,
+   |         ^^^^^^^^^^^^^^^^^
+   |
+note: required for `B` to implement `m::Loop`
+  --> tests/ui/module_absolute_bound_structural.rs:24:10
+   |
+24 |     impl Loop for B
+   |          ^^^^     ^
+25 |     where
+26 |         A: Loop,
+   |            ---- unsatisfied trait bound introduced here
+
+error[E0275]: overflow evaluating the requirement `B: m::Loop`
+  --> tests/ui/module_absolute_bound_structural.rs:26:9
+   |
+26 |         A: Loop,
+   |         ^^^^^^^
+   |
+note: required for `A` to implement `m::Loop`
+  --> tests/ui/module_absolute_bound_structural.rs:15:10
+   |
+15 |     impl Loop for A
+   |          ^^^^     ^
+16 |     where
+17 |         crate::m::B: Loop,
+   |                      ---- unsatisfied trait bound introduced here

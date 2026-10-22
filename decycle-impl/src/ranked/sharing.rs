@@ -1,4 +1,4 @@
-//! Give every contracted impl of one cycle the **union** of its siblings' non-cyclic premises.
+//! Give every impl of one cycle the **union** of its siblings' non-cyclic premises — both engines.
 //!
 //! A cycle member's body reaches its siblings through the *public* trait, and the engine discharges
 //! that through the sibling's own delegating impl — which carries the sibling's **own** leaf bounds.
@@ -7,8 +7,9 @@
 //!
 //! The union is computed from the impls' *real* predicates rather than re-derived from field types,
 //! so an obligation a caller introduced by hand (or through a generated helper type) is covered too.
-//! Peeled cyclic bounds are excluded: those are the engine's to rank, and copying one onto a sibling
-//! would rank-lower it there as well.
+//! The cycle's own edges are excluded — which predicates those are is the engine's to say
+//! (`is_edge`): the ranked engine ranks them, and copying one onto a sibling would rank-lower it
+//! there as well; the structural engine strips them from the generated impls.
 //!
 //! **Scope.** An impl only ever *needs* a sibling's premises when its own rank chain can reach that
 //! sibling's delegating impl — that is, when its (transitive) cyclic bounds obligate it. The caller
@@ -34,18 +35,15 @@ use template_quote::quote;
 /// types (so a `#[group]`'s `Fill` obligation is covered too).
 ///
 /// `sources[i]` lists the indices (into `impls`) of the impls whose premises `impls[i]` may inherit —
-/// the impls its rank chain can actually reach, as computed by the caller from the obligation edges.
-/// `routed_traits` is the full set of `#[decycle]`-routed trait idents: a predicate whose bound names
-/// any of them in the bare (or `self::`-qualified) spelling is a cycle edge for the engine to rank,
-/// never a premise to copy — copying one onto a sibling would rank-lower it there too, and a
-/// cross-trait edge (`X: Tr2` inside an impl of `Tr`) is stripped downstream exactly like an own-trait
-/// one (`remove_cyclic_bounds` keys on every routed trait), so both spellings are excluded alike.
+/// the impls it can actually reach, as computed by the caller from the obligation edges.
+/// `is_edge(im, pred)` says whether a predicate of `im` is an edge of the cycle rather than a premise
+/// — never shared (see [`is_ranked_edge`] and the structural engine's `is_cycle_edge`).
 ///
 /// A predicate is only injected into an impl that declares every generic parameter it mentions, so a
 /// cycle whose members carry *different* parameters stays well-formed.
 pub(crate) fn share_side_predicates_scoped(
     impls: &mut [&mut ItemImpl],
-    routed_traits: &HashSet<Ident>,
+    is_edge: &dyn Fn(&ItemImpl, &WherePredicate) -> bool,
     sources: &[Vec<usize>],
 ) {
     debug_assert_eq!(impls.len(), sources.len());
@@ -58,10 +56,8 @@ pub(crate) fn share_side_predicates_scoped(
                 .where_clause
                 .iter()
                 .flat_map(|wc| wc.predicates.iter())
-                // Skip the cyclic bounds (spelled bare or `self::`-qualified, naming any routed
-                // trait): those are decycle's to rank, and copying one onto a sibling would
-                // rank-lower it there too.
-                .filter(|p| !is_bare_trait_pred(p, routed_traits))
+                // Skip the cycle's edges: those are the engine's to rank or strip.
+                .filter(|p| !is_edge(im, p))
                 // `Self` is impl-relative: `Self: Debug` on `impl Tr for A` says *A* is `Debug`, so
                 // copying it onto `impl Tr for B` silently asserts something about a different type
                 // (and fails if B is not `Debug`). Only impl-independent premises can be shared.
@@ -145,22 +141,6 @@ pub(crate) fn share_side_predicates_scoped(
     }
 }
 
-/// [`share_side_predicates_scoped`] with the whole group as every impl's source — each member both
-/// contributes to and receives the full union.
-///
-/// Kept for the structural engine's graph path (`structural::expand`), whose group is the
-/// caller-GENERATED impls of one trait under a supplied graph: there the caller has already stated
-/// the participant set, and the generated helper impls are siblings of one cycle by construction.
-/// The ranked engine instead scopes each impl's sources by obligation reachability — see
-/// [`crate::ranked::process_module`]'s `sharing_sources`.
-pub(crate) fn share_side_predicates(impls: &mut [&mut ItemImpl], cyclic_marker: &Ident) {
-    let routed: HashSet<Ident> = core::iter::once(cyclic_marker.clone()).collect();
-    let everyone: Vec<Vec<usize>> = (0..impls.len())
-        .map(|i| (0..impls.len()).filter(|j| *j != i).collect())
-        .collect();
-    share_side_predicates_scoped(impls, &routed, &everyone);
-}
-
 /// The generic-parameter idents an impl declares — used to decide whether a sibling's predicate can be
 /// injected into it (see [`share_side_predicates_scoped`]).
 fn impl_param_idents(item_impl: &ItemImpl) -> HashSet<String> {
@@ -242,6 +222,28 @@ fn freshen_binder_lifetimes(mut pred: WherePredicate, taken: &HashSet<String>) -
     pred
 }
 
+/// The ranked engine's edges, for [`share_side_predicates_scoped`]: a predicate with a bound naming
+/// a routed trait in the bare (or `self::`-qualified) spelling, on a target the rank chain descends.
+///
+/// `routed_traits` is the full set of `#[decycle]`-routed trait idents: a cross-trait edge (`X: Tr2`
+/// inside an impl of `Tr`) is stripped downstream exactly like an own-trait one
+/// (`remove_cyclic_bounds` keys on every routed trait). `participants` are the head idents of the
+/// impls the engine takes over — the targets `remove_cyclic_bounds` reads a bare bound as an edge
+/// on, besides `Self` and the impl's own type parameters. A bare bound on any other target
+/// (`crate::other::Leaf: Tr`, `u8: Tr`, or the parts `peel` keeps of a wrapped bound) is no edge but
+/// a premise on the original trait, which `finalize` keeps un-lowered, and it is shared like any
+/// other premise. (Not sharing it left a sibling unable to prove what the rank chain reaching this
+/// impl demands, so its re-entry fn was never registered, and a recursion past the floor panicked.)
+pub(crate) fn is_ranked_edge(
+    im: &ItemImpl,
+    pred: &WherePredicate,
+    routed_traits: &HashSet<Ident>,
+    participants: &HashSet<Ident>,
+) -> bool {
+    is_bare_trait_pred(pred, routed_traits)
+        && targets_participant(pred, participants, &impl_param_idents(im))
+}
+
 /// Does the predicate carry a bound the engine treats as a cycle edge — a bare (or
 /// `self::`-qualified, which peel/validate normalise the same way) reference to **any** routed
 /// trait? Matching only the group's own trait missed two spellings of the same edge: `B: self::Tr`
@@ -259,6 +261,27 @@ fn is_bare_trait_pred(pred: &WherePredicate, routed_traits: &HashSet<Ident>) -> 
         }
         _ => false,
     })
+}
+
+/// Is the predicate's bounded type one the ranked chain descends — `Self`, one of the impl's own type
+/// parameters (`params`), or a type whose head is a participant? The same test as
+/// `finalize::remove_cyclic_bounds`, which keys the head by its last segment.
+fn targets_participant(
+    pred: &WherePredicate,
+    heads: &HashSet<Ident>,
+    params: &HashSet<String>,
+) -> bool {
+    let WherePredicate::Type(pt) = pred else {
+        return false;
+    };
+    if let syn::Type::Path(syn::TypePath { qself: None, path }) = &pt.bounded_ty {
+        if path.is_ident("Self")
+            || (path.segments.len() == 1 && params.contains(&path.segments[0].ident.to_string()))
+        {
+            return true;
+        }
+    }
+    crate::helper::type_head_ident(&pt.bounded_ty).is_some_and(|h| heads.contains(&h))
 }
 
 /// Does the predicate mention `Self` anywhere? Such a premise cannot be shared between impls.

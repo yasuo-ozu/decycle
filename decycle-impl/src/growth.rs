@@ -174,7 +174,7 @@ fn routed_trait_names(items: &[Item], decycle: &Path) -> HashSet<String> {
 
 /// The cycle members' type names. An empty set (no cycle at all) short-circuits the whole pass.
 fn cycle_member_names(module: &ItemMod, decycle: &Path) -> HashSet<String> {
-    use crate::safegraph::graph::Graph;
+    use safegraph::graph::Graph;
     let graph = analysis::cyclic_subgraph(&analysis::analyze_module(module, decycle));
     graph.nodes().map(|n| n.to_string()).collect()
 }

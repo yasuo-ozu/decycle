@@ -5,10 +5,9 @@
 //! overflows (E0275: "required for `Wrap<Stmt>` to implement `Tr`") without decycle. The structural
 //! engine breaks it, and this file pins that it does — it compiles and it runs.
 //!
-//! It is the working program behind `decycle-impl/tests/analysis_regressions.rs`, whose obligation
-//! graph used to come back ACYCLIC for exactly this module: `Wrap` is a participant in its own
-//! right, and a bound whose head was a participant swallowed the nested `Stmt`/`Expr` endpoints —
-//! so `cyclic_subgraph` had nothing to hand an engine and the graph-fed run emitted no terminators.
+//! It is the working program behind the obligation-graph unit tests (`decycle-impl/src/analysis`),
+//! whose graph used to come back ACYCLIC for exactly this module: `Wrap` is a participant in its own
+//! right, and a bound whose head was a participant swallowed the nested `Stmt`/`Expr` endpoints.
 
 #[decycle::decycle(structural)]
 mod structural {
@@ -60,7 +59,7 @@ mod structural {
 // NOTE: only the STRUCTURAL engine is exercised here. The same module under the default ranked
 // engine still overflows (`Wrap<Expr>: TrRanked<()>`): the blanket `impl<T: Tr> Tr for Wrap<T>` is
 // not itself rank-lowered, so the rank chain runs through an un-lowered link. That is a pre-existing
-// ranked-engine limitation, unrelated to the obligation graph this file backs, and left as is.
+// ranked-engine limitation, unrelated to the obligation graph, and left as is.
 
 macro_rules! check {
     ($m:ident) => {{

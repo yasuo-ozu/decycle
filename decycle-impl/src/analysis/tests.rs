@@ -1,28 +1,29 @@
-//! Regressions for the obligation-graph API (`analysis.rs`) — the 2026-08-05 front-door audit.
+//! Unit tests of the obligation graph (`analyze_module`, `cyclic_subgraph`).
+//!
+//! Regressions kept from the audits of the former public API:
 //!
 //! 1. A generic parameter of an impl that shadows a participant's name must not fabricate an
-//!    edge: the doc promises that a bound targeting one of the impl's own type parameters is
-//!    "not represented", and the engine (`remove_cyclic_bounds` / `cyclic_where_bounds`)
-//!    already consults the impl's param idents.
+//!    edge: a bound targeting one of the impl's own type parameters is "not represented", and the
+//!    engine (`remove_cyclic_bounds` / `cyclic_where_bounds`) already consults the impl's param
+//!    idents.
 //! 2. A raw-identifier participant (`struct r#loop`) must not panic `analyze_module` — the
 //!    node idents are cloned from the source, never re-created via `Ident::new`.
-//!
-//! …and the 2026-08-14 pass:
-//!
 //! 3. A bound wrapped in a container that is ITSELF a participant (`Wrap<Stmt>: Tr`, `Wrap`
 //!    implementing the trait too) must report both endpoints. Emitting only the head edge made
-//!    `cyclic_subgraph` answer "no participants" for a fully cyclic module, and an engine fed that
-//!    answer left the module un-decycled.
+//!    `cyclic_subgraph` answer "no participants" for a fully cyclic module.
 //! 4. A bound whose target is a FOREIGN type sharing its last path segment with a participant
 //!    (`::other::Stmt: Tr`) is no edge at all — the same bare-or-`self::` rule the engine's own
-//!    `peel::cycle_types_within` / `ranked::contract` apply.
+//!    `peel::cycle_types_within` applies.
 
-use decycle_impl::analysis::{analyze_module, cyclic_subgraph, EdgeKind};
-use decycle_impl::safegraph::graph::Graph;
+use super::{analyze_module, cyclic_subgraph, EdgeKind};
+use proc_macro2::Ident;
+use safegraph::graph::Graph;
+use safegraph::VecGraph;
 use syn::parse_quote;
 
 /// `(from, kind, to)` triples, sorted, so assertions do not depend on insertion order.
-fn edges_of(g: &decycle_impl::safegraph::VecGraph<proc_macro2::Ident, EdgeKind>) -> Vec<(String, EdgeKind, String)> {
+fn edges_of(g: &VecGraph<Ident, EdgeKind>) -> Vec<(String, EdgeKind, String)> {
+    // Indices only exist inside a scope for a `Vec`-backed graph.
     let mut out = g.scope(|ctx| {
         ctx.edge_indices()
             .map(|e| {
@@ -43,6 +44,217 @@ fn edges_of(g: &decycle_impl::safegraph::VecGraph<proc_macro2::Ident, EdgeKind>)
 
 fn edges(module: &syn::ItemMod) -> Vec<(String, EdgeKind, String)> {
     edges_of(&analyze_module(module, &parse_quote!(::decycle)))
+}
+
+fn sorted_nodes(g: &VecGraph<Ident, EdgeKind>) -> Vec<String> {
+    let mut v: Vec<String> = g.nodes().map(|n| n.to_string()).collect();
+    v.sort();
+    v
+}
+
+fn nodes(module: &syn::ItemMod) -> Vec<String> {
+    sorted_nodes(&analyze_module(module, &parse_quote!(::decycle)))
+}
+
+#[test]
+fn direct_and_peeled() {
+    let m: syn::ItemMod = parse_quote! {
+        mod ast {
+            #[decycle]
+            pub trait Tr { fn f(&self); }
+            pub enum Expr { A }
+            pub enum Stmt { B }
+            // Wrapped: the head is `Vec`, so `Stmt` is only reachable inside the arguments.
+            impl Tr for Expr where Vec<Box<Stmt>>: Tr { fn f(&self) {} }
+            // Direct: the bound names `Expr` outright.
+            impl Tr for Stmt where Expr: Tr { fn f(&self) {} }
+        }
+    };
+    assert_eq!(nodes(&m), vec!["Expr", "Stmt"]);
+    assert_eq!(
+        edges(&m),
+        vec![
+            ("Expr".into(), EdgeKind::Peeled, "Stmt".into()),
+            ("Stmt".into(), EdgeKind::Direct, "Expr".into()),
+        ]
+    );
+}
+
+#[test]
+fn only_routed_traits_and_bare_spellings_count() {
+    let m: syn::ItemMod = parse_quote! {
+        mod ast {
+            #[decycle]
+            pub trait Tr { fn f(&self); }
+            pub trait Other { fn g(&self); }   // NOT routed
+            pub enum Expr { A }
+            pub enum Stmt { B }
+            pub enum Leaf { C }
+            impl Tr for Expr
+            where
+                Stmt: Tr,                 // routed + bare  -> edge
+                Leaf: Other,              // not routed     -> no edge
+                Stmt: ::other::Tr,        // qualified      -> the documented opt-out, no edge
+            { fn f(&self) {} }
+            impl Tr for Stmt { fn f(&self) {} }
+            impl Other for Leaf { fn g(&self) {} }   // Leaf is not a participant at all
+        }
+    };
+    assert_eq!(
+        nodes(&m),
+        vec!["Expr", "Stmt"],
+        "Leaf implements no routed trait"
+    );
+    assert_eq!(
+        edges(&m),
+        vec![("Expr".into(), EdgeKind::Direct, "Stmt".into())]
+    );
+}
+
+#[test]
+fn self_and_impl_params_are_not_edges() {
+    let m: syn::ItemMod = parse_quote! {
+        mod ast {
+            #[decycle]
+            pub trait Tr { fn f(&self); }
+            pub struct A<T>(T);
+            impl<T> Tr for A<T> where Self: Tr, T: Tr { fn f(&self) {} }
+        }
+    };
+    assert_eq!(nodes(&m), vec!["A"]);
+    assert!(
+        edges(&m).is_empty(),
+        "neither endpoint names another participant"
+    );
+}
+
+#[test]
+fn one_edge_per_pair_even_with_several_routed_traits() {
+    let m: syn::ItemMod = parse_quote! {
+        mod ast {
+            #[decycle] pub trait P { fn p(&self); }
+            #[decycle] pub trait U { fn u(&self); }
+            pub enum Expr { A }
+            pub enum Stmt { B }
+            impl P for Expr where Stmt: P { fn p(&self) {} }
+            impl U for Expr where Stmt: U { fn u(&self) {} }
+            impl P for Stmt { fn p(&self) {} }
+            impl U for Stmt { fn u(&self) {} }
+        }
+    };
+    assert_eq!(
+        edges(&m),
+        vec![("Expr".into(), EdgeKind::Direct, "Stmt".into())]
+    );
+}
+
+#[test]
+fn decycle_use_routes_a_foreign_trait() {
+    let m: syn::ItemMod = parse_quote! {
+        mod ast {
+            #[decycle]
+            use ::somewhere::Tr;
+            pub enum Expr { A }
+            pub enum Stmt { B }
+            impl Tr for Expr where Box<Stmt>: Tr { fn f(&self) {} }
+            impl Tr for Stmt { fn f(&self) {} }
+        }
+    };
+    assert_eq!(nodes(&m), vec!["Expr", "Stmt"]);
+    assert_eq!(
+        edges(&m),
+        vec![("Expr".into(), EdgeKind::Peeled, "Stmt".into())]
+    );
+}
+
+#[test]
+fn empty_and_traitless_modules_are_empty_graphs() {
+    let bodyless: syn::ItemMod = parse_quote!(
+        mod ast;
+    );
+    assert!(nodes(&bodyless).is_empty());
+
+    let no_traits: syn::ItemMod = parse_quote! {
+        mod ast { pub enum Expr { A } impl Expr { fn f(&self) {} } }
+    };
+    assert!(nodes(&no_traits).is_empty());
+}
+
+/// The qualified spelling is the "not an edge" opt-out, and that cuts both ways: a module whose
+/// bounds are *all* qualified has no participants at all.
+///
+/// So `analyze_module` cannot be used to *discover* a caller's cycles: it reads a classification
+/// that the caller has already expressed in how it spells each path.
+#[test]
+fn a_fully_qualified_module_has_no_participants() {
+    let m: syn::ItemMod = parse_quote! {
+        mod ast {
+            #[decycle]
+            use ::syan::decycle_traits::Parse;
+            pub enum Expr<S> { Lit, Nest(Box<Stmt<S>>) }
+            pub enum Stmt<S> { E(Box<Expr<S>>) }
+            impl<S, A> ::syan::parse::parse::Parse<A> for Expr<S>
+            where Box<Stmt<S>>: ::syan::parse::parse::Parse<A> {}
+            impl<S, A> ::syan::parse::parse::Parse<A> for Stmt<S>
+            where Box<Expr<S>>: ::syan::parse::parse::Parse<A> {}
+        }
+    };
+    assert!(
+        nodes(&m).is_empty(),
+        "a qualified impl is deliberately not adopted, so it cannot make its self type a participant"
+    );
+}
+
+#[test]
+fn cyclic_subgraph_keeps_only_recursive_nodes() {
+    // Expr <-> Stmt is a real cycle; Leaf is pointed at by Expr but points nowhere.
+    let m: syn::ItemMod = parse_quote! {
+        mod ast {
+            #[decycle] pub trait Tr { fn f(&self); }
+            pub enum Expr { A } pub enum Stmt { B } pub enum Leaf { C }
+            impl Tr for Expr where Box<Stmt>: Tr, Leaf: Tr { fn f(&self) {} }
+            impl Tr for Stmt where Expr: Tr { fn f(&self) {} }
+            impl Tr for Leaf { fn f(&self) {} }
+        }
+    };
+    let full = analyze_module(&m, &parse_quote!(::decycle));
+    assert_eq!(sorted_nodes(&full), vec!["Expr", "Leaf", "Stmt"]);
+
+    let cyc = cyclic_subgraph(&full);
+    assert_eq!(
+        sorted_nodes(&cyc),
+        vec!["Expr", "Stmt"],
+        "Leaf is referenced but not recursive"
+    );
+    // The Expr -> Leaf edge goes with it; Expr <-> Stmt survives.
+    assert_eq!(cyc.len_edge(), 2);
+}
+
+#[test]
+fn a_self_edge_is_a_cycle_of_one() {
+    let m: syn::ItemMod = parse_quote! {
+        mod ast {
+            #[decycle] pub trait Tr { fn f(&self); }
+            pub enum Expr { A }
+            impl Tr for Expr where Box<Expr>: Tr { fn f(&self) {} }
+        }
+    };
+    let cyc = cyclic_subgraph(&analyze_module(&m, &parse_quote!(::decycle)));
+    assert_eq!(sorted_nodes(&cyc), vec!["Expr"]);
+}
+
+#[test]
+fn a_lone_referenced_node_is_not_a_cycle() {
+    let m: syn::ItemMod = parse_quote! {
+        mod ast {
+            #[decycle] pub trait Tr { fn f(&self); }
+            pub enum A { X } pub enum B { Y }
+            impl Tr for A where B: Tr { fn f(&self) {} }   // A -> B, no way back
+            impl Tr for B { fn f(&self) {} }
+        }
+    };
+    let cyc = cyclic_subgraph(&analyze_module(&m, &parse_quote!(::decycle)));
+    assert!(sorted_nodes(&cyc).is_empty(), "a DAG has no cyclic nodes");
 }
 
 /// Defect 1: `impl<Stmt> Tr for Expr where Stmt: Tr` — the bound targets the impl's OWN type
@@ -145,8 +357,7 @@ fn raw_ident_participant_does_not_panic() {
 /// the bystander survived into the result. Nodes are now tracked by position.
 #[test]
 fn cyclic_subgraph_keeps_same_named_nodes_distinct() {
-    use decycle_impl::safegraph::VecGraph;
-    use proc_macro2::{Ident, Span};
+    use proc_macro2::Span;
 
     let mut g: VecGraph<Ident, EdgeKind> = VecGraph::default();
     g.scope_mut(|mut ctx| {
@@ -263,30 +474,21 @@ fn a_participating_container_does_not_swallow_its_nested_participants() {
     );
 }
 
-/// The documented workflow end to end: analyze -> `cyclic_subgraph` -> engine. The graph-fed
-/// structural run must emit the very terminators the deriving run does — it used to be handed an
-/// empty node set and emit nothing at all, silently leaving the module un-decycled (E0275 at the
-/// use site).
+/// The structural engine unrolls this cycle exactly where the graph says it is: both members get a
+/// terminator, `Wrap` (which only forwards its own parameter) none — the module
+/// `tests/nested_participant_cycle.rs` compiles and runs.
 #[test]
-fn the_graph_fed_structural_run_emits_terminators_for_a_wrapped_cycle() {
+fn the_structural_run_emits_terminators_for_a_wrapped_cycle() {
     let p: syn::Path = parse_quote!(::decycle);
-    let m = wrapped_cycle_module();
-    let cyc = cyclic_subgraph(&analyze_module(&m, &p));
-
-    let fed = decycle_impl::structural::process_module_with_graph(m.clone(), &cyc, &p).to_string();
+    let out = crate::structural::process_module(wrapped_cycle_module(), &p).to_string();
     assert!(
-        fed.contains("__ExprTerm_") && fed.contains("__StmtTerm_"),
-        "both cycle members must get a terminator: {fed}"
+        out.contains("__ExprTerm_") && out.contains("__StmtTerm_"),
+        "both cycle members must get a terminator: {out}"
     );
     assert!(
-        !fed.contains("__WrapTerm_"),
+        !out.contains("__WrapTerm_"),
         "Wrap is not on the cycle, so it needs none"
     );
-
-    // Strongest available statement of "this works": the graph-fed expansion is byte-identical to
-    // the deriving one, which `tests/nested_participant_cycle.rs` compiles and runs.
-    let derived = decycle_impl::structural::process_module(m, &p).to_string();
-    assert_eq!(derived, fed);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -362,4 +564,77 @@ fn empty_decycle_path_yields_empty_graph_not_panic() {
     };
     let g = analyze_module(&m, &empty);
     assert_eq!(g.nodes().count(), 0);
+}
+
+/// A self type spelled by a path names the item itself: like a path-spelled trait, it is no node of
+/// the module's graph, which stays the engines' own participant set. `self::` is the bare name.
+#[test]
+fn self_types_are_read_by_their_bare_name() {
+    let m: syn::ItemMod = parse_quote! {
+        mod m {
+            #[decycle]
+            pub trait Tr { fn f(&self); }
+            pub struct Expr;
+            pub struct Term;
+            pub struct Stmt;
+            impl Tr for Expr where Term: Tr { fn f(&self) {} }
+            impl Tr for self::Term where Expr: Tr { fn f(&self) {} }
+            impl Tr for crate::m::Stmt where Expr: Tr { fn f(&self) {} }
+            impl Tr for ::other::Leaf { fn f(&self) {} }
+        }
+    };
+    let g = analyze_module(&m, &parse_quote!(::decycle));
+    assert_eq!(sorted_nodes(&g), vec!["Expr", "Term"]);
+    assert_eq!(sorted_nodes(&cyclic_subgraph(&g)), vec!["Expr", "Term"]);
+}
+
+/// Without a graph, an impl of a path-spelled self type beside a member of the same name is no
+/// member: the structural engine re-emits it as written, next to the member's generated impls.
+#[test]
+fn structural_path_spelled_self_type_is_emitted_as_written() {
+    let m: syn::ItemMod = parse_quote! {
+        mod m {
+            #[decycle] pub trait Loop { fn step(&self) -> u32; }
+            pub struct A;
+            pub struct B;
+            impl Loop for crate::other::B { fn step(&self) -> u32 { 7 } }
+            impl Loop for A where B: Loop { fn step(&self) -> u32 { 1 } }
+            impl Loop for B where A: Loop { fn step(&self) -> u32 { 2 } }
+        }
+    };
+    let out = crate::structural::process_module(m, &parse_quote!(::decycle)).to_string();
+    assert!(out.contains("__BTerm_"), "B is still a member: {out}");
+    assert!(
+        out.contains("impl Loop for crate :: other :: B"),
+        "the foreign impl is re-emitted as written: {out}"
+    );
+}
+
+/// The graph is built in a deterministic order (nodes sorted, edges in item order), so two runs over
+/// one module agree to the index.
+#[test]
+fn the_graph_is_the_same_every_time() {
+    let m: syn::ItemMod = parse_quote! {
+        mod m {
+            #[decycle] pub trait Base { fn base(&self) -> u32; }
+            #[decycle] pub trait Size { fn size(&self) -> u32; }
+            pub struct Expr; pub struct Term; pub struct Stmt;
+            impl Base for Expr where Term: Base { fn base(&self) -> u32 { 1 } }
+            impl Base for Term where Stmt: Base { fn base(&self) -> u32 { 1 } }
+            impl Base for Stmt where Expr: Base { fn base(&self) -> u32 { 1 } }
+            impl Size for Expr where Vec<Term>: Size { fn size(&self) -> u32 { 1 } }
+            impl Size for Term where Expr: Size { fn size(&self) -> u32 { 1 } }
+        }
+    };
+    let render = || {
+        let g = analyze_module(&m, &parse_quote!(::decycle));
+        let nodes: Vec<String> = g.nodes().map(|n| n.to_string()).collect();
+        let edges: Vec<String> = g.edges().map(|e| format!("{e:?}")).collect();
+        (nodes, edges, edges_of(&g))
+    };
+    let first = render();
+    assert_eq!(first.0, vec!["Expr", "Stmt", "Term"]);
+    for _ in 0..8 {
+        assert_eq!(render(), first);
+    }
 }

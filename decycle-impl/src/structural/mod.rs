@@ -33,6 +33,8 @@ mod analyze;
 mod codegen;
 mod collect;
 mod rho;
+#[cfg(test)]
+mod tests;
 
 pub(crate) use analyze::*;
 pub(crate) use codegen::*;
@@ -44,7 +46,7 @@ pub(crate) use rho::*;
 /// crate, used to recognise `#[<crate>::decycle]` on inner items). For macro authors wrapping
 /// `#[decycle(structural)]`; most users should use the attribute.
 pub fn process_module(module: ItemMod, decycle: &Path) -> TokenStream {
-    match expand(module.clone(), None, decycle) {
+    match expand(module.clone(), decycle, None) {
         Ok(ts) => ts,
         Err(e) => {
             // Re-emit the module verbatim alongside the error so downstream code still sees the defs.
@@ -54,42 +56,54 @@ pub fn process_module(module: ItemMod, decycle: &Path) -> TokenStream {
     }
 }
 
-/// [`process_module`], but with participation restricted to the types named by `graph`.
+/// [`process_module`] for a module whose absolute path is `module_path` — the programmatic form of
+/// `#[decycle(structural, module = path)]`.
 ///
-/// `graph` is an obligation graph in the shape [`crate::analysis::analyze_module`] returns.
-///
-/// **This engine's model is finer-grained than the graph.** It works over `(type, trait)` *pairs*,
-/// because a type implementing two routed traits can be cyclic in one and acyclic in the other; the
-/// graph collapses that, keying only on the type. So the node set is applied as a **filter**, not a
-/// replacement: a pair participates when its trait is `#[decycle]`-annotated *and* its self type is a
-/// node. Passing `analyze_module(&module, decycle)` therefore reproduces [`process_module`] only when
-/// every participating type is a node, which is exactly what that function returns — so the round
-/// trip is faithful, but a hand-built graph can only ever narrow the cycle, never widen it or split
-/// it per trait.
-///
-/// The **edges are not consumed**; `Peeled` bounds are still recognised by their own syntax. See
-/// [`crate::ranked::process_module_with_graph`], which has the same caveat for the same reason.
-pub fn process_module_with_graph(
-    module: ItemMod,
-    graph: &crate::safegraph::VecGraph<Ident, crate::analysis::EdgeKind>,
-    decycle: &Path,
-) -> TokenStream {
-    use crate::safegraph::graph::Graph;
-    let allowed: HashSet<String> = graph.nodes().map(|n| n.to_string()).collect();
-    match expand(module.clone(), Some(&allowed), decycle) {
+/// `module_path` must be absolute (`crate::..`, `$crate::..` or `::..`), without generic arguments,
+/// and end in the module's own name; anything else aborts (through `proc_macro_error`). The cycle is
+/// solved on the module as written, where only a bare (or `self::`) name is the module's; once it
+/// is, the items re-emitted as written (everything but the impls the unroll replaces) have each bare
+/// or `self::` name of a type or trait declared in the module spelled `<module_path>::X`, so an
+/// `#[announce]` on one of them sees absolute paths only. A check that `module_path` names this
+/// module is emitted into it (an error at the path otherwise).
+pub fn process_module_at(module: ItemMod, module_path: &Path, decycle: &Path) -> TokenStream {
+    let scope = crate::module_path::ModuleScope::new(module_path, &module);
+    let mut module = module;
+    match expand(module.clone(), decycle, Some(&scope)) {
         Ok(ts) => ts,
         Err(e) => {
             let err = e.to_compile_error();
+            scope.qualify_module(&mut module);
+            let path_check = scope.path_check();
+            if let Some((_, items)) = &mut module.content {
+                items.push(Item::Verbatim(path_check));
+            }
             quote! { #err #module }
         }
     }
 }
 
+/// `scope` is the `module = path` of the attribute, when given: the cycle is solved on the module as
+/// written, and every item re-emitted as written is qualified on the way out, after it. See
+/// `crate::module_path`.
 fn expand(
     mut module: ItemMod,
-    allowed_types: Option<&HashSet<String>>,
     decycle: &Path,
+    scope: Option<&crate::module_path::ModuleScope>,
 ) -> syn::Result<TokenStream> {
+    let qualify = |item: &Item| match scope {
+        Some(scope) => scope.qualify_item(item),
+        None => item.clone(),
+    };
+    let pass_through = |mut module: ItemMod| {
+        if let Some(scope) = scope {
+            scope.qualify_module(&mut module);
+            if let Some((_, items)) = &mut module.content {
+                items.push(Item::Verbatim(scope.path_check()));
+            }
+        }
+        module.to_token_stream()
+    };
     let decycle_crate = decycle
         .segments
         .first()
@@ -119,47 +133,36 @@ fn expand(
     // and strip the `#[decycle]` attrs from the trait/use items.
     let decycle_traits = collect_decycle_traits(brace_items, &decycle_crate);
 
-    // A caller supplying a graph is generating these impls, which means a cycle member and its helper
-    // types are separate impls that each declare only their OWN leaf premises — and the generated
-    // terminator for one has to prove what a sibling's impl demands. Share the union across each
-    // trait's impls first, the same gap `ranked::sharing` closes on the other engine. Skipped without a
-    // graph: hand-written impls state their own premises, and rewriting a caller's `where`-clause
-    // uninvited is the sort of thing the graph is the opt-in for.
-    if allowed_types.is_some() {
-        for trait_name in &decycle_traits {
-            let marker = Ident::new(trait_name, Span::call_site());
-            let mut group: Vec<&mut ItemImpl> = brace_items
-                .iter_mut()
-                .filter_map(|item| match item {
-                    Item::Impl(im)
-                        if impl_trait_key(im).as_deref() == Some(trait_name.as_str()) =>
-                    {
-                        Some(im)
-                    }
-                    _ => None,
-                })
-                .collect();
-            if group.len() > 1 {
-                crate::ranked::sharing::share_side_predicates(&mut group, &marker);
-            }
-        }
-    }
-
-    let items = brace_items.clone();
+    let mut items = brace_items.clone();
 
     // No `#[decycle]`-annotated trait/use → no cyclic participants. Re-emit the module unchanged (its
     // inner `#[decycle]` attrs were already stripped in place): the impls are valid Rust on their own,
     // so a `structural` annotation on a module with nothing to unroll is a silent no-op, not an error.
     // (The ranked engine instead REQUIRES an annotated cycle and rejects this — `NO_DECYCLE_TRAITS_MSG`.)
     if decycle_traits.is_empty() {
-        return Ok(module.to_token_stream());
+        return Ok(pass_through(module));
     }
 
-    let model = Model::collect(&items, nonce)?;
-    let sccs = model.cyclic_sccs(&decycle_traits, allowed_types);
+    let mut model = Model::collect(&items, nonce)?;
+    let sccs = model.cyclic_sccs(&decycle_traits);
     // Annotated traits present but they form no cycle — the same silent no-op pass-through.
     if sccs.is_empty() {
-        return Ok(module.to_token_stream());
+        return Ok(pass_through(module));
+    }
+
+    // The impls of one trait in one cycle share their non-cyclic premises. A member's generated
+    // terminator impl reaches a sibling through the public trait, which the sibling's natural impl
+    // discharges — and that impl demands the sibling's OWN leaf premises, which the member's
+    // `where`-clause need not state (a generated helper type's `Leaf: Parse<A>`, or simply members
+    // written with different leaf bounds). Plain Rust proves those through the cyclic bound itself;
+    // the unroll strips that bound, so the member needs them in its own environment. Scoped to the
+    // members of the cycle: an impl outside every cycle, and a disjoint cycle of the same trait,
+    // acquire nothing. Adding them does not change what a natural impl requires in effect — the
+    // stripped cyclic bound required them already, transitively (as far as the name-based matching
+    // of generic parameters, see `share_cycle_premises`, reads them right).
+    if share_cycle_premises(brace_items, &sccs, &model) {
+        items = brace_items.clone();
+        model = Model::collect(&items, nonce)?;
     }
 
     let mut replaced_impls: HashSet<(String, String)> = HashSet::new();
@@ -213,9 +216,9 @@ fn expand(
                         continue;
                     }
                 }
-                out.extend(it.to_token_stream());
+                out.extend(qualify(it).to_token_stream());
             }
-            other => out.extend(other.to_token_stream()),
+            other => out.extend(qualify(other).to_token_stream()),
         }
     }
 
@@ -236,6 +239,11 @@ fn expand(
         out.extend(codegen_scc(&model, scc)?);
     }
 
+    // `module = path`: checked against the module, in the module (`ModuleScope::path_check`).
+    if let Some(scope) = scope {
+        out.extend(scope.path_check());
+    }
+
     let attrs = &module.attrs;
     let vis = &module.vis;
     let unsafety = &module.unsafety;
@@ -246,6 +254,79 @@ fn expand(
         #vis #unsafety #mod_token #ident {
             #out
         }
+    })
+}
+
+/// Give the impls of each trait in each cycle (`sccs`) the union of each other's non-cyclic premises,
+/// in place; whether any impl changed. See `expand`.
+///
+/// A premise is one of the `where`-predicates `reduce_generics` keeps on the generated impls: one
+/// carrying no bound that is an edge of the same cycle (a bound `X: Tr` where `X` names a member
+/// `M` with `(M, Tr)` in the SCC). The union, its scoping and its guards are the ranked engine's
+/// ([`crate::ranked::sharing::share_side_predicates_scoped`]): a predicate is only injected into an
+/// impl that declares every generic parameter it names (by name: a sibling's `U: Clone` does not
+/// reach an impl calling its parameter `T`), a `Self`-mentioning one is never shared, and an HRTB
+/// binder is renamed apart from the receiver's lifetimes. Inline parameter bounds
+/// (`impl<T: Clone>`) are not shared, as in the ranked engine, and neither are the premises of an
+/// impl of another trait in a cross-trait cycle.
+fn share_cycle_premises(items: &mut [Item], sccs: &[Scc], model: &Model) -> bool {
+    let adt_names: HashSet<String> = model.adts.keys().cloned().collect();
+    let mut changed = false;
+    for scc in sccs {
+        let mut traits: Vec<&String> = scc.pairs.iter().map(|(_, tr)| tr).collect();
+        traits.sort();
+        traits.dedup();
+        for trait_name in traits {
+            let mut group: Vec<&mut ItemImpl> = items
+                .iter_mut()
+                .filter_map(|item| match item {
+                    Item::Impl(im)
+                        if impl_trait_key(im).as_deref() == Some(trait_name.as_str())
+                            && impl_self_ident(im)
+                                .is_some_and(|ty| scc.contains(&ty.to_string(), trait_name)) =>
+                    {
+                        Some(im)
+                    }
+                    _ => None,
+                })
+                .collect();
+            if group.len() < 2 {
+                continue;
+            }
+            let before: Vec<String> = group
+                .iter()
+                .map(|im| im.to_token_stream().to_string())
+                .collect();
+            let everyone: Vec<Vec<usize>> = (0..group.len())
+                .map(|i| (0..group.len()).filter(|j| *j != i).collect())
+                .collect();
+            let is_edge =
+                |im: &ItemImpl, pred: &WherePredicate| is_cycle_edge(im, pred, scc, &adt_names);
+            crate::ranked::sharing::share_side_predicates_scoped(&mut group, &is_edge, &everyone);
+            changed |= group
+                .iter()
+                .zip(&before)
+                .any(|(im, b)| im.to_token_stream().to_string() != *b);
+        }
+    }
+    changed
+}
+
+/// Does `pred` (on `im`) carry a bound that is an edge of `scc` — the bounds `reduce_generics`
+/// strips from the generated impls?
+fn is_cycle_edge(
+    im: &ItemImpl,
+    pred: &WherePredicate,
+    scc: &Scc,
+    adt_names: &HashSet<String>,
+) -> bool {
+    let WherePredicate::Type(pt) = pred else {
+        return false;
+    };
+    let refs = local_refs(&subst_self(&pt.bounded_ty, &im.self_ty), adt_names);
+    pt.bounds.iter().any(|b| {
+        matches!(b, syn::TypeParamBound::Trait(tb) if trait_key(&tb.path)
+            .is_some_and(|key| refs.iter().any(|r| scc.contains(r, &key))))
     })
 }
 

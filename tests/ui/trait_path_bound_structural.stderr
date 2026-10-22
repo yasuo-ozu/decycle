@@ -1,0 +1,29 @@
+error[E0275]: overflow evaluating the requirement `A: Loop`
+  --> tests/ui/trait_path_bound_structural.rs:18:9
+   |
+18 |         B: super::Loop,
+   |         ^^^^^^^^^^^^^^
+   |
+note: required for `B` to implement `Loop`
+  --> tests/ui/trait_path_bound_structural.rs:25:10
+   |
+25 |     impl Loop for B
+   |          ^^^^     ^
+26 |     where
+27 |         A: Loop,
+   |            ---- unsatisfied trait bound introduced here
+
+error[E0275]: overflow evaluating the requirement `B: Loop`
+  --> tests/ui/trait_path_bound_structural.rs:27:9
+   |
+27 |         A: Loop,
+   |         ^^^^^^^
+   |
+note: required for `A` to implement `Loop`
+  --> tests/ui/trait_path_bound_structural.rs:16:10
+   |
+16 |     impl Loop for A
+   |          ^^^^     ^
+17 |     where
+18 |         B: super::Loop,
+   |            ----------- unsatisfied trait bound introduced here

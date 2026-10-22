@@ -130,6 +130,47 @@ pub(crate) fn is_local_impl_bound_target(ty: &Type, impl_type_params: &HashSet<I
     ident == "Self" || impl_type_params.contains(ident)
 }
 
+/// Does `im` implement a routed trait in the spelling the engine takes over — a single segment after
+/// `self::`-normalisation?
+fn impls_routed_trait(im: &ItemImpl, all_traits: &HashSet<Ident>) -> bool {
+    let Some((_, trait_path, _)) = im.trait_.as_ref() else {
+        return false;
+    };
+    let mut tp = trait_path.clone();
+    crate::helper::strip_leading_self(&mut tp);
+    tp.segments.len() == 1 && all_traits.contains(&tp.segments[0].ident)
+}
+
+/// `impl Tr for self::Term` → `impl Tr for Term`, the spelling a cycle member is matched by — unless
+/// the bare name is one of the impl's own type parameters, which would then shadow the type.
+fn bare_self_type(im: &mut ItemImpl) {
+    let Type::Path(TypePath { qself: None, path }) = &mut *im.self_ty else {
+        return;
+    };
+    let mut bare = path.clone();
+    crate::helper::strip_leading_self(&mut bare);
+    let shadowed = bare.segments.len() == 1
+        && im
+            .generics
+            .params
+            .iter()
+            .any(|p| matches!(p, GenericParam::Type(t) if t.ident == bare.segments[0].ident));
+    if !shadowed {
+        *path = bare;
+    }
+}
+
+/// Is `ty` spelled by a path other than a bare name or its no-op `self::` form (`crate::m::Term`,
+/// `super::Term`, `::dep::Term`)? Such a self type names the item itself, the opt-out.
+fn self_ty_spelled_by_path(ty: &Type) -> bool {
+    let Type::Path(TypePath { qself: None, path }) = ty else {
+        return false;
+    };
+    let mut probe = path.clone();
+    crate::helper::strip_leading_self(&mut probe);
+    probe.leading_colon.is_some() || probe.segments.len() > 1
+}
+
 fn has_assoc_constraints(path: &Path) -> bool {
     let Some(last_segment) = path.segments.last() else {
         return false;
@@ -303,8 +344,8 @@ fn validate_impl_where_bounds(
 /// of the impl's own generic params names no other member (and a param *shadowing* a member's name
 /// must not fabricate an edge), so it contributes none.
 fn sharing_sources(members: &[&ItemImpl], trait_ident: &Ident) -> Vec<Vec<usize>> {
-    use crate::safegraph::algo::dfs::Dfs;
-    use crate::safegraph::graph::Graph;
+    use safegraph::algo::dfs::Dfs;
+    use safegraph::graph::Graph;
     // Node key per member: its self type's head ident. An un-headed self type (`&A`, `(A, B)`)
     // gets a synthetic key no bound can name: it can obligate others, never be obligated by ident.
     let keys: Vec<String> = members
@@ -359,7 +400,7 @@ fn sharing_sources(members: &[&ItemImpl], trait_ident: &Ident) -> Vec<Vec<usize>
             // member that merely shares that name, and predicate sharing then unioned the
             // sibling's own leaf premises into `A` — `A<NotClone>: Tr` stopped holding, while
             // renaming the foreign type made the identical program compile. Same rule as
-            // `peel::cycle_types_within` and `contract::reaches_participant`.
+            // `peel::cycle_types_within`.
             let Some(head) = crate::helper::local_type_head_ident(&pt.bounded_ty) else {
                 continue;
             };
@@ -376,7 +417,7 @@ fn sharing_sources(members: &[&ItemImpl], trait_ident: &Ident) -> Vec<Vec<usize>
     // the reachability walk, mirroring how `analysis.rs` builds and reads its obligation graph.
     let mut names: Vec<String> = member_heads.iter().map(|s| s.to_string()).collect();
     names.sort();
-    let mut graph: crate::safegraph::VecGraph<String, ()> = Default::default();
+    let mut graph: safegraph::VecGraph<String, ()> = Default::default();
     graph.scope_mut(|mut ctx| {
         let index: std::collections::HashMap<String, _> = names
             .iter()
@@ -426,51 +467,27 @@ pub fn process_module(
     process_module_inner(module, None, decycle, recurse_level, support_infinite_cycle)
 }
 
-/// [`process_module`], but with the participant set supplied by the caller instead of derived.
+/// [`process_module`] for a module whose absolute path is `module_path` — the programmatic form of
+/// `#[decycle(module = path)]`.
 ///
-/// `graph` is an obligation graph in the shape [`crate::analysis::analyze_module`] returns. Its
-/// **node set replaces** the engine's own `cycle_self_heads` — the types it would otherwise take to
-/// be cycle participants, namely every head with a bare-spelled impl of a routed trait. Everything
-/// downstream keys off that set: which impls get contracted, which where-bounds count as cycle edges,
-/// which wrapped bounds are peeled and which are rejected, and which local names need aliasing
-/// against the helper-module nesting.
-///
-/// Passing `analyze_module(&module, decycle)` reproduces [`process_module`] exactly. Passing a subset
-/// narrows the cycle: the omitted types keep verbatim impls, and a bound naming one becomes an
-/// ordinary premise rather than an edge. That is the useful direction — a caller that already knows
-/// its cycles (from field structure, say) can state them instead of relying on the bare/qualified
-/// trait spelling to signal them.
-///
-/// The **edges are not consumed**. Direct-vs-`Peeled` is re-derived per bound from the node set,
-/// because a bound has to be matched by its own syntax, and a graph keyed on type idents cannot say
-/// *which* bound of *which* impl an edge came from. They are still worth passing — they are what the
-/// caller inspects to decide on the node set — but adding or removing one changes nothing here.
-///
-/// A node naming a type with no routed impl in this module is ignored rather than rejected: the
-/// engine only ever asks whether a given head is in the set.
-/// `emit_contracts` re-spells the adopted impls **from the graph** before anything else runs, via
-/// [`super::contract`]: bare the header trait path, bare a bound whose target reaches a participant,
-/// qualify every other bound naming a routed trait.
-///
-/// Pass `false` and the graph supplies the node set only, leaving everything else exactly as
-/// [`process_module`] does it — the engine's normal contract, where the *caller* expresses the
-/// classification in how it spells each bound. Pass `true` when the graph is the intended source of
-/// truth and the impls are generated code not yet spelled for the engine: then the cycle is stated
-/// once, rather than encoded into every bound by the caller and decoded again here. Rewriting a
-/// caller's spelling changes what a crate-rooted path means, which is why it is not the default.
-pub fn process_module_with_graph(
+/// `module_path` must be absolute (`crate::..`, `$crate::..` or `::..`), without generic arguments,
+/// and end in the module's own name; anything else aborts (through `proc_macro_error`). The cycle is
+/// solved on the module as written, where only a bare (or `self::`) name is the module's; once it
+/// is, the items re-emitted as written (everything but the impls the engine takes over — an impl of
+/// a `#[decycle]` trait that names the trait or its self type by a path is the opt-out, re-emitted
+/// and qualified too) have each bare or `self::` name of a type or trait declared in the module
+/// spelled `<module_path>::X`, so an `#[announce]` on one of them sees absolute paths only. A check
+/// that `module_path` names this module is emitted into it (an error at the path otherwise).
+pub fn process_module_at(
     module: ItemMod,
-    graph: &crate::safegraph::VecGraph<Ident, crate::analysis::EdgeKind>,
-    emit_contracts: bool,
+    module_path: &Path,
     decycle: &Path,
     recurse_level: usize,
     support_infinite_cycle: bool,
 ) -> TokenStream {
-    use crate::safegraph::graph::Graph;
-    let heads: HashSet<Ident> = graph.nodes().cloned().collect();
     process_module_inner(
         module,
-        Some((heads, emit_contracts)),
+        Some(module_path),
         decycle,
         recurse_level,
         support_infinite_cycle,
@@ -479,11 +496,21 @@ pub fn process_module_with_graph(
 
 fn process_module_inner(
     mut module: ItemMod,
-    graph_input: Option<(HashSet<Ident>, bool)>,
+    module_path: Option<&Path>,
     decycle: &Path,
     recurse_level: usize,
     support_infinite_cycle: bool,
 ) -> TokenStream {
+    // `module = path`: the cycle is solved on the module as written, where only a bare name is the
+    // module's; the items re-emitted as written are qualified on the way out (`qualify`), after it.
+    // See `crate::module_path`.
+    let scope = module_path.map(|path| crate::module_path::ModuleScope::new(path, &module));
+    let qualify = |item: &Item| match &scope {
+        Some(scope) => scope.qualify_item(item),
+        None => item.clone(),
+    };
+    // ... and the path is checked against the module, in the module (`ModuleScope::path_check`).
+    let path_check = scope.as_ref().map(|scope| scope.path_check());
     // Value-level instantiation growth (a cyclic method reborrowing its own by-value generic
     // parameter) — neither engine can break it, and left alone it surfaces as a monomorphisation limit
     // naming generated internals. See `crate::growth`.
@@ -531,13 +558,12 @@ fn process_module_inner(
             (traits, working_list, renames)
         },
     );
-    proc_macro_error::set_dummy(
-        quote! {
-            #{&module.vis} #{&module.unsafety} mod #{&module.ident} {
-                #(for content in contents.clone()) { #content }
-            }
-        },
-    );
+    proc_macro_error::set_dummy(quote! {
+        #{&module.vis} #{&module.unsafety} mod #{&module.ident} {
+            #(for content in contents.iter()) { #{qualify(content)} }
+            #path_check
+        }
+    });
     if let Err(e) = growth {
         abort!(e.span(), "{}", e);
     }
@@ -615,30 +641,33 @@ fn process_module_inner(
         .filter_map(|path| path.segments.last().map(|seg| seg.ident.clone()))
         .chain(traits.iter().map(|ItemTrait { ident, .. }| ident.clone()))
         .collect();
+    // `impl Tr for self::Term` is `impl Tr for Term`: read (and re-emit) a self type in the bare
+    // spelling, which is the one everything below matches a cycle member by.
+    for item in contents.iter_mut() {
+        if let Item::Impl(im) = item {
+            if impls_routed_trait(im, &all_traits) {
+                bare_self_type(im);
+            }
+        }
+    }
+    // The impls the engine takes over: those of a routed trait spelled bare (see the split below),
+    // for a self type the module names by its bare name. A self type spelled by any other path
+    // (`impl Tr for crate::m::Term`, `impl Tr for crate::other::B`) names the item itself, the
+    // opt-out, exactly as a path-spelled trait does: the impl takes no part in the cycle and is
+    // re-emitted as written.
+    let adopts = |im: &ItemImpl| {
+        impls_routed_trait(im, &all_traits) && !self_ty_spelled_by_path(&im.self_ty)
+    };
     // Head idents of the types that IMPLEMENT a cyclic trait here — the only heads a bare cyclic
     // where-bound may target (besides `Self` / an impl type-param). A bound whose head is a foreign
     // container (`Box<Stmt>: Tr`) has no ranked impl to descend through, so it's flagged below.
-    // With a caller-supplied participant set, re-spell the impls here rather than requiring the
-    // caller to have encoded the classification in how it wrote every bound — see `super::contract`.
-    // Must run before everything below: adoption, peeling and validation all read the spelling.
-    if let Some((participants, true)) = graph_input.as_ref().map(|(p, e)| (p, *e)) {
-        crate::ranked::contract::contract_from_graph(contents, &all_traits, participants);
-    }
-
-    let cycle_self_heads: HashSet<Ident> = graph_input.map(|(heads, _)| heads).unwrap_or_else(|| {
-        contents
-            .iter()
-            .filter_map(|item| {
-                let Item::Impl(im) = item else { return None };
-                let (_, trait_path, _) = im.trait_.as_ref()?;
-                let mut tp = trait_path.clone();
-                crate::helper::strip_leading_self(&mut tp);
-                (tp.segments.len() == 1 && all_traits.contains(&tp.segments[0].ident))
-                    .then(|| type_head_ident(&im.self_ty))
-                    .flatten()
-            })
-            .collect()
-    });
+    let cycle_self_heads: HashSet<Ident> = contents
+        .iter()
+        .filter_map(|item| {
+            let Item::Impl(im) = item else { return None };
+            adopts(im).then(|| type_head_ident(&im.self_ty)).flatten()
+        })
+        .collect();
     // Peel wrapped cyclic bounds (`Vec<Box<Stmt>>: Tr` ⇒ `Stmt: Tr`) BEFORE validating, so the
     // validation below only rejects heads that genuinely cannot be made rankable.
     for item in contents.iter_mut() {
@@ -671,10 +700,8 @@ fn process_module_inner(
                 },
             ) = content
             {
-                let mut normalized_impl = item_impl.clone();
-                let trait_path = &mut normalized_impl.trait_.as_mut().unwrap().1;
-                crate::helper::strip_leading_self(trait_path);
-                // Check the (self::-normalized) trait_path contains just one segment.
+                // Taken over when the (self::-normalized) trait path is a single segment naming a
+                // routed trait, for a self type that is no path-spelled opt-out (`adopts`).
                 // NOTE: a still-qualified trait path (`impl crate::foo::MyTrait for X`,
                 // `impl super::MyTrait for X`) is intentionally left as an ordinary,
                 // non-decycled impl rather than flagged — the same qualified-reference
@@ -682,14 +709,13 @@ fn process_module_inner(
                 // impl of the ORIGINAL, un-ranked trait from inside a #[decycle] module
                 // (mirrored by the identical, deliberate pattern in where-bounds; see
                 // `validate_impl_where_bounds`), so it can't be reliably distinguished
-                // from a genuine mis-qualification at this syntactic level.
-                if trait_path.segments.len() == 1 {
-                    if let Some(seg) = trait_path.segments.first() {
-                        if all_traits.contains(&seg.ident) {
-                            // The item is impl of a trait annotated with #[decycle]
-                            return (None, Some(normalized_impl));
-                        }
-                    }
+                // from a genuine mis-qualification at this syntactic level. A path-spelled
+                // self type (`impl MyTrait for crate::m::X`) is the same opt-out.
+                if adopts(item_impl) {
+                    let mut normalized_impl = item_impl.clone();
+                    let trait_path = &mut normalized_impl.trait_.as_mut().unwrap().1;
+                    crate::helper::strip_leading_self(trait_path);
+                    return (None, Some(normalized_impl));
                 }
             }
             (Some(content), None)
@@ -711,10 +737,18 @@ fn process_module_inner(
     // acquiring `T: Clone` rejects code that is valid without the macro), and two disjoint cycles of
     // one trait unioned each other's. Scope each impl's inheritance to the impls its own cyclic
     // bounds (transitively) obligate instead — see `sharing_sources` and `crate::ranked::sharing`.
+    // The heads `finalize` reads a bare bound as an edge on (`remove_cyclic_bounds`): those of the
+    // impls taken over. A bare bound on any other type is a premise, shared like one.
+    let adopted_heads: HashSet<Ident> = contents
+        .iter()
+        .filter_map(|im| type_head_ident(&im.self_ty))
+        .collect();
     for trait_ident in &all_traits {
         let is_member = |im: &ItemImpl| {
             im.trait_.as_ref().is_some_and(|(_, path, _)| {
-                path.segments.last().is_some_and(|s| s.ident == *trait_ident)
+                path.leading_colon.is_none()
+                    && path.segments.len() == 1
+                    && path.segments[0].ident == *trait_ident
             })
         };
         let members: Vec<&ItemImpl> = contents.iter().filter(|im| is_member(im)).collect();
@@ -723,7 +757,10 @@ fn process_module_inner(
         }
         let sources = sharing_sources(&members, trait_ident);
         let mut group: Vec<&mut ItemImpl> = contents.iter_mut().filter(|im| is_member(im)).collect();
-        crate::ranked::sharing::share_side_predicates_scoped(&mut group, &all_traits, &sources);
+        let is_edge = |im: &ItemImpl, pred: &WherePredicate| {
+            crate::ranked::sharing::is_ranked_edge(im, pred, &all_traits, &adopted_heads)
+        };
+        crate::ranked::sharing::share_side_predicates_scoped(&mut group, &is_edge, &sources);
     }
 
     // Restricted to types this module DEFINES: a foreign self type (`impl Tr for &str`) is reachable
@@ -770,7 +807,9 @@ fn process_module_inner(
 
             #(for alias_item in &alias_items) { #alias_item }
 
-            #(for raw_content in raw_contents) { #raw_content }
+            #(for raw_content in raw_contents) { #{qualify(raw_content)} }
+
+            #path_check
 
             #(if first_path.is_some()) {
                 #{ args.cont_list().invoke(args.rest_tokens()) }

@@ -37,19 +37,11 @@ struct Graph {
 }
 
 impl Model {
-    /// Every cyclic SCC over the `#[decycle]`-annotated traits (`allowed_traits`, keyed by
-    /// last-segment ident). Impls of other traits are left untouched.
-    ///
-    /// `allowed_types`, when given, additionally restricts participation to those self-type idents —
-    /// see `process_module_with_graph`. It can only narrow: a pair is a node when its trait is
-    /// annotated *and* its self type is listed.
-    pub fn cyclic_sccs(
-        &self,
-        allowed_traits: &HashSet<String>,
-        allowed_types: Option<&HashSet<String>>,
-    ) -> Vec<Scc> {
+    /// Every cyclic SCC over the `#[decycle]`-annotated traits (`allowed_traits`, keyed by the bare
+    /// name, `collect::trait_key`). Impls of other traits are left untouched.
+    pub fn cyclic_sccs(&self, allowed_traits: &HashSet<String>) -> Vec<Scc> {
         let adt_names: HashSet<String> = self.adts.keys().cloned().collect();
-        let graph = self.build_graph(allowed_traits, allowed_types, &adt_names);
+        let graph = self.build_graph(allowed_traits, &adt_names);
         let mut out = Vec::new();
         for comp in graph.sccs() {
             if !graph.is_cyclic_component(&comp) {
@@ -60,18 +52,9 @@ impl Model {
         out
     }
 
-    fn build_graph(
-        &self,
-        allowed: &HashSet<String>,
-        allowed_types: Option<&HashSet<String>>,
-        adt_names: &HashSet<String>,
-    ) -> Graph {
-        let participates = |im: &crate::structural::collect::ImplBlock| {
-            allowed.contains(&im.trait_key)
-                // `map_or(true, …)`, not `is_none_or`: the latter is stable only since 1.82
-                // and this crate's MSRV is 1.71.
-                && allowed_types.map_or(true, |t| t.contains(&im.self_ident.to_string()))
-        };
+    fn build_graph(&self, allowed: &HashSet<String>, adt_names: &HashSet<String>) -> Graph {
+        let participates =
+            |im: &crate::structural::collect::ImplBlock| allowed.contains(&im.trait_key);
         let mut adj: BTreeMap<Pair, BTreeSet<Pair>> = BTreeMap::new();
         // node: (self type, trait) for every impl of an allowed trait
         for im in &self.impls {
@@ -96,10 +79,9 @@ impl Model {
                         let syn::TypeParamBound::Trait(tb) = bound else {
                             continue;
                         };
-                        let Some(seg) = tb.path.segments.last() else {
+                        let Some(btr) = trait_key(&tb.path) else {
                             continue;
                         };
-                        let btr = seg.ident.to_string();
                         if !allowed.contains(&btr) {
                             continue;
                         }
@@ -179,15 +161,35 @@ impl Graph {
 }
 
 /// Local ADT idents appearing anywhere in `ty` (peeling references/containers/tuples).
+///
+/// A local ADT is named by its bare (or `self::`-qualified) name, as in the ranked engine: a path
+/// the module writes (`crate::m::Stmt`, `super::Stmt`) names the item itself, the opt-out, and is no
+/// edge of the cycle. The arguments of any path are still visited, so `crate::other::Wrap<Stmt>`
+/// names `Stmt`.
 pub(crate) fn local_refs(ty: &Type, adt_names: &HashSet<String>) -> Vec<String> {
-    let mut out = Vec::new();
-    walk_type(ty, &mut |id| {
-        let s = id.to_string();
-        if adt_names.contains(&s) && !out.contains(&s) {
-            out.push(s);
+    struct Refs<'a> {
+        adt_names: &'a HashSet<String>,
+        out: Vec<String>,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for Refs<'_> {
+        fn visit_type_path(&mut self, tp: &'ast syn::TypePath) {
+            if tp.qself.is_none() {
+                if let Some(ident) = bare_ident(&tp.path) {
+                    let s = ident.to_string();
+                    if self.adt_names.contains(&s) && !self.out.contains(&s) {
+                        self.out.push(s);
+                    }
+                }
+            }
+            syn::visit::visit_type_path(self, tp);
         }
-    });
-    out
+    }
+    let mut refs = Refs {
+        adt_names,
+        out: Vec::new(),
+    };
+    syn::visit::Visit::visit_type(&mut refs, ty);
+    refs.out
 }
 
 /// Visit every path-segment ident within `ty`, descending references/containers/tuples/generic args,

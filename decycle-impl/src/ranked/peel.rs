@@ -12,14 +12,25 @@
 //! surviving cyclic bound has a rankable head, because by that point the ones that *could* be made
 //! rankable already are.
 //!
+//! The contract a peel relies on is that **a wrapper implements the trait when its type arguments
+//! do**. So a wrapper is replaced by the obligations of its parts, and nothing is dropped: a part
+//! that is a cycle member becomes an edge, and a part that contains no member at all stays an
+//! ordinary premise on the original trait, as written — `(B, crate::m::C): Tr` peels to `B: Tr` and
+//! `crate::m::C: Tr`, and `(B, u8): Tr` to `B: Tr` and `u8: Tr`. Dropping those parts (as this pass
+//! once did) left a call the body still makes with no obligation behind it, which the ranked engine
+//! could only discover at run time.
+//!
 //! Bounds that are not cyclic, and cyclic bounds that already name a rankable head (or target `Self`
-//! or one of the impl's own type parameters), are left exactly as written.
+//! or one of the impl's own type parameters), are left as written — but for the spelling of a cycle
+//! member's head, which is made bare (`self::Term` → `Term`): the impls are re-emitted two modules
+//! deeper, where only the bare spelling still names the member.
 
 use std::collections::HashSet;
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
 use syn::{
-    Ident, ItemImpl, Token, TraitBound, Type, TypeParamBound, TypePath, WherePredicate,
+    GenericArgument, Ident, ItemImpl, PathArguments, Token, TraitBound, Type, TypeParamBound,
+    TypePath, WherePredicate,
 };
 use template_quote::quote;
 
@@ -46,15 +57,32 @@ pub(crate) fn peel_cyclic_bounds(
             push(pred.clone(), &mut out);
             continue;
         };
-        // Already fine: `Self` / an impl type-param (the engine handles those directly), or a head
-        // that is itself a cycle member — recognised by the BARE (or `self::`-qualified) spelling
-        // only, exactly like `cycle_types_within` below. Keying on the last segment made
-        // `crate::other::Stmt` pass for the local member `Stmt`.
-        if is_local_target(&pt.bounded_ty)
-            || crate::helper::local_type_head_ident(&pt.bounded_ty)
-                .is_some_and(|h| cycle_self_heads.contains(&h))
-        {
+        // Already fine: `Self` / an impl type-param (the engine handles those directly).
+        if is_local_target(&pt.bounded_ty) {
             push(pred.clone(), &mut out);
+            continue;
+        }
+        // Already fine too: a head that is itself a cycle member — recognised by the BARE (or
+        // `self::`-qualified) spelling only, exactly like `cycle_types_within` below. Keying on the
+        // last segment made `crate::other::Stmt` pass for the local member `Stmt`.
+        if crate::helper::local_type_head_ident(&pt.bounded_ty)
+            .is_some_and(|h| cycle_self_heads.contains(&h))
+        {
+            // `self::Term` and `Term` are the same member; emit the bare spelling, as the peeled
+            // targets below are. A `self::` path is depth-fragile, so `nesting` would otherwise
+            // lift it to an alias, and `finalize` would no longer see the member's head. (Unless
+            // the bare name is the impl's own type parameter, which then shadows the member.)
+            let mut bare = pt.bounded_ty.clone();
+            if let Type::Path(TypePath { qself: None, path }) = &mut bare {
+                crate::helper::strip_leading_self(path);
+            }
+            let mut pred = pred.clone();
+            if let WherePredicate::Type(pt) = &mut pred {
+                if !is_local_target(&bare) {
+                    pt.bounded_ty = bare;
+                }
+            }
+            push(pred, &mut out);
             continue;
         }
         let (mut cyclic, other): (Vec<TypeParamBound>, Vec<TypeParamBound>) = pt
@@ -72,8 +100,9 @@ pub(crate) fn peel_cyclic_bounds(
             push(pred.clone(), &mut out);
             continue;
         }
-        let targets = cycle_types_within(&pt.bounded_ty, cycle_self_heads);
-        if targets.is_empty() {
+        let mut parts = Parts::default();
+        parts.decompose(&pt.bounded_ty, cycle_self_heads);
+        if parts.members.is_empty() {
             // Nothing to peel to. Left as written so `validate_impl_where_bounds` can report it
             // against the bound the caller actually wrote.
             push(pred.clone(), &mut out);
@@ -83,7 +112,10 @@ pub(crate) fn peel_cyclic_bounds(
         // lifetime (`for<'a> Wrapper<Sub<'a>>: Tr` ⇒ `for<'a> Sub<'a>: Tr`), which would otherwise be
         // undeclared (E0261).
         let binder = &pt.lifetimes;
-        for target in targets {
+        // A member is an edge; a member-free part is a premise on the original trait, spelled as
+        // written. Both carry the trait bare: a bare bound on a type that is no cycle member is
+        // exactly how a premise reaches `finalize` (it keeps it, un-lowered).
+        for target in parts.members.iter().chain(&parts.premises) {
             push(syn::parse_quote!(#binder #target: #(#cyclic)+*), &mut out);
         }
         // An unrelated extra bound (`T: Tr + Clone`) stays on the ORIGINAL type — peeling it too
@@ -107,6 +139,99 @@ fn is_bare_cyclic_bound(bound: &TypeParamBound, all_traits: &HashSet<Ident>) -> 
     path.segments.len() == 1 && all_traits.contains(&path.segments[0].ident)
 }
 
+/// The obligations a wrapped bound stands for, by the peel contract: a wrapper implements the trait
+/// when its type arguments do.
+#[derive(Default)]
+struct Parts {
+    /// The cycle members reached, in their bare spelling, outermost first: the edges.
+    members: Vec<Type>,
+    /// The parts that contain no member, as written: premises on the original trait.
+    premises: Vec<Type>,
+    seen: HashSet<String>,
+}
+
+impl Parts {
+    fn member(&mut self, ty: Type) {
+        if self.seen.insert(quote!(#ty).to_string()) {
+            self.members.push(ty);
+        }
+    }
+
+    fn premise(&mut self, ty: &Type) {
+        if self.seen.insert(quote!(#ty).to_string()) {
+            self.premises.push(ty.clone());
+        }
+    }
+
+    /// Split `ty` into the obligations of its parts.
+    ///
+    /// - A cycle member (bare or `self::`) is an edge. Members inside its own arguments are edges
+    ///   too, as they always were (`Vec<Stmt<Expr>>: Tr` ⇒ `Stmt<Expr>: Tr`, `Expr: Tr`), but the
+    ///   rest of its arguments are the member's business, not parts of a wrapper.
+    /// - A type that contains no member is a premise, as written: `crate::m::C`, `u8`.
+    /// - A wrapper that contains a member is replaced by the obligations of its parts: the type
+    ///   arguments of a path, the elements of a tuple, the referent of a reference or pointer, the
+    ///   element of an array or slice.
+    /// - Anything else that contains a member (`dyn Fn(Stmt)`, `<Stmt as Tr>::Out`, a member inside
+    ///   an associated-type binding) is not a wrapper this contract covers: its members are edges,
+    ///   as before, and nothing else is read from it.
+    fn decompose(&mut self, ty: &Type, heads: &HashSet<Ident>) {
+        let within = cycle_types_within(ty, heads);
+        if within.is_empty() {
+            self.premise(ty);
+            return;
+        }
+        let is_member = matches!(ty, Type::Path(TypePath { qself: None, path })
+            if crate::helper::path_names_local_ident(path, heads));
+        if is_member {
+            within.into_iter().for_each(|t| self.member(t));
+            return;
+        }
+        match ty {
+            Type::Path(TypePath { qself: None, path }) => {
+                for seg in &path.segments {
+                    match &seg.arguments {
+                        PathArguments::AngleBracketed(args) => {
+                            for arg in &args.args {
+                                match arg {
+                                    GenericArgument::Type(t) => self.decompose(t, heads),
+                                    // A lifetime or a const names no type; a binding or a
+                                    // constraint is no part of the wrapper.
+                                    other => {
+                                        self.members_in(heads, |v| v.visit_generic_argument(other))
+                                    }
+                                }
+                            }
+                        }
+                        PathArguments::Parenthesized(args) => self
+                            .members_in(heads, |v| v.visit_parenthesized_generic_arguments(args)),
+                        PathArguments::None => {}
+                    }
+                }
+            }
+            Type::Tuple(t) => t.elems.iter().for_each(|e| self.decompose(e, heads)),
+            Type::Reference(r) => self.decompose(&r.elem, heads),
+            Type::Ptr(p) => self.decompose(&p.elem, heads),
+            Type::Array(a) => self.decompose(&a.elem, heads),
+            Type::Slice(s) => self.decompose(&s.elem, heads),
+            Type::Paren(p) => self.decompose(&p.elem, heads),
+            Type::Group(g) => self.decompose(&g.elem, heads),
+            _ => within.into_iter().for_each(|t| self.member(t)),
+        }
+    }
+
+    /// The members `visit` finds in a node that is no part of a wrapper, as edges.
+    fn members_in(&mut self, heads: &HashSet<Ident>, visit: impl FnOnce(&mut MemberVisitor<'_>)) {
+        let mut v = MemberVisitor {
+            heads,
+            seen: HashSet::new(),
+            out: Vec::new(),
+        };
+        visit(&mut v);
+        v.out.into_iter().for_each(|t| self.member(t));
+    }
+}
+
 /// Every distinct cycle-member type appearing anywhere inside `ty`, outermost first.
 ///
 /// A member is recognised only by a **bare** (or `self::`-qualified) ident — the same rule
@@ -119,32 +244,34 @@ fn is_bare_cyclic_bound(bound: &TypeParamBound, all_traits: &HashSet<Ident>) -> 
 /// Recursion is unaffected: an outer path's generic arguments are still visited, so a genuine
 /// member nested inside a foreign wrapper (`crate::other::Wrap<Stmt>`) is still found.
 fn cycle_types_within(ty: &Type, cycle_self_heads: &HashSet<Ident>) -> Vec<Type> {
-    struct V<'a> {
-        heads: &'a HashSet<Ident>,
-        seen: HashSet<String>,
-        out: Vec<Type>,
-    }
-    impl Visit<'_> for V<'_> {
-        fn visit_type_path(&mut self, tp: &TypePath) {
-            if tp.qself.is_none() && crate::helper::path_names_local_ident(&tp.path, self.heads) {
-                // Emit the canonical BARE spelling, exactly as the trait side is normalised above:
-                // a peeled target is re-emitted two modules deeper, where a `self::`-qualified
-                // path would resolve against the wrong module.
-                let mut tp = tp.clone();
-                crate::helper::strip_leading_self(&mut tp.path);
-                let t = Type::Path(tp);
-                if self.seen.insert(quote!(#t).to_string()) {
-                    self.out.push(t);
-                }
-            }
-            syn::visit::visit_type_path(self, tp);
-        }
-    }
-    let mut v = V {
+    let mut v = MemberVisitor {
         heads: cycle_self_heads,
         seen: HashSet::new(),
         out: Vec::new(),
     };
     v.visit_type(ty);
     v.out
+}
+
+struct MemberVisitor<'a> {
+    heads: &'a HashSet<Ident>,
+    seen: HashSet<String>,
+    out: Vec<Type>,
+}
+
+impl Visit<'_> for MemberVisitor<'_> {
+    fn visit_type_path(&mut self, tp: &TypePath) {
+        if tp.qself.is_none() && crate::helper::path_names_local_ident(&tp.path, self.heads) {
+            // Emit the canonical BARE spelling, exactly as the trait side is normalised above:
+            // a peeled target is re-emitted two modules deeper, where a `self::`-qualified
+            // path would resolve against the wrong module.
+            let mut tp = tp.clone();
+            crate::helper::strip_leading_self(&mut tp.path);
+            let t = Type::Path(tp);
+            if self.seen.insert(quote!(#t).to_string()) {
+                self.out.push(t);
+            }
+        }
+        syn::visit::visit_type_path(self, tp);
+    }
 }

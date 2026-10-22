@@ -1318,7 +1318,9 @@ const MAX_PROJ_DEPTH: u8 = 16;
 struct ProjCtx {
     /// assoc-type name → (definition type, whether the assoc type has its own generics).
     assoc: BTreeMap<String, (Type, bool)>,
-    /// Last-segment ident of the trait this impl implements (the crate-wide coherence key).
+    /// Last-segment ident of the trait this impl implements, matched against the trait of a
+    /// `<Self as Tr>::Assoc` projection. (An impl reaching codegen names its trait bare, so this is
+    /// also its coherence key, `ImplBlock::trait_key`.)
     trait_ident: String,
 }
 
@@ -1656,8 +1658,8 @@ fn reduce_generics(
             syn::punctuated::Punctuated::new();
         for b in &pt.bounds {
             let is_cyclic_bound = matches!(b,
-                syn::TypeParamBound::Trait(tb) if tb.path.segments.last().is_some_and(|s|
-                    refs.iter().any(|r| scc.contains(r, &s.ident.to_string()))));
+                syn::TypeParamBound::Trait(tb) if trait_key(&tb.path)
+                    .is_some_and(|key| refs.iter().any(|r| scc.contains(r, &key))));
             match b {
                 syn::TypeParamBound::Trait(tb) if is_cyclic_bound => cyclic_paths.push(tb.path.clone()),
                 _ => noncyclic.push(b.clone()),
@@ -1716,26 +1718,34 @@ fn finish_where(
 }
 
 /// Is `ty` a *container around* a member (not the bare member itself)? `Box<Stmt>` → yes, `Stmt` → no.
+///
+/// Only a bare (or `self::`) path is the member, so `crate::other::B<B>` is a container around `B`
+/// even beside a local `B`.
 fn is_wrapped_member(ty: &Type, members: &HashSet<String>) -> bool {
+    !is_member_path(ty, members)
+}
+
+/// Is `ty` a path naming one of `members` by its bare name?
+fn is_member_path(ty: &Type, members: &HashSet<String>) -> bool {
     match ty {
         Type::Path(tp) if tp.qself.is_none() => {
-            let head = tp.path.segments.last().map(|s| s.ident.to_string());
-            !head.is_some_and(|h| members.contains(&h))
+            bare_ident(&tp.path).is_some_and(|h| members.contains(&h.to_string()))
         }
-        _ => true, // tuple / array / reference / … are always containers
+        _ => false, // tuple / array / reference / … are always containers
     }
 }
 
 /// Replace every member-headed path in `ty` with the ident `__DecycleX` (dropping its args), so
 /// `Box<Stmt<T>>` becomes `Box<__DecycleX>` — the generic container for the forwarding assertion.
+/// A member is recognised as [`is_wrapped_member`] recognises one.
 fn generalize_members(ty: &Type, members: &HashSet<String>) -> Type {
     let x = memberx_ident();
     let repl: Type = parse_quote!(#x);
     fn go(ty: &Type, members: &HashSet<String>, repl: &Type) -> Type {
+        let go = |ty: &Type| go(ty, members, repl);
         match ty {
             Type::Path(tp) if tp.qself.is_none() => {
-                let head = tp.path.segments.last().map(|s| s.ident.to_string());
-                if head.is_some_and(|h| members.contains(&h)) {
+                if is_member_path(ty, members) {
                     return repl.clone();
                 }
                 let mut tp = tp.clone();
@@ -1743,7 +1753,7 @@ fn generalize_members(ty: &Type, members: &HashSet<String>) -> Type {
                     if let PathArguments::AngleBracketed(ab) = &mut seg.arguments {
                         for a in ab.args.iter_mut() {
                             if let GenericArgument::Type(t) = a {
-                                *t = go(t, members, repl);
+                                *t = go(t);
                             }
                         }
                     }
@@ -1752,37 +1762,37 @@ fn generalize_members(ty: &Type, members: &HashSet<String>) -> Type {
             }
             Type::Reference(r) => {
                 let mut r = r.clone();
-                r.elem = Box::new(go(&r.elem, members, repl));
+                r.elem = Box::new(go(&r.elem));
                 Type::Reference(r)
             }
             Type::Ptr(p) => {
                 let mut p = p.clone();
-                p.elem = Box::new(go(&p.elem, members, repl));
+                p.elem = Box::new(go(&p.elem));
                 Type::Ptr(p)
             }
             Type::Tuple(t) => {
                 let mut t = t.clone();
-                t.elems = t.elems.iter().map(|e| go(e, members, repl)).collect();
+                t.elems = t.elems.iter().map(&go).collect();
                 Type::Tuple(t)
             }
             Type::Array(a) => {
                 let mut a = a.clone();
-                a.elem = Box::new(go(&a.elem, members, repl));
+                a.elem = Box::new(go(&a.elem));
                 Type::Array(a)
             }
             Type::Slice(s) => {
                 let mut s = s.clone();
-                s.elem = Box::new(go(&s.elem, members, repl));
+                s.elem = Box::new(go(&s.elem));
                 Type::Slice(s)
             }
             Type::Paren(p) => {
                 let mut p = p.clone();
-                p.elem = Box::new(go(&p.elem, members, repl));
+                p.elem = Box::new(go(&p.elem));
                 Type::Paren(p)
             }
             Type::Group(g) => {
                 let mut g = g.clone();
-                g.elem = Box::new(go(&g.elem, members, repl));
+                g.elem = Box::new(go(&g.elem));
                 Type::Group(g)
             }
             other => other.clone(),
@@ -1803,7 +1813,11 @@ fn generalize_members(ty: &Type, members: &HashSet<String>) -> Type {
 /// `... required by a bound in <name>` note reads as guidance, and the placeholder is `__DecycleElem`
 /// so the message reads `the trait bound Box<__DecycleElem>: Tr is not satisfied`. The primary span
 /// lands on the user's own `Container<Member>` bound (its tokens are cloned verbatim).
-fn emit_forwarding_assertion(sw: &StrippedWrapped, scc: &Scc, reduced: &syn::Generics) -> TokenStream {
+fn emit_forwarding_assertion(
+    sw: &StrippedWrapped,
+    scc: &Scc,
+    reduced: &syn::Generics,
+) -> TokenStream {
     let member_set: HashSet<String> = scc.types().into_iter().collect();
     let generalized = generalize_members(&sw.container, &member_set);
     let trait_path = &sw.trait_path;

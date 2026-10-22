@@ -35,8 +35,9 @@ default = ["std", "api", "announce"]
 # runs at a fixed depth (`support_infinite_cycle = false`), and the structural engine is
 # unaffected — it emits no runtime machinery at all.
 std = []
-# The programmatic surface: both engines' entry points, the obligation-graph API, and safegraph.
-# Off, `decycle-impl` is not compiled for your target at all, which is what makes `no_std` work.
+# The programmatic surface: both engines' entry points (`decycle::ranked`, `decycle::structural`),
+# for macro authors wrapping `#[decycle]`. Off, `decycle-impl` is not compiled for your target at
+# all, which is what makes `no_std` work.
 api = ["dep:decycle-impl"]
 # `decycle::announce`, the re-export of the announce crate: a trait outside a `#[decycle] mod` is
 # announced with it, so that other crates can `#[decycle] use` it. It builds for a core-only target
@@ -48,7 +49,9 @@ announce = ["dep:announce"]
 traitdef = { path = "tests/traitdef" }
 typedef = { path = "tests/typedef" }
 alsorank_bridge = { path = "tests/alsorank_bridge" }
-graph_bridge = { path = "tests/graph_bridge" }
+# Calls the ranked engine's programmatic entry point inside a proc macro (it reports through
+# `proc_macro_error`), for `tests/deterministic_expansion.rs`.
+expand_bridge = { path = "tests/expand_bridge" }
 # Counts its own expansions, so a test can pin that a method attribute macro runs exactly once.
 attrcount = { path = "tests/attrcount" }
 trybuild = "1.0"
@@ -56,8 +59,8 @@ trybuild = "1.0"
 announce-std = "0.2.0"
 [dev-dependencies.syn]
 version = "2.0"
-# `analysis::analyze_module` takes a `syn::ItemMod`, so the reachability test builds one; that is
-# all the suite needs from syn.
+# `structural::process_module` takes a `syn::ItemMod`, so `tests/deterministic_expansion.rs` builds
+# one; that is all the suite needs from syn.
 default-features = false
 features = ["clone-impls", "full", "parsing", "printing"]
 
@@ -68,7 +71,7 @@ members = [
   "tests/traitdef",
   "tests/typedef",
   "tests/alsorank_bridge",
-  "tests/graph_bridge",
+  "tests/expand_bridge",
   "tests/attrcount",
 ]
 # Built explicitly by the `no_std` CI job, never as part of this workspace: cargo unifies features

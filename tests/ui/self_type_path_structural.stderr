@@ -1,0 +1,29 @@
+error[E0275]: overflow evaluating the requirement `m::Expr: Eval`
+  --> tests/ui/self_type_path_structural.rs:16:9
+   |
+16 |         Term: Eval,
+   |         ^^^^^^^^^^
+   |
+note: required for `Term` to implement `Eval`
+  --> tests/ui/self_type_path_structural.rs:23:10
+   |
+23 |     impl Eval for crate::m::Term
+   |          ^^^^     ^^^^^^^^^^^^^^
+24 |     where
+25 |         Expr: Eval,
+   |               ---- unsatisfied trait bound introduced here
+
+error[E0275]: overflow evaluating the requirement `Term: Eval`
+  --> tests/ui/self_type_path_structural.rs:25:9
+   |
+25 |         Expr: Eval,
+   |         ^^^^^^^^^^
+   |
+note: required for `m::Expr` to implement `Eval`
+  --> tests/ui/self_type_path_structural.rs:14:10
+   |
+14 |     impl Eval for Expr
+   |          ^^^^     ^^^^
+15 |     where
+16 |         Term: Eval,
+   |               ---- unsatisfied trait bound introduced here

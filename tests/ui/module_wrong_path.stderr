@@ -1,0 +1,15 @@
+error[E0425]: cannot find type `__DecycleModule_5d8281193ec056c4` in module `crate::a::r`
+  --> tests/ui/module_wrong_path.rs:13:39
+   |
+13 | #[decycle::decycle(module = crate::a::r)]
+   |                                       ^ not found in `crate::a::r`
+   |
+   = note: this error originates in the attribute macro `decycle::decycle` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0425]: cannot find type `__DecycleModule_ca1f9f9a4628d7e3` in module `crate::a::s`
+  --> tests/ui/module_wrong_path.rs:44:51
+   |
+44 | #[decycle::decycle(structural, module = crate::a::s)]
+   |                                                   ^ not found in `crate::a::s`
+   |
+   = note: this error originates in the attribute macro `decycle::decycle` (in Nightly builds, run with -Z macro-backtrace for more info)

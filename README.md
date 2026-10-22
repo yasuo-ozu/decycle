@@ -30,7 +30,7 @@ All are on by default; a normal `std` user needs none of these flags.
 | feature | default | what turning it **off** does |
 | --- | --- | --- |
 | `std` | on | Drops the re-entry registry, which is a `thread_local!` map. The ranked engine then requires `support_infinite_cycle = false`; asking for unbounded re-entry without `std` is a compile error naming `UnboundedReentryRequiresTheDecycleStdFeature`. The structural engine is unaffected — it emits no runtime machinery at all. |
-| `api` | on | Drops the programmatic surface (`decycle::{analysis, ranked, structural, safegraph}`). This is what keeps `decycle-impl` out of your *target* graph, and is therefore required for `no_std`. |
+| `api` | on | Drops the programmatic surface (`decycle::{ranked, structural}`, the engines' entry points for macro authors). This is what keeps `decycle-impl` out of your *target* graph, and is therefore required for `no_std`. |
 | `announce` | on | Drops `decycle::announce`, the re-export of [announce](https://docs.rs/announce) that `#[decycle]` on a trait outside a module expands to. It builds for a core-only target. |
 
 **`no_std` needs `default-features = false`.** With the defaults on, `api` pulls `decycle-impl`
@@ -204,6 +204,7 @@ mod cycle {
 | Generic arg instantiated with an **anonymous type** (closure, `async` block, `-> impl Trait` value) | ✗ in unbounded mode — see the closure note below | **✓** |
 | Arg mentioning `Self`: **`fn(&Self)`** / **`&dyn Fn(&Self)`** | ✗ | **✓** |
 | Non-`#[decycle]` **supertrait** on the trait | **✓** | ✗ |
+| `#[decycle]` **supertrait** (another trait of the module, `trait Eval: Base`) | **✓** | only when the supertrait is cyclic on the same types |
 | Third-party trait *in* the cycle | only when `#[decycle]`-annotated at its definition | **✓**  |
 
 > **Note on closures (ranked engine, unbounded mode only).** With
@@ -513,8 +514,31 @@ resolve in one pass.
 ## Attribute Arguments
 
 - **Module**: 
-  - `#[decycle::decycle(recurse_level = N, support_infinite_cycle = true|false, decycle = path)]`
+  - `#[decycle::decycle(module = path, recurse_level = N, support_infinite_cycle = true|false, decycle = path)]`
   - `structural`: use the structural unroll instead of the ranked engine (see [Two algorithms](#two-algorithms)); incompatible with `recurse_level` / `support_infinite_cycle`
+  - `module`: the absolute path of the annotated module (`module = crate::path::to::m`; it may also
+    start with `$crate`, or with `::` through `extern crate self as ..`, takes no generic
+    arguments, and must end in the module's name). The cycle is still solved on the module as
+    written; once it is, the items the engines emit as written (structs, enums, unions, type
+    aliases, traits, fns, consts, statics, and every impl they do not take over) have each bare or
+    `self::` name of a type or trait declared directly in the module spelled `path::X` — so an item
+    inside the module can carry [`#[announce]`](https://docs.rs/announce), which requires absolute
+    paths, with bare fields. Bare names shadowed by a generic parameter, `Self`, other multi-segment
+    paths, fn bodies, macro invocations, nested modules and imported names are left as written.
+    The rewrite is syntactic: a type declared under an inactive `#[cfg]` still counts as declared,
+    and a type declared by a macro invocation does not. The path is checked against the module, so
+    a path that is not this module's (one naming another module, or none) is an error at the
+    argument.
+  - Both engines read a cycle participant only by the name the module gives it, bare (or
+    `self::`-qualified): the trait of an impl, its self type, and the trait and the types of a
+    bound. A trait or a type the module names by a path (`impl crate::m::Eval for X`,
+    `impl super::Eval for X` for a `#[decycle] use super::Eval`, `impl Eval for crate::m::Term`,
+    `where crate::m::Term: Eval`) is the opt-out and is left as written, with or without `module`,
+    so a cycle through it fails to compile: with `structural`, rustc's own overflow (`E0275`); with
+    the ranked engine an `E0275` too, which may name its internal `…Ranked` traits. A wrapped
+    bound is read as the obligations of its parts (a wrapper implements the trait when its type
+    arguments do): `(B, crate::m::C): Eval` is the edge `B: Eval` plus the premise
+    `crate::m::C: Eval`, as written.
   - `recurse_level`: expansion depth (default 10, must be at least 1)
   - `support_infinite_cycle`: enables/disable infinite cycle handling (default true)
   - `decycle`: override the path used to refer to this crate

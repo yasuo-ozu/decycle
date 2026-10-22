@@ -1,39 +1,33 @@
-//! Read-only inspection of a `#[decycle]` module's **obligation graph**.
+//! A `#[decycle]` module's **obligation graph**, read without generating anything.
 //!
-//! Both engines work out the same thing before they generate anything: which of the module's types
-//! participate in a cyclic trait obligation, and which other participant each of their where-bounds
-//! reaches. That analysis is useful on its own — for diagnostics, for tooling, or for a caller that
-//! wants to decide something before invoking an engine — so it is exposed here as a plain function
-//! that generates no code and mutates nothing.
+//! Which of the module's types participate in a cyclic trait obligation, and which other
+//! participant each of their where-bounds reaches. Crate-internal: `crate::growth` uses it to find
+//! the cycle members before either engine runs.
 //!
 //! The graph is over **type idents**, not over the module's fields: an edge exists because an `impl`
 //! *stated* a cyclic where-bound, not because one type happens to contain another. A type with no
 //! impl of a routed trait is not a node at all, even if a participant stores it.
 //!
-//! # Example
-//!
-//! ```ignore
-//! use decycle_impl::analysis::{analyze_module, EdgeKind};
-//! use decycle_impl::safegraph::graph::Graph;
-//!
-//! // mod ast {
-//! //     #[decycle] pub trait Tr { fn f(&self); }
-//! //     pub enum Expr { … }   impl Tr for Expr where Vec<Box<Stmt>>: Tr { … }
-//! //     pub enum Stmt { … }   impl Tr for Stmt where Expr: Tr          { … }
-//! // }
-//! let g = analyze_module(&module, &parse_quote!(::decycle));
-//! // nodes: Expr, Stmt
-//! // edges: Expr -Peeled-> Stmt   (the bound was written on `Vec<Box<Stmt>>`)
-//! //        Stmt -Direct-> Expr   (the bound named `Expr` itself)
+//! ```text
+//! mod ast {
+//!     #[decycle] pub trait Tr { fn f(&self); }
+//!     pub enum Expr { … }   impl Tr for Expr where Vec<Box<Stmt>>: Tr { … }
+//!     pub enum Stmt { … }   impl Tr for Stmt where Expr: Tr          { … }
+//! }
+//! nodes: Expr, Stmt
+//! edges: Expr -Peeled-> Stmt   (the bound was written on `Vec<Box<Stmt>>`)
+//!        Stmt -Direct-> Expr   (the bound named `Expr` itself)
 //! ```
 
-use crate::helper::{strip_leading_self, type_head_ident};
-use crate::safegraph::graph::Graph;
-use crate::safegraph::VecGraph;
+use crate::helper::strip_leading_self;
 use proc_macro2::Ident;
+use safegraph::graph::Graph;
+use safegraph::VecGraph;
 use std::collections::{HashMap, HashSet};
 use syn::visit::Visit;
-use syn::{Item, ItemImpl, ItemMod, Path, TraitBound, Type, TypeParamBound, UseTree, WherePredicate};
+use syn::{
+    Item, ItemImpl, ItemMod, Path, TraitBound, Type, TypeParamBound, UseTree, WherePredicate,
+};
 
 /// How a cyclic where-bound names the participant it reaches.
 ///
@@ -43,7 +37,7 @@ use syn::{Item, ItemImpl, ItemMod, Path, TraitBound, Type, TypeParamBound, UseTr
 /// stripping a wrapped one is only sound if the container forwards the trait, so it emits a
 /// forwarding assertion in exactly the [`EdgeKind::Peeled`] case.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub enum EdgeKind {
+pub(crate) enum EdgeKind {
     /// The bound names the participant directly: `Stmt: Tr` — its head *is* the target.
     Direct,
     /// The bound names a type that *contains* the participant: `Vec<Box<Stmt>>: Tr` — reaching
@@ -77,59 +71,32 @@ pub enum EdgeKind {
 ///   edge either (`ranked::peel::cycle_types_within`). Only the bare and the no-op `self::`
 ///   spellings name a participant;
 /// - the trait each edge came from. Two impls of different routed traits relating the same pair the
-///   same way yield **one** edge, since the question this graph answers is about types.
+///   same way yield **one** edge, since the question this graph answers is about types;
+/// - impls whose self type the module spells by a path (`impl Tr for crate::m::Term`, `impl Tr for
+///   ::other::Stmt`): like a path-spelled trait, that names the item itself, the opt-out, and the
+///   engines take no such impl over. Only a bare (or `self::`) self type contributes a node, so the
+///   node set stays exactly the engines' own `cycle_self_heads`.
 ///
-/// Two known imprecisions, both kept on purpose so the graph keeps describing what the engines
-/// actually do:
-/// - a NODE is still the last path segment of the impl's self type, so `impl Tr for
-///   ::other::Stmt` contributes the node `Stmt`. That is exactly the engines' own
-///   `cycle_self_heads`, and the node set is what [`crate::ranked::process_module_with_graph`]
-///   substitutes for it — dropping such a head here would desynchronise the graph from the
-///   expansion it is meant to reproduce (a graph over idents cannot spell a foreign path anyway);
-/// - a glob `#[decycle] use path::*;` routes no trait, because a glob names none. A module whose
-///   only marker is a glob therefore yields the empty graph — the ranked engine rejects that module
-///   outright ("glob is not supported in #[decycle] use"), so there is no expansion to describe.
-pub fn analyze_module(module: &ItemMod, decycle: &Path) -> VecGraph<Ident, EdgeKind> {
+/// One known imprecision, kept on purpose so the graph keeps describing what the engines actually
+/// do: a glob `#[decycle] use path::*;` routes no trait, because a glob names none. A module whose
+/// only marker is a glob therefore yields the empty graph — the ranked engine rejects that module
+/// outright ("glob is not supported in #[decycle] use"), so there is no expansion to describe.
+pub(crate) fn analyze_module(module: &ItemMod, decycle: &Path) -> VecGraph<Ident, EdgeKind> {
     let Some((_, items)) = module.content.as_ref() else {
         return VecGraph::default();
     };
-    // An empty path can only be hand-built, but this is a public API: fail soft, not via `expect`.
+    // An empty path can only be hand-built: fail soft, not via `expect`.
     let Some(first_segment) = decycle.segments.first() else {
         return VecGraph::default();
     };
     let decycle_crate = &first_segment.ident;
     let routed = routed_traits(items, decycle_crate);
-    build(items, &routed, Spelling::BareOnly)
+    build(items, &routed)
 }
 
-/// Build the obligation graph over `items`, taking the routed traits **as given** rather than
-/// discovering them from `#[decycle]` markers, and matching a trait path by its **last segment**.
-///
-/// This is the entry point for a caller that generates the impls it is about to hand to an engine.
-/// Such a caller knows its routed traits, and writes every path fully qualified — so neither the
-/// `#[decycle]` markers nor the bare/qualified spelling is available yet, and neither is needed:
-/// naming the traits *is* the signal. Contrast [`analyze_module`], which reads a module that has
-/// already been spelled for the engine and therefore honours the qualified opt-out.
-///
-/// Feed the result through [`cyclic_subgraph`] to get the participants, then pass that to
-/// [`crate::ranked::process_module_with_graph`] with `emit_contracts` set to `true` — which
-/// re-spells the impls from it, closing the loop.
-pub fn analyze_items(items: &[Item], routed: &HashSet<Ident>) -> VecGraph<Ident, EdgeKind> {
-    build(items, routed, Spelling::AnySpelling)
-}
-
-/// How a trait path is matched against the routed set.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Spelling {
-    /// Single segment after `self::`-normalisation. A qualified path is the caller's opt-out.
-    BareOnly,
-    /// Last segment, whatever the qualification. For impls not yet spelled for the engine.
-    AnySpelling,
-}
-
-fn build(items: &[Item], routed: &HashSet<Ident>, how: Spelling) -> VecGraph<Ident, EdgeKind> {
+fn build(items: &[Item], routed: &HashSet<Ident>) -> VecGraph<Ident, EdgeKind> {
     let mut graph = VecGraph::default();
-    let participants = participants(items, routed, how);
+    let participants = participants(items, routed);
 
     // Deterministic node order, so the indices a caller sees are reproducible across runs. The
     // idents themselves are CLONED from the source — never re-created via `Ident::new`, which
@@ -143,16 +110,16 @@ fn build(items: &[Item], routed: &HashSet<Ident>, how: Spelling) -> VecGraph<Ide
     let mut seen: HashSet<(String, String, EdgeKind)> = HashSet::new();
     for item in items {
         let Item::Impl(im) = item else { continue };
-        if !impls_routed_trait(im, routed, how) {
+        if !impls_routed_trait(im, routed) {
             continue;
         }
-        let Some(from) = type_head_ident(&im.self_ty) else {
+        let Some(from) = self_head(im) else {
             continue;
         };
         if !participants.contains(&from) {
             continue;
         }
-        for (to, kind) in bound_edges(im, routed, &participants, how) {
+        for (to, kind) in bound_edges(im, routed, &participants) {
             let key = (from.to_string(), to.to_string(), kind);
             if seen.insert(key.clone()) {
                 edges.push(key);
@@ -228,37 +195,37 @@ fn collect_use_idents(tree: &UseTree, out: &mut HashSet<Ident>) {
 }
 
 /// Head idents of the types implementing a routed trait here — the engines' `cycle_self_heads`.
-fn participants(items: &[Item], routed: &HashSet<Ident>, how: Spelling) -> HashSet<Ident> {
+fn participants(items: &[Item], routed: &HashSet<Ident>) -> HashSet<Ident> {
     items
         .iter()
         .filter_map(|item| {
             let Item::Impl(im) = item else { return None };
-            impls_routed_trait(im, routed, how)
-                .then(|| type_head_ident(&im.self_ty))
+            impls_routed_trait(im, routed)
+                .then(|| self_head(im))
                 .flatten()
         })
         .collect()
 }
 
+/// The head ident of the impl's self type, as a node — read as the engines do: a self type spelled
+/// by a path (`impl Tr for crate::m::Term`) names the item itself, the opt-out, and is no node.
+fn self_head(im: &ItemImpl) -> Option<Ident> {
+    crate::helper::local_type_head_ident(&im.self_ty)
+}
+
 /// Does this impl's trait path name a routed trait in the form the engines adopt — a single segment
 /// after `self::`-normalisation? A crate-rooted or `super::` spelling is the documented opt-out.
-fn impls_routed_trait(im: &ItemImpl, routed: &HashSet<Ident>, how: Spelling) -> bool {
+fn impls_routed_trait(im: &ItemImpl, routed: &HashSet<Ident>) -> bool {
     let Some((_, path, _)) = im.trait_.as_ref() else {
         return false;
     };
-    path_names_routed(path, routed, how)
+    path_names_routed(path, routed)
 }
 
-fn path_names_routed(path: &Path, routed: &HashSet<Ident>, how: Spelling) -> bool {
+fn path_names_routed(path: &Path, routed: &HashSet<Ident>) -> bool {
     let mut path = path.clone();
     strip_leading_self(&mut path);
-    match how {
-        Spelling::BareOnly => path.segments.len() == 1 && routed.contains(&path.segments[0].ident),
-        Spelling::AnySpelling => path
-            .segments
-            .last()
-            .is_some_and(|s| routed.contains(&s.ident)),
-    }
+    path.segments.len() == 1 && routed.contains(&path.segments[0].ident)
 }
 
 /// The participants reached by this impl's cyclic where-bounds, with how each was reached.
@@ -266,7 +233,6 @@ fn bound_edges(
     im: &ItemImpl,
     routed: &HashSet<Ident>,
     participants: &HashSet<Ident>,
-    how: Spelling,
 ) -> Vec<(Ident, EdgeKind)> {
     let Some(where_clause) = im.generics.where_clause.as_ref() else {
         return Vec::new();
@@ -290,7 +256,7 @@ fn bound_edges(
         let WherePredicate::Type(pt) = pred else {
             continue;
         };
-        if !pt.bounds.iter().any(|b| is_routed_bound(b, routed, how)) {
+        if !pt.bounds.iter().any(|b| is_routed_bound(b, routed)) {
             continue;
         }
         // Target is `Self` or a bare impl type param: no second endpoint, no edge (documented).
@@ -324,11 +290,11 @@ fn bound_edges(
     out
 }
 
-fn is_routed_bound(bound: &TypeParamBound, routed: &HashSet<Ident>, how: Spelling) -> bool {
+fn is_routed_bound(bound: &TypeParamBound, routed: &HashSet<Ident>) -> bool {
     let TypeParamBound::Trait(TraitBound { path, .. }) = bound else {
         return false;
     };
-    path_names_routed(path, routed, how)
+    path_names_routed(path, routed)
 }
 
 /// The participant `path` names — but only when the path can actually *denote* one: a bare ident,
@@ -353,7 +319,7 @@ fn local_participant(path: &Path, participants: &HashSet<Ident>) -> Option<Ident
 }
 
 /// [`local_participant`] applied to the *head* of `ty` — `None` for a non-path type (`&Stmt`,
-/// `(A, B)`) or a `<T as Tr>::X` qself, as [`type_head_ident`] has it.
+/// `(A, B)`) or a `<T as Tr>::X` qself, as `helper::type_head_ident` has it.
 fn local_participant_head(ty: &Type, participants: &HashSet<Ident>) -> Option<Ident> {
     match ty {
         Type::Path(syn::TypePath { qself: None, path }) => local_participant(path, participants),
@@ -391,30 +357,6 @@ fn nested_participants(ty: &Type, participants: &HashSet<Ident>) -> Vec<Ident> {
     v.out
 }
 
-/// Read a graph back out as `(nodes, (from, to, kind) edges)`, nodes in enumeration order and
-/// edges referring to nodes by **position** in that order — not by name, so two same-named nodes
-/// in a caller-built graph stay distinct through a round-trip.
-///
-/// Indices of a `Vec`-backed graph only exist inside a scope, so anything that inspects one has to
-/// do it here and hand out owned data.
-fn decompose(graph: &VecGraph<Ident, EdgeKind>) -> (Vec<Ident>, Vec<(usize, usize, EdgeKind)>) {
-    graph.scope(|ctx| {
-        let order: Vec<_> = ctx.node_indices().map(|ix| ix.to_ix()).collect();
-        let pos: HashMap<_, usize> = order.iter().enumerate().map(|(i, ix)| (*ix, i)).collect();
-        let nodes: Vec<Ident> = order.iter().map(|ix| ctx.node(*ix).clone()).collect();
-        let edges = ctx
-            .edge_indices()
-            .map(|e| {
-                let e = e.to_ix();
-                let mut ends = ctx.endpoints(e).map(|n| pos[&n.to_ix()]);
-                let (a, b) = (ends.next().unwrap(), ends.next().unwrap());
-                (a, b, *ctx.edge(e))
-            })
-            .collect();
-        (nodes, edges)
-    })
-}
-
 /// Assemble a graph from nodes and `(from, to, kind)` edges given by node **position**. Edges
 /// referring to an absent position are dropped; nodes are inserted in the order given.
 fn compose(nodes: Vec<Ident>, edges: Vec<(usize, usize, EdgeKind)>) -> VecGraph<Ident, EdgeKind> {
@@ -443,11 +385,7 @@ fn compose(nodes: Vec<Ident>, edges: Vec<(usize, usize, EdgeKind)>) -> VecGraph<
 /// when it has a self-edge. A lone node with no self-edge is not recursive, however many other nodes
 /// point at it.
 ///
-/// This is the counterpart to building a graph from a reference relation: a caller can hand over
-/// *everything* it knows — every type and every reference between them — and let this decide which of
-/// them recurse, rather than implementing a reachability search of its own. The result is in the
-/// shape [`crate::ranked::process_module_with_graph`] wants.
-pub fn cyclic_subgraph(graph: &VecGraph<Ident, EdgeKind>) -> VecGraph<Ident, EdgeKind> {
+pub(crate) fn cyclic_subgraph(graph: &VecGraph<Ident, EdgeKind>) -> VecGraph<Ident, EdgeKind> {
     // Everything is computed inside ONE scope, keyed by node position rather than by name, so a
     // caller-built graph with two same-named nodes keeps them distinct throughout.
     let (nodes, edges, cyclic) = graph.scope(|ctx| {
@@ -469,7 +407,7 @@ pub fn cyclic_subgraph(graph: &VecGraph<Ident, EdgeKind>) -> VecGraph<Ident, Edg
             .map(|(a, _, _)| *a)
             .collect();
         let mut cyclic: HashSet<usize> = HashSet::new();
-        for component in crate::safegraph::algo::connectivity::tarjan_scc(ctx) {
+        for component in safegraph::algo::connectivity::tarjan_scc(ctx) {
             let members: Vec<usize> = component.iter().map(|ix| pos[ix]).collect();
             if members.len() > 1 || members.iter().any(|p| self_looped.contains(p)) {
                 cyclic.extend(members);
@@ -497,20 +435,5 @@ pub fn cyclic_subgraph(graph: &VecGraph<Ident, EdgeKind>) -> VecGraph<Ident, Edg
     compose(nodes, edges)
 }
 
-/// `graph` plus `extra` nodes, edges unchanged.
-///
-/// For a caller that discovers further participants only after the graph is built — a macro that
-/// generates a helper type belonging to the cycle, say. Names already present are not duplicated.
-pub fn with_nodes(
-    graph: &VecGraph<Ident, EdgeKind>,
-    extra: impl IntoIterator<Item = Ident>,
-) -> VecGraph<Ident, EdgeKind> {
-    let (mut nodes, edges) = decompose(graph);
-    let mut have: HashSet<String> = nodes.iter().map(|n| n.to_string()).collect();
-    for name in extra {
-        if have.insert(name.to_string()) {
-            nodes.push(name);
-        }
-    }
-    compose(nodes, edges)
-}
+#[cfg(test)]
+mod tests;

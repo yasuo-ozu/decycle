@@ -57,6 +57,22 @@ pub(crate) struct Model {
     pub nonce: u64,
 }
 
+/// The ident a path names a cycle participant by: its bare name, or the no-op `self::` form. Any
+/// other path (`crate::m::Tr`, `super::Term`, `crate::other::B`) names the item itself, the
+/// opt-out, and takes no part in the cycle — as in the ranked engine.
+pub(crate) fn bare_ident(path: &syn::Path) -> Option<&Ident> {
+    let mut segments = path.segments.iter();
+    if path.leading_colon.is_some() {
+        return None;
+    }
+    let mut first = segments.next()?;
+    // A leading, argument-less `self` is a no-op prefix (`helper::strip_leading_self`).
+    if first.ident == "self" && first.arguments.is_none() {
+        first = segments.next()?;
+    }
+    segments.next().is_none().then_some(&first.ident)
+}
+
 impl Model {
     /// The declaration of `name` in trait `trait_key`, when that trait is declared in this module.
     pub fn trait_method_sig(&self, trait_key: &str, name: &Ident) -> Option<&syn::Signature> {
@@ -126,21 +142,31 @@ impl Model {
     }
 }
 
-/// The trait's last-segment ident, used as the coherence key (`a::Foo` and `b::Foo` collide — same as
-/// the visitor system's last-segment keying).
+/// The trait's ident, used as the coherence key — only for a trait path of one segment (after a
+/// leading `self::`). A qualified path (`crate::m::Tr`, `super::Tr`) is the caller's opt-out, as in
+/// the ranked engine: the impl has no key, takes no part in the cycle and is re-emitted as written.
 pub(crate) fn impl_trait_key(im: &ItemImpl) -> Option<String> {
-    im.trait_
-        .as_ref()
-        .and_then(|(_, path, _)| path.segments.last())
-        .map(|s| s.ident.to_string())
+    let (_, path, _) = im.trait_.as_ref()?;
+    trait_key(path)
 }
 
+/// The key of the trait of a bound, as [`impl_trait_key`] keys an impl's: a bound naming the trait
+/// by a path is the opt-out, so it is no edge of the cycle and is left as written.
+pub(crate) fn trait_key(path: &syn::Path) -> Option<String> {
+    bare_ident(path).map(|ident| ident.to_string())
+}
+
+/// The ident of the impl's self type, which keys it as a cycle member — only for a bare (or
+/// `self::`) path: `impl Tr for crate::other::B` names the item itself, the opt-out, and is no
+/// member even beside a local `B`.
 pub(crate) fn impl_self_ident(im: &ItemImpl) -> Option<Ident> {
-    if let Type::Path(tp) = &*im.self_ty {
-        tp.path.segments.last().map(|s| s.ident.clone())
-    } else {
-        None
+    let Type::Path(tp) = &*im.self_ty else {
+        return None;
+    };
+    if tp.qself.is_some() {
+        return None;
     }
+    bare_ident(&tp.path).cloned()
 }
 
 fn impl_self_args(im: &ItemImpl) -> Vec<GenericArgument> {

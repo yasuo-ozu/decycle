@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use syn::spanned::Spanned;
 use syn::*;
 use crate::helper::type_head_ident;
+use crate::names::{use_leaves, UseLeaf};
 use template_quote::quote;
 
 /// A `super::super::…`-rooted path (2+ leading `super` segments) written by the user
@@ -71,24 +72,17 @@ fn process_trait_path(item: &Item) -> Vec<Path> {
                 "#[decycle] is not supported on a trait alias"
             )
         }
-        Item::Use(ItemUse { tree, .. }) => {
-            fn process_use_tree(tree: &UseTree) -> Vec<Path> {
-                match tree {
-                    UseTree::Path(UsePath { tree, .. }) => process_use_tree(tree),
-                    UseTree::Name(UseName { ident })
-                    | UseTree::Rename(UseRename { rename: ident, .. }) => {
-                        vec![crate::ident_to_path(ident)]
-                    }
-                    UseTree::Glob(use_glob) => {
-                        abort!(use_glob, "glob is not supported in #[decycle] use")
-                    }
-                    UseTree::Group(UseGroup { items, .. }) => {
-                        items.iter().flat_map(process_use_tree).collect()
-                    }
+        Item::Use(ItemUse { tree, .. }) => use_leaves(tree)
+            .into_iter()
+            .map(|leaf| match leaf {
+                UseLeaf::Name(ident) | UseLeaf::Rename { local: ident, .. } => {
+                    crate::ident_to_path(ident)
                 }
-            }
-            process_use_tree(tree)
-        }
+                UseLeaf::Glob(use_glob) => {
+                    abort!(use_glob, "glob is not supported in #[decycle] use")
+                }
+            })
+            .collect(),
         _ => unreachable!(),
     }
 }
@@ -97,26 +91,16 @@ fn process_trait_path(item: &Item) -> Vec<Path> {
 /// from a `#[decycle] use` item — see `finalize::TraitRename`/L-C1. A plain `UseName`
 /// (`use path::T;`) needs no entry: the local name already matches the original.
 fn collect_trait_renames(item: &Item) -> Vec<(Ident, Ident)> {
-    fn walk(tree: &UseTree, out: &mut Vec<(Ident, Ident)>) {
-        match tree {
-            UseTree::Path(UsePath { tree, .. }) => walk(tree, out),
-            UseTree::Rename(UseRename { ident, rename, .. }) => {
-                out.push((ident.clone(), rename.clone()));
-            }
-            UseTree::Name(_) | UseTree::Glob(_) => (),
-            UseTree::Group(UseGroup { items, .. }) => {
-                for item in items {
-                    walk(item, out);
-                }
-            }
-        }
-    }
     let Item::Use(ItemUse { tree, .. }) = item else {
         return Vec::new();
     };
-    let mut out = Vec::new();
-    walk(tree, &mut out);
-    out
+    use_leaves(tree)
+        .into_iter()
+        .filter_map(|leaf| match leaf {
+            UseLeaf::Rename { original, local } => Some((original.clone(), local.clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 pub(crate) fn is_local_impl_bound_target(ty: &Type, impl_type_params: &HashSet<Ident>) -> bool {

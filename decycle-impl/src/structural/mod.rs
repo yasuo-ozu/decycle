@@ -25,8 +25,7 @@ use template_quote::{quote, ToTokens};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use syn::{
     parse_quote, spanned::Spanned, Attribute, GenericArgument, GenericParam, Ident, ImplItem, Item,
-    ItemEnum, ItemImpl, ItemMod, ItemStruct, Path, PathArguments, ReturnType, Type, UseTree,
-    WherePredicate,
+    ItemEnum, ItemImpl, ItemMod, ItemStruct, Path, PathArguments, ReturnType, Type, WherePredicate,
 };
 
 mod analyze;
@@ -456,7 +455,7 @@ fn collect_decycle_traits(items: &mut [Item], decycle_crate: &Ident) -> HashSet<
             }
             Item::Use(u) => {
                 if take_decycle_attr(&mut u.attrs, decycle_crate) {
-                    collect_use_trait_idents(&u.tree, &mut traits);
+                    traits.extend(crate::names::use_names(&u.tree).map(|i| i.to_string()));
                     // This engine reads no trait through the `use`: its name is all it takes, and
                     // the module's impls spell the trait by it. Nothing else may name the import
                     // (a stand-in that is only the real trait's copy, reached under a rename), so
@@ -474,22 +473,4 @@ fn take_decycle_attr(attrs: &mut Vec<Attribute>, decycle_crate: &Ident) -> bool 
     let before = attrs.len();
     attrs.retain(|a| !crate::is_decycle_attribute(a, decycle_crate));
     attrs.len() != before
-}
-
-fn collect_use_trait_idents(tree: &UseTree, out: &mut HashSet<String>) {
-    match tree {
-        UseTree::Path(p) => collect_use_trait_idents(&p.tree, out),
-        UseTree::Name(n) => {
-            out.insert(n.ident.to_string());
-        }
-        UseTree::Rename(r) => {
-            out.insert(r.rename.to_string());
-        }
-        UseTree::Group(g) => {
-            for t in &g.items {
-                collect_use_trait_idents(t, out);
-            }
-        }
-        UseTree::Glob(_) => {}
-    }
 }

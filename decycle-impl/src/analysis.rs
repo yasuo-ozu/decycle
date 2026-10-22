@@ -23,7 +23,7 @@ use crate::names::{is_routed_bound, routed_ident};
 use proc_macro2::Ident;
 use safegraph::VecGraph;
 use std::collections::{HashMap, HashSet};
-use syn::{Item, ItemImpl, ItemMod, Path, Type, UseTree, WherePredicate};
+use syn::{Attribute, Item, ItemImpl, ItemMod, Path, Type, WherePredicate};
 
 /// How a cyclic where-bound names the participant it reaches.
 ///
@@ -86,7 +86,7 @@ pub(crate) fn analyze_module(module: &ItemMod, decycle: &Path) -> VecGraph<Ident
         return VecGraph::default();
     };
     let decycle_crate = &first_segment.ident;
-    let routed = routed_traits(items, decycle_crate);
+    let routed = routed_traits(items, &|attrs| has_decycle_attr(attrs, decycle_crate));
     build(items, &routed)
 }
 
@@ -128,16 +128,24 @@ fn build(items: &[Item], routed: &HashSet<Ident>) -> VecGraph<Ident, EdgeKind> {
 }
 
 /// Trait idents routed through an engine: `#[decycle] trait …` plus every name bound by a
-/// `#[decycle] use …`.
-fn routed_traits(items: &[Item], decycle_crate: &Ident) -> HashSet<Ident> {
+/// `#[decycle] use …`, by its local name; `marked` says whether an item's attributes carry the
+/// marker.
+///
+/// A glob names no trait, so it routes none — see the caveat on `analyze_module`. The ranked engine
+/// rejects `#[decycle] use path::*;` outright, so a module relying on one has no expansion for this
+/// graph to describe.
+pub(crate) fn routed_traits(
+    items: &[Item],
+    marked: &dyn Fn(&[Attribute]) -> bool,
+) -> HashSet<Ident> {
     let mut out = HashSet::new();
     for item in items {
         match item {
-            Item::Trait(t) if has_decycle_attr(&t.attrs, decycle_crate) => {
+            Item::Trait(t) if marked(&t.attrs) => {
                 out.insert(t.ident.clone());
             }
-            Item::Use(u) if has_decycle_attr(&u.attrs, decycle_crate) => {
-                collect_use_idents(&u.tree, &mut out);
+            Item::Use(u) if marked(&u.attrs) => {
+                out.extend(crate::names::use_names(&u.tree).cloned());
             }
             _ => {}
         }
@@ -150,27 +158,10 @@ fn routed_traits(items: &[Item], decycle_crate: &Ident) -> HashSet<Ident> {
 /// rejection goes through `abort!`, which panics outside a proc-macro entry point — and this
 /// function is a plain library call. So the marker is honoured here whatever it carries, and the
 /// engine the caller goes on to invoke is the one that reports it.
-fn has_decycle_attr(attrs: &[syn::Attribute], decycle_crate: &Ident) -> bool {
+fn has_decycle_attr(attrs: &[Attribute], decycle_crate: &Ident) -> bool {
     attrs
         .iter()
         .any(|a| crate::names_decycle_attribute(a, decycle_crate))
-}
-
-fn collect_use_idents(tree: &UseTree, out: &mut HashSet<Ident>) {
-    match tree {
-        UseTree::Path(p) => collect_use_idents(&p.tree, out),
-        UseTree::Name(n) => {
-            out.insert(n.ident.clone());
-        }
-        UseTree::Rename(r) => {
-            out.insert(r.rename.clone());
-        }
-        UseTree::Group(g) => g.items.iter().for_each(|t| collect_use_idents(t, out)),
-        // A glob names no trait, so it routes none — see the caveat on `analyze_module`. The ranked
-        // engine rejects `#[decycle] use path::*;` outright, so a module relying on one has no
-        // expansion for this graph to describe.
-        UseTree::Glob(_) => {}
-    }
 }
 
 /// Head idents of the types implementing a routed trait here — the engines' `cycle_self_heads`.

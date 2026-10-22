@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use syn::visit::Visit;
 use syn::{
     GenericParam, Generics, Ident, Path, PathArguments, TraitBound, Type, TypeParamBound, TypePath,
+    UseGlob, UseTree,
 };
 
 /// Strips a leading, argument-less `self` segment (`self::Trait` -> `Trait`,
@@ -149,4 +150,50 @@ pub(crate) fn strip_parens(ty: &Type) -> &Type {
         Type::Group(g) => strip_parens(&g.elem),
         other => other,
     }
+}
+
+/// One name a `use` tree binds: `use a::T;` binds `T`, `use a::T as R;` binds `R` (for `T`), and a
+/// glob `use a::*;` binds no name of its own.
+pub(crate) enum UseLeaf<'a> {
+    Name(&'a Ident),
+    Rename {
+        original: &'a Ident,
+        local: &'a Ident,
+    },
+    Glob(&'a UseGlob),
+}
+
+impl<'a> UseLeaf<'a> {
+    /// The name the leaf binds in the module; none for a glob.
+    pub(crate) fn local(&self) -> Option<&'a Ident> {
+        match self {
+            UseLeaf::Name(ident) | UseLeaf::Rename { local: ident, .. } => Some(ident),
+            UseLeaf::Glob(_) => None,
+        }
+    }
+}
+
+/// The leaves of `tree`, in source order: what a `#[decycle] use` routes, read the same way by both
+/// engines, [`crate::analysis`] and `crate::growth`.
+pub(crate) fn use_leaves(tree: &UseTree) -> Vec<UseLeaf<'_>> {
+    fn walk<'a>(tree: &'a UseTree, out: &mut Vec<UseLeaf<'a>>) {
+        match tree {
+            UseTree::Path(p) => walk(&p.tree, out),
+            UseTree::Name(n) => out.push(UseLeaf::Name(&n.ident)),
+            UseTree::Rename(r) => out.push(UseLeaf::Rename {
+                original: &r.ident,
+                local: &r.rename,
+            }),
+            UseTree::Glob(g) => out.push(UseLeaf::Glob(g)),
+            UseTree::Group(g) => g.items.iter().for_each(|t| walk(t, out)),
+        }
+    }
+    let mut out = Vec::new();
+    walk(tree, &mut out);
+    out
+}
+
+/// The names `tree` binds, in source order: [`UseLeaf::local`] of each leaf (a glob binds none).
+pub(crate) fn use_names(tree: &UseTree) -> impl Iterator<Item = &Ident> {
+    use_leaves(tree).into_iter().filter_map(|leaf| leaf.local())
 }

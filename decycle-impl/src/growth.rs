@@ -91,7 +91,7 @@ use std::collections::HashSet;
 use syn::visit::Visit;
 use syn::{
     Expr, ExprPath, FnArg, Ident, ImplItem, Item, ItemImpl, ItemMod, Pat, Path, Signature, Stmt,
-    Type, UseTree,
+    Type,
 };
 
 /// What a call site has to name for its callee to be the cycle's own trait method — condition 3.
@@ -135,41 +135,21 @@ pub(crate) fn check_value_generic_growth(module: &ItemMod, decycle: &Path) -> sy
 }
 
 /// The idents of the traits routed through this module — `#[decycle] trait Tr` and
-/// `#[decycle] use path::Tr` (under its local name).
+/// `#[decycle] use path::Tr` (under its local name), as [`analysis::routed_traits`] reads them.
 ///
-/// A small re-derivation of `analysis`'s private `routed_traits`, kept here because this pass runs
-/// before any of the engine's own bookkeeping exists and only needs the names.
+/// Through the engines' own marker predicate (`crate::is_decycle_attribute`), which rejects an
+/// argument list on the marker: this pass runs inside an engine's entry point.
 fn routed_trait_names(items: &[Item], decycle: &Path) -> HashSet<String> {
-    fn use_idents(tree: &UseTree, out: &mut HashSet<String>) {
-        match tree {
-            UseTree::Path(p) => use_idents(&p.tree, out),
-            UseTree::Name(n) => {
-                out.insert(n.ident.to_string());
-            }
-            UseTree::Rename(r) => {
-                out.insert(r.rename.to_string());
-            }
-            UseTree::Group(g) => g.items.iter().for_each(|t| use_idents(t, out)),
-            UseTree::Glob(_) => {}
-        }
-    }
-    let mut out = HashSet::new();
     let Some(first) = decycle.segments.first() else {
-        return out;
+        return HashSet::new();
     };
     let decycle_crate = &first.ident;
     let marked =
         |attrs: &[syn::Attribute]| attrs.iter().any(|a| crate::is_decycle_attribute(a, decycle_crate));
-    for item in items {
-        match item {
-            Item::Trait(t) if marked(&t.attrs) => {
-                out.insert(t.ident.to_string());
-            }
-            Item::Use(u) if marked(&u.attrs) => use_idents(&u.tree, &mut out),
-            _ => {}
-        }
-    }
-    out
+    analysis::routed_traits(items, &marked)
+        .iter()
+        .map(|ident| ident.to_string())
+        .collect()
 }
 
 /// The cycle members' type names. An empty set (no cycle at all) short-circuits the whole pass.

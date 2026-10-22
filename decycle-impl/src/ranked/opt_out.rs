@@ -208,8 +208,8 @@ impl<'a> Graph<'a> {
     /// rank) to `to`'s impl, at any rank: `[from, .., to]`, or `None` when the rank chain never
     /// reaches it.
     ///
-    /// Searched over `(node, ranks left)` with the crate's graph machinery (`safegraph`, as for the
-    /// obligation graph in `crate::analysis` and `sharing_sources`). The top rank is capped at the
+    /// Searched over `(node, ranks left)` with the crate's graph machinery (`crate::graph`, as for
+    /// the obligation graph in `crate::analysis` and `sharing_sources`). The top rank is capped at the
     /// number of nodes: a chain never needs a longer run of cycle edges than that, so the answer is
     /// the same, and the search stays small for a large `recurse_level`.
     fn chain_back(
@@ -223,7 +223,13 @@ impl<'a> Graph<'a> {
         use safegraph::algo::shortest_path::dijkstra;
         use safegraph::graph::Graph as _;
         let top = recurse_level.min(self.nodes.len());
-        let mut edges: Vec<((String, usize), (String, usize))> = Vec::new();
+        let states: Vec<(String, usize)> = self
+            .nodes
+            .keys()
+            .flat_map(|name| (0..=top).map(move |rank| (name.clone(), rank)))
+            .collect();
+        let position: HashMap<(String, usize), usize> = states.iter().cloned().zip(0..).collect();
+        let mut edges: Vec<(usize, usize, ())> = Vec::new();
         for (name, im) in &self.nodes {
             for (kind, target, ..) in self.edges(im, trait_name, scope) {
                 for rank in 0..=top {
@@ -232,27 +238,15 @@ impl<'a> Graph<'a> {
                         Edge::Cycle => rank - 1,
                         Edge::OptOut => top,
                     };
-                    edges.push(((name.clone(), rank), (target.clone(), next)));
+                    edges.push((
+                        position[&(name.clone(), rank)],
+                        position[&(target.clone(), next)],
+                        (),
+                    ));
                 }
             }
         }
-        let mut graph: safegraph::VecGraph<(String, usize), ()> = Default::default();
-        graph.scope_mut(|mut ctx| {
-            let mut index = HashMap::new();
-            for name in self.nodes.keys() {
-                for rank in 0..=top {
-                    let state = (name.clone(), rank);
-                    let ix = ctx
-                        .insert_node(state.clone())
-                        .expect("insertion into a fresh VecGraph cannot fail");
-                    index.insert(state, ix);
-                }
-            }
-            for (a, b) in &edges {
-                ctx.insert_edge((), [index[a], index[b]])
-                    .expect("both endpoints were just inserted");
-            }
-        });
+        let graph = crate::graph::compose(states, edges);
         graph.scope(|ctx| {
             let ix_of = |name: &str, rank: usize| {
                 ctx.node_indices()

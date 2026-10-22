@@ -23,21 +23,11 @@ use syn::parse_quote;
 
 /// `(from, kind, to)` triples, sorted, so assertions do not depend on insertion order.
 fn edges_of(g: &VecGraph<Ident, EdgeKind>) -> Vec<(String, EdgeKind, String)> {
-    // Indices only exist inside a scope for a `Vec`-backed graph.
-    let mut out = g.scope(|ctx| {
-        ctx.edge_indices()
-            .map(|e| {
-                let e = e.to_ix();
-                let mut ends = ctx.endpoints(e).map(|n| n.to_ix());
-                let (a, b) = (ends.next().unwrap(), ends.next().unwrap());
-                (
-                    ctx.node(a).to_string(),
-                    *ctx.edge(e),
-                    ctx.node(b).to_string(),
-                )
-            })
-            .collect::<Vec<_>>()
-    });
+    let (nodes, edges) = crate::graph::decompose(g);
+    let mut out: Vec<_> = edges
+        .into_iter()
+        .map(|(a, b, kind)| (nodes[a].to_string(), kind, nodes[b].to_string()))
+        .collect();
     out.sort();
     out
 }
@@ -359,15 +349,11 @@ fn raw_ident_participant_does_not_panic() {
 fn cyclic_subgraph_keeps_same_named_nodes_distinct() {
     use proc_macro2::Span;
 
-    let mut g: VecGraph<Ident, EdgeKind> = VecGraph::default();
-    g.scope_mut(|mut ctx| {
-        // a0 <-> b is a real cycle; a1 (same NAME as a0) is an isolated bystander.
-        let a0 = ctx.insert_node(Ident::new("A", Span::call_site())).unwrap();
-        let b = ctx.insert_node(Ident::new("B", Span::call_site())).unwrap();
-        let _a1 = ctx.insert_node(Ident::new("A", Span::call_site())).unwrap();
-        ctx.insert_edge(EdgeKind::Direct, [a0, b]).unwrap();
-        ctx.insert_edge(EdgeKind::Direct, [b, a0]).unwrap();
-    });
+    // a0 <-> b is a real cycle; a1 (same NAME as a0) is an isolated bystander.
+    let g: VecGraph<Ident, EdgeKind> = crate::graph::compose(
+        ["A", "B", "A"].map(|name| Ident::new(name, Span::call_site())),
+        [(0, 1, EdgeKind::Direct), (1, 0, EdgeKind::Direct)],
+    );
 
     let cyc = cyclic_subgraph(&g);
     let mut nodes: Vec<String> = cyc.nodes().map(|n| n.to_string()).collect();

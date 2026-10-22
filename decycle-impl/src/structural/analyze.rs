@@ -31,132 +31,61 @@ impl Scc {
     }
 }
 
-/// A directed graph over `(type, trait)` pairs; edges from `where`-clause references.
-struct Graph {
-    adj: BTreeMap<Pair, BTreeSet<Pair>>,
-}
-
 impl Model {
     /// Every cyclic SCC over the `#[decycle]`-annotated traits (`allowed_traits`, keyed by the bare
-    /// name, `collect::trait_key`). Impls of other traits are left untouched.
+    /// name, `collect::trait_key`): the components of the graph over `(type, trait)` pairs that lie
+    /// on a cycle (more than one pair, or a lone self-looping pair), each pair-sorted, in the order of
+    /// their smallest pair. Impls of other traits are left untouched.
     pub fn cyclic_sccs(&self, allowed_traits: &HashSet<String>) -> Vec<Scc> {
         let adt_names: HashSet<String> = self.adts.keys().cloned().collect();
-        let graph = self.build_graph(allowed_traits, &adt_names);
-        let mut out = Vec::new();
-        for comp in graph.sccs() {
-            if !graph.is_cyclic_component(&comp) {
-                continue; // a lone pair with no self-edge is not a recursion cycle
-            }
-            out.push(Scc { pairs: comp });
-        }
-        out
-    }
-
-    fn build_graph(&self, allowed: &HashSet<String>, adt_names: &HashSet<String>) -> Graph {
-        let participates =
-            |im: &crate::structural::collect::ImplBlock| allowed.contains(&im.trait_key);
-        let mut adj: BTreeMap<Pair, BTreeSet<Pair>> = BTreeMap::new();
+        let participating = || {
+            self.impls
+                .iter()
+                .filter(move |im| allowed_traits.contains(&im.trait_key))
+        };
+        let pair = |im: &ImplBlock| -> Pair { (im.self_ident.to_string(), im.trait_key.clone()) };
         // node: (self type, trait) for every impl of an allowed trait
-        for im in &self.impls {
-            if participates(im) {
-                adj.entry((im.self_ident.to_string(), im.trait_key.clone()))
-                    .or_default();
-            }
-        }
+        let nodes: Vec<Pair> = participating()
+            .map(pair)
+            .collect::<BTreeSet<Pair>>()
+            .into_iter()
+            .collect();
+        let position = |p: &Pair| nodes.binary_search(p).ok();
         // edge: `impl Tr for A where <ref B>: TrB`  =>  (A, Tr) -> (B, TrB), when (B, TrB) is a node.
-        for im in &self.impls {
-            if !participates(im) {
-                continue;
-            }
-            let src: Pair = (im.self_ident.to_string(), im.trait_key.clone());
+        let mut edges = Vec::new();
+        for im in participating() {
+            let src = position(&pair(im)).expect("every participating impl is a node");
             for pred in im.item.generics.where_clause.iter().flat_map(|w| &w.predicates) {
-                if let WherePredicate::Type(pt) = pred {
-                    // Resolve `Self` to the impl's self type so `where Self: Tr` forms a real cycle
-                    // edge — `Self` never matches a local ADT ident on its own.
-                    let bounded = subst_self(&pt.bounded_ty, &im.item.self_ty);
-                    let refs = local_refs(&bounded, adt_names);
-                    for bound in &pt.bounds {
-                        let syn::TypeParamBound::Trait(tb) = bound else {
-                            continue;
-                        };
-                        let Some(btr) = trait_key(&tb.path) else {
-                            continue;
-                        };
-                        if !allowed.contains(&btr) {
-                            continue;
-                        }
-                        for b in &refs {
-                            let dst: Pair = (b.clone(), btr.clone());
-                            if adj.contains_key(&dst) {
-                                adj.get_mut(&src).unwrap().insert(dst);
-                            }
+                let WherePredicate::Type(pt) = pred else {
+                    continue;
+                };
+                // Resolve `Self` to the impl's self type so `where Self: Tr` forms a real cycle
+                // edge — `Self` never matches a local ADT ident on its own.
+                let bounded = subst_self(&pt.bounded_ty, &im.item.self_ty);
+                let refs = local_refs(&bounded, &adt_names);
+                for bound in &pt.bounds {
+                    let syn::TypeParamBound::Trait(tb) = bound else {
+                        continue;
+                    };
+                    let Some(btr) = trait_key(&tb.path).filter(|t| allowed_traits.contains(t))
+                    else {
+                        continue;
+                    };
+                    for b in &refs {
+                        if let Some(dst) = position(&(b.clone(), btr.clone())) {
+                            edges.push((src, dst, ()));
                         }
                     }
                 }
             }
         }
-        Graph { adj }
-    }
-}
-
-impl Graph {
-    fn nodes(&self) -> Vec<Pair> {
-        self.adj.keys().cloned().collect()
-    }
-
-    /// Tarjan-free SCC via mutual reachability (node counts are tiny). Two nodes share a component iff
-    /// mutually reachable; a node is always in its own.
-    fn sccs(&self) -> Vec<Vec<Pair>> {
-        let nodes = self.nodes();
-        let mut seen: HashSet<Pair> = HashSet::new();
-        let mut comps = Vec::new();
-        for n in &nodes {
-            if seen.contains(n) {
-                continue;
-            }
-            let comp: Vec<Pair> = nodes
-                .iter()
-                .filter(|m| *m == n || (self.reaches(n, m) && self.reaches(m, n)))
-                .cloned()
-                .collect();
-            for m in &comp {
-                seen.insert(m.clone());
-            }
-            comps.push(comp);
-        }
-        comps
-    }
-
-    fn reaches(&self, from: &Pair, to: &Pair) -> bool {
-        if from == to {
-            // reflexive only through a real path (self-edge)
-            return self.adj.get(from).is_some_and(|s| s.contains(to));
-        }
-        let mut stack = vec![from.clone()];
-        let mut seen = HashSet::new();
-        while let Some(cur) = stack.pop() {
-            if !seen.insert(cur.clone()) {
-                continue;
-            }
-            if let Some(succ) = self.adj.get(&cur) {
-                if succ.contains(to) {
-                    return true;
-                }
-                for s in succ {
-                    stack.push(s.clone());
-                }
-            }
-        }
-        false
-    }
-
-    /// Is this component an actual cycle (size > 1, or a lone self-looping pair)?
-    fn is_cyclic_component(&self, comp: &[Pair]) -> bool {
-        if comp.len() > 1 {
-            return true;
-        }
-        let n = &comp[0];
-        self.adj.get(n).is_some_and(|s| s.contains(n))
+        let graph = crate::graph::compose(nodes.iter().cloned(), edges);
+        crate::graph::cyclic_components(&graph)
+            .into_iter()
+            .map(|component| Scc {
+                pairs: component.into_iter().map(|k| nodes[k].clone()).collect(),
+            })
+            .collect()
     }
 }
 

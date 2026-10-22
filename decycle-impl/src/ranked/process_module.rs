@@ -408,8 +408,6 @@ fn ranked_cycle_edges(
 /// of the impl's own generic params names no other member (and a param *shadowing* a member's name
 /// must not fabricate an edge), so it contributes none.
 fn sharing_sources(members: &[&ItemImpl], trait_ident: &Ident) -> Vec<Vec<usize>> {
-    use safegraph::algo::dfs::Dfs;
-    use safegraph::graph::Graph;
     // Node key per member: its self type's head ident. An un-headed self type (`&A`, `(A, B)`)
     // gets a synthetic key no bound can name: it can obligate others, never be obligated by ident.
     let keys: Vec<String> = members
@@ -465,40 +463,25 @@ fn sharing_sources(members: &[&ItemImpl], trait_ident: &Ident) -> Vec<Vec<usize>
             }
         }
     }
-    // Reuse the crate's own graph machinery (the same `safegraph` backing `crate::analysis`) for
-    // the reachability walk, mirroring how `analysis.rs` builds and reads its obligation graph.
+    // The reachability walk, over the crate's own graph machinery (`crate::graph`, which backs
+    // `crate::analysis` too), by head name.
     let mut names: Vec<String> = member_heads.iter().map(|s| s.to_string()).collect();
     names.sort();
-    let mut graph: safegraph::VecGraph<String, ()> = Default::default();
-    graph.scope_mut(|mut ctx| {
-        let index: std::collections::HashMap<String, _> = names
-            .iter()
-            .map(|name| {
-                let ix = ctx
-                    .insert_node(name.clone())
-                    .expect("insertion into a fresh VecGraph cannot fail");
-                (name.clone(), ix)
-            })
-            .collect();
-        for (from, to) in &edges {
-            ctx.insert_edge((), [index[from], index[to]])
-                .expect("both endpoints were just inserted");
-        }
-    });
-    let reach: std::collections::HashMap<String, HashSet<String>> = graph.scope(|ctx| {
-        ctx.node_indices()
-            .map(|ix| ix.to_ix())
-            .map(|ix| {
-                let set: HashSet<String> = Dfs::new(ctx, ix).map(|n| ctx.node(n).clone()).collect();
-                (ctx.node(ix).clone(), set)
-            })
-            .collect()
-    });
+    let position = |name: &String| {
+        names
+            .binary_search(name)
+            .expect("every key and every edge endpoint is a node")
+    };
+    let graph = crate::graph::compose(
+        names.iter().cloned(),
+        edges.iter().map(|(from, to)| (position(from), position(to), ())),
+    );
+    let reach = crate::graph::reachable(&graph);
     (0..members.len())
         .map(|i| {
-            let reachable = &reach[&keys[i]];
+            let reachable = &reach[position(&keys[i])];
             (0..members.len())
-                .filter(|j| *j != i && reachable.contains(&keys[*j]))
+                .filter(|j| *j != i && reachable.contains(&position(&keys[*j])))
                 .collect()
         })
         .collect()

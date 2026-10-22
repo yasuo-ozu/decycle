@@ -28,6 +28,8 @@ pub use structural::{
 
 // Rendering `syn::Generics` to token form, shared by both engines.
 mod generics_fmt;
+// The small directed graphs a module's cycles are read off, shared by both engines.
+mod graph;
 // How a module names its own items (bare or `self::`), as both engines read it.
 mod names;
 mod growth;

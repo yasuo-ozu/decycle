@@ -21,7 +21,6 @@
 
 use crate::names::{is_routed_bound, routed_ident};
 use proc_macro2::Ident;
-use safegraph::graph::Graph;
 use safegraph::VecGraph;
 use std::collections::{HashMap, HashSet};
 use syn::{Item, ItemImpl, ItemMod, Path, Type, UseTree, WherePredicate};
@@ -92,7 +91,6 @@ pub(crate) fn analyze_module(module: &ItemMod, decycle: &Path) -> VecGraph<Ident
 }
 
 fn build(items: &[Item], routed: &HashSet<Ident>) -> VecGraph<Ident, EdgeKind> {
-    let mut graph = VecGraph::default();
     let participants = participants(items, routed);
 
     // Deterministic node order, so the indices a caller sees are reproducible across runs. The
@@ -100,11 +98,14 @@ fn build(items: &[Item], routed: &HashSet<Ident>) -> VecGraph<Ident, EdgeKind> {
     // rejects the `to_string()` rendering of a raw identifier (`"r#loop"`).
     let mut node_idents: Vec<Ident> = participants.iter().cloned().collect();
     node_idents.sort_by_key(|i| i.to_string());
+    let position: HashMap<String, usize> = node_idents
+        .iter()
+        .enumerate()
+        .map(|(k, ident)| (ident.to_string(), k))
+        .collect();
 
-    // Collect edges before touching the graph: `scope_mut` hands out scope-local indices, so nodes
-    // and edges have to be inserted together inside one scope.
-    let mut edges: Vec<(String, String, EdgeKind)> = Vec::new();
-    let mut seen: HashSet<(String, String, EdgeKind)> = HashSet::new();
+    let mut edges: Vec<(usize, usize, EdgeKind)> = Vec::new();
+    let mut seen: HashSet<(usize, usize, EdgeKind)> = HashSet::new();
     for item in items {
         let Item::Impl(im) = item else { continue };
         if !impls_routed_trait(im, routed) {
@@ -117,32 +118,13 @@ fn build(items: &[Item], routed: &HashSet<Ident>) -> VecGraph<Ident, EdgeKind> {
             continue;
         }
         for (to, kind) in bound_edges(im, routed, &participants) {
-            let key = (from.to_string(), to.to_string(), kind);
-            if seen.insert(key.clone()) {
+            let key = (position[&from.to_string()], position[&to.to_string()], kind);
+            if seen.insert(key) {
                 edges.push(key);
             }
         }
     }
-
-    // `VecGraph` is `Vec`-backed, so its indices are not stable across removals and `insert_node`
-    // is only offered inside a scope. Nothing is removed here, so one scope covers the whole build.
-    graph.scope_mut(|mut ctx| {
-        let index: HashMap<String, _> = node_idents
-            .into_iter()
-            .map(|ident| {
-                let name = ident.to_string();
-                let ix = ctx
-                    .insert_node(ident)
-                    .expect("insertion into a fresh VecGraph cannot fail");
-                (name, ix)
-            })
-            .collect();
-        for (from, to, kind) in &edges {
-            ctx.insert_edge(*kind, [index[from], index[to]])
-                .expect("both endpoints were just inserted");
-        }
-    });
-    graph
+    crate::graph::compose(node_idents, edges)
 }
 
 /// Trait idents routed through an engine: `#[decycle] trait …` plus every name bound by a
@@ -302,28 +284,6 @@ fn nested_participants(ty: &Type, participants: &HashSet<Ident>) -> Vec<Ident> {
         .collect()
 }
 
-/// Assemble a graph from nodes and `(from, to, kind)` edges given by node **position**. Edges
-/// referring to an absent position are dropped; nodes are inserted in the order given.
-fn compose(nodes: Vec<Ident>, edges: Vec<(usize, usize, EdgeKind)>) -> VecGraph<Ident, EdgeKind> {
-    let mut out = VecGraph::default();
-    out.scope_mut(|mut ctx| {
-        let index: Vec<_> = nodes
-            .into_iter()
-            .map(|n| {
-                ctx.insert_node(n)
-                    .expect("insertion into a fresh VecGraph cannot fail")
-            })
-            .collect();
-        for (from, to, kind) in edges {
-            if let (Some(a), Some(b)) = (index.get(from), index.get(to)) {
-                ctx.insert_edge(kind, [*a, *b])
-                    .expect("both endpoints exist");
-            }
-        }
-    });
-    out
-}
-
 /// Restrict `graph` to the nodes that actually **lie on a cycle**, keeping the edges between them.
 ///
 /// A node is retained when it belongs to a strongly connected component of more than one node, or
@@ -331,35 +291,13 @@ fn compose(nodes: Vec<Ident>, edges: Vec<(usize, usize, EdgeKind)>) -> VecGraph<
 /// point at it.
 ///
 pub(crate) fn cyclic_subgraph(graph: &VecGraph<Ident, EdgeKind>) -> VecGraph<Ident, EdgeKind> {
-    // Everything is computed inside ONE scope, keyed by node position rather than by name, so a
-    // caller-built graph with two same-named nodes keeps them distinct throughout.
-    let (nodes, edges, cyclic) = graph.scope(|ctx| {
-        let order: Vec<_> = ctx.node_indices().map(|ix| ix.to_ix()).collect();
-        let pos: HashMap<_, usize> = order.iter().enumerate().map(|(i, ix)| (*ix, i)).collect();
-        let nodes: Vec<Ident> = order.iter().map(|ix| ctx.node(*ix).clone()).collect();
-        let edges: Vec<(usize, usize, EdgeKind)> = ctx
-            .edge_indices()
-            .map(|e| {
-                let e = e.to_ix();
-                let mut ends = ctx.endpoints(e).map(|n| pos[&n.to_ix()]);
-                let (a, b) = (ends.next().unwrap(), ends.next().unwrap());
-                (a, b, *ctx.edge(e))
-            })
-            .collect();
-        let self_looped: HashSet<usize> = edges
-            .iter()
-            .filter(|(a, b, _)| a == b)
-            .map(|(a, _, _)| *a)
-            .collect();
-        let mut cyclic: HashSet<usize> = HashSet::new();
-        for component in safegraph::algo::connectivity::tarjan_scc(ctx) {
-            let members: Vec<usize> = component.iter().map(|ix| pos[ix]).collect();
-            if members.len() > 1 || members.iter().any(|p| self_looped.contains(p)) {
-                cyclic.extend(members);
-            }
-        }
-        (nodes, edges, cyclic)
-    });
+    // Keyed by node position rather than by name, so a caller-built graph with two same-named
+    // nodes keeps them distinct throughout.
+    let (nodes, edges) = crate::graph::decompose(graph);
+    let cyclic: HashSet<usize> = crate::graph::cyclic_components(graph)
+        .into_iter()
+        .flatten()
+        .collect();
 
     // Retained nodes keep their relative order; edge endpoints are remapped into that subsequence.
     let remap: HashMap<usize, usize> = (0..nodes.len())
@@ -371,13 +309,11 @@ pub(crate) fn cyclic_subgraph(graph: &VecGraph<Ident, EdgeKind>) -> VecGraph<Ide
         .into_iter()
         .enumerate()
         .filter(|(i, _)| cyclic.contains(i))
-        .map(|(_, n)| n)
-        .collect();
+        .map(|(_, n)| n);
     let edges = edges
         .into_iter()
-        .filter_map(|(a, b, kind)| Some((*remap.get(&a)?, *remap.get(&b)?, kind)))
-        .collect();
-    compose(nodes, edges)
+        .filter_map(|(a, b, kind)| Some((*remap.get(&a)?, *remap.get(&b)?, kind)));
+    crate::graph::compose(nodes, edges)
 }
 
 #[cfg(test)]

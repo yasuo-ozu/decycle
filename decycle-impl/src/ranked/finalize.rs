@@ -25,6 +25,10 @@ fn name(s: &str) -> Ident {
     crate::suffixed_ident(s, crate::get_random())
 }
 
+// Declared after the macros above, so that their textual scope covers it.
+#[path = "wrapper.rs"]
+pub(crate) mod wrapper;
+
 /// Rewrites single-segment trait paths that match the replacing table to their
 /// ranked equivalents. E.g., `Evaluate` → `ranked_traits::EvaluateRanked<Rank, ()>`.
 ///
@@ -238,9 +242,13 @@ fn remove_cyclic_bounds(
         // them apart needs the *field* graph, which decycle deliberately never reads. Excluding bare
         // params here breaks `bareparam_reentry`/`limitation`; a caller that needs such a leaf bound
         // to survive must still route it through a non-cyclic supertrait alias.
+        //
+        // A wrapper `peel` kept whole (`(B, crate::other::Leaf)`, the pair's impl taken over), which
+        // names a member by its bare name without being headed by one, is an edge too (`wrapper`).
         let target_is_participant = is_self_target
             || is_bareparam_target
-            || crate::helper::type_head_ident(&ty).is_some_and(|h| self_heads.contains(&h));
+            || crate::helper::type_head_ident(&ty).is_some_and(|h| self_heads.contains(&h))
+            || crate::names::names_bare(&ty, &self_heads);
         // Cyclic iff: a depth-fragile spelling (always), or a BARE spelling whose target the ranked
         // chain can actually descend. A crate-rooted or absolute path is never cyclic — that is the
         // opt-out, and it is what lets a leaf premise on a bare type parameter survive, which no
@@ -341,7 +349,8 @@ fn requalify_foreign_premises(
                 if path.is_ident("Self")
                     || (path.segments.len() == 1 && param_idents.contains(&path.segments[0].ident)))
             || crate::helper::type_head_ident(&pt.bounded_ty)
-                .is_some_and(|h| self_heads.contains(&h));
+                .is_some_and(|h| self_heads.contains(&h))
+            || crate::names::names_bare(&pt.bounded_ty, &self_heads);
         if target_is_participant || !pt.bounds.iter().any(is_bare_routed) {
             continue;
         }
@@ -1073,6 +1082,7 @@ fn generics_mention_self(generics: &Generics) -> bool {
 /// lifetimes that scope names inside `target`; empty for an ordinary bound. C1 splices `binder`
 /// as generics of the register-once fn so `target`'s lifetimes are declared where the
 /// `register`/`Re` statement lands.
+#[derive(Clone)]
 struct CyclicBound {
     binder: Vec<GenericParam>,
     target: Type,
@@ -1185,9 +1195,11 @@ fn cyclic_where_bounds(
                     // `Self` means "this impl's self type" only INSIDE the impl; every consumer
                     // of the returned target reads it from outside (see the doc comment).
                     let mut target = subst_bare_self_in_type(&pt.bounded_ty, &impl_.self_ty);
-                    // A premise, not an edge: see the doc comment.
+                    // A premise, not an edge: see the doc comment. (A wrapper `peel` kept whole is an
+                    // edge: see `wrapper`.)
                     if !crate::helper::type_head_ident(&target)
                         .is_some_and(|h| self_heads.contains(&h))
+                        && !crate::names::names_bare(&target, &self_heads)
                     {
                         continue;
                     }
@@ -2526,6 +2538,75 @@ fn build_bareparam_registrations(
     build_self_registrations(trait_, impl_, current_sig, &rt, decycle)
 }
 
+/// The targets rule 2 registers for `impl_`, each already past its gate: every cyclic bound whose
+/// side bounds are reachable (`reachable_side_bounds_ok`), as always; and, for a bound whose ranked
+/// chain goes through a wrapper (`wrapper`), the wrapper itself and every type of that chain an
+/// impl taken over implements, which `impl_` may name (`wrapper::registration_ok`).
+///
+/// A chain through a wrapper reaches floors that no other frame registers: the wrapper's own (its
+/// frames are bare-param ones, which register nothing — `impl_has_bare_param_cyclic_bound`), and a
+/// member's that `impl_` reaches only through it. Registered here, in the frame that names the
+/// wrapper, they are live for the whole descent below it.
+fn rule2_targets(
+    impl_: &ItemImpl,
+    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+    settled: &wrapper::Settled,
+) -> Vec<CyclicBound> {
+    let heads = cycle_self_heads(replacing_table);
+    let key = |tr: &Ident, ty: &Type, targs: &[GenericArgument]| {
+        format!("{}|{}|{}", tr, quote!(#ty), quote!(#(#targs),*))
+    };
+    let cbs = cyclic_where_bounds(impl_, replacing_table);
+    let mut seen: std::collections::HashSet<String> = cbs
+        .iter()
+        .map(|cb| key(&cb.trait_ident, &cb.target, &cb.targs))
+        .collect();
+    let mut out = Vec::new();
+    for cb in cbs {
+        let headed =
+            crate::helper::type_head_ident(&cb.target).is_some_and(|h| heads.contains(&h));
+        let is_wrapper = !headed && crate::names::names_bare(&cb.target, &heads);
+        let plan = cb
+            .binder
+            .is_empty()
+            .then(|| {
+                wrapper::Planner::plan(replacing_table, impl_, &cb.target, &cb.trait_ident, &cb.targs)
+            })
+            .flatten()
+            .filter(|p| settled.admits(p));
+        let ok = if is_wrapper {
+            plan.as_ref()
+                .is_some_and(|p| wrapper::registration_ok(impl_, p, 0, replacing_table))
+        } else {
+            reachable_side_bounds_ok(impl_, &cb.target, &cb.trait_ident, &cb.targs, replacing_table)
+        };
+        if ok {
+            out.push(cb);
+        }
+        let Some(plan) = plan else {
+            continue;
+        };
+        for ix in wrapper::reached(&plan) {
+            let e = &plan.entries[ix];
+            if !matches!(e.kind, wrapper::Kind::Node { .. }) {
+                continue;
+            }
+            if !seen.insert(key(&e.trait_ident, &e.ty, &e.targs)) {
+                continue;
+            }
+            if wrapper::registration_ok(impl_, &plan, ix, replacing_table) {
+                out.push(CyclicBound {
+                    binder: Vec::new(),
+                    target: e.ty.clone(),
+                    trait_ident: e.trait_ident.clone(),
+                    targs: e.targs.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Rule 2's cyclic-bound-sibling registrations for one impl (`X: T'` provable at the
 /// cross-edge call, gated per `(target, trait)` pair by F-C1's reachability check — finer
 /// grained than rule 1's whole-impl skip, since a different cyclic bound on the same impl can
@@ -2544,18 +2625,17 @@ fn build_shared_registrations(
     impl_: &ItemImpl,
     replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
     decycle: &Path,
+    settled: &wrapper::Settled,
 ) -> (TokenStream, Vec<GenericParam>) {
     let rt = quote!(#{name!("ranked_traits")});
     let mut out = TokenStream::new();
     let mut binders: Vec<GenericParam> = Vec::new();
-    for cb in cyclic_where_bounds(impl_, replacing_table) {
+    // Each target is past its gate already (a skipped bound does NOT declare its binder: it would be
+    // unused-but-harmless, but keeping the sets aligned avoids a stray param on a no-op fn).
+    for cb in rule2_targets(impl_, replacing_table, settled) {
         let Some((sibling_trait, _, _)) = replacing_table.get(&cb.trait_ident) else {
             continue;
         };
-        if !reachable_side_bounds_ok(impl_, &cb.target, &cb.trait_ident, &cb.targs, replacing_table) {
-            continue; // skipped bound => do NOT declare its binder (would be unused-but-harmless,
-                       // but keeping the sets aligned avoids a stray param on a no-op fn)
-        }
         binders.extend(cb.binder.iter().cloned());
         let target_unsized =
             bound_target_floor_is_unsized(&cb.target, &cb.trait_ident, &cb.targs, replacing_table);
@@ -2613,13 +2693,15 @@ fn build_cross_edge_generic_registrations(
     replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
     current_sig: &Signature,
     decycle: &Path,
+    settled: &wrapper::Settled,
 ) -> TokenStream {
     let mut out = TokenStream::new();
     if !method_is_generic(current_sig) {
         return out; // nothing in scope names a callee's method generics
     }
     let rt = quote!(#{name!("ranked_traits")});
-    for cb in cyclic_where_bounds(impl_, replacing_table) {
+    // Each target is past its gate already (`rule2_targets`).
+    for cb in rule2_targets(impl_, replacing_table, settled) {
         let Some((sibling_trait, _, _)) = replacing_table.get(&cb.trait_ident) else {
             continue;
         };
@@ -2640,10 +2722,6 @@ fn build_cross_edge_generic_registrations(
             })
             .collect();
         if generic_siblings.is_empty() {
-            continue; // don't pay for the reachability walk when nothing would be emitted
-        }
-        if !reachable_side_bounds_ok(impl_, &cb.target, &cb.trait_ident, &cb.targs, replacing_table)
-        {
             continue;
         }
         let target_unsized =
@@ -3656,6 +3734,11 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
         }
     }
 
+    // Calls through a wrapper whose parts are partly outside the cycle: plan every edge's ranked
+    // chain, decide the bridges, and drop each wrapper bound `peel` kept whose chain cannot be
+    // ranked (it then reads exactly as `peel` alone would have left it). See `wrapper`.
+    let settled = wrapper::settle(&traits, &mut replacing_table);
+
     // F2: a renamed trait's ORIGINAL name (`#[decycle] use super::T as R;`) still leaks into
     // `shadowing_module`'s scope via `use super::super::*;` (reaching whatever contains the
     // `#[decycle] mod`, where the un-renamed `T` lives) even though the LOCAL alias `R` is
@@ -3767,9 +3850,13 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                         #{emit_reentry_items(trait_, *rank_loc, &decycle_path)}
                     }
 
-                    #(for impl_ in impls) {
+                    #(for (impl_ix, impl_) in impls.iter().enumerate()) {
 
-                        #(let g = remove_cyclic_bounds(&impl_.generics, &replacing_table, false)) {
+                        #(let g = wrapper::floor_generics(
+                            impl_,
+                            &replacing_table,
+                            settled.ranked_floor(&trait_.ident, impl_ix),
+                        )) {
                             // Leaf: impl<'a, T> MyTraitRanked<'a, (), T> for ImplSelfTy
                             // (`unused_mut`: the floor only forwards/diverges, so a `mut` param is
                             // unused in this copy — self-allow for downstream `#![deny(warnings)]`.)
@@ -3777,13 +3864,16 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                             // with it instead of referencing a removed self type (E0412).
                             // Emitted twice: the floor at `()`, then its twin at the decoy rank
                             // (`decoy_rank`), identical but for the rank and the method bodies.
+                            // The generics: the impl's own, its where-clause without the cyclic
+                            // bounds; inline cyclic bounds ranked at the floor for a wrapper a
+                            // planned chain goes through (`wrapper::floor_generics`), in both.
                             #(for (rank, body) in [
                                 (floor_rank(), floor_body),
                                 (decoy_rank(), LeafBody::Decoy),
                             ]) {
                                 #(for a in &crate::extract_cfg_attrs(&impl_.attrs)) { #a }
                                 #[allow(unused_variables, unused_mut)]
-                                impl #{impl_.generics.impl_generics()}
+                                impl #{g.impl_generics()}
                                 #{name!("{}Ranked", &trait_.ident)}
                                 #{impl_.trait_.as_ref().unwrap().1.ty_generics().insert(*rank_loc, rank)}
                                 for #{&impl_.self_ty} #{&g.where_clause} {
@@ -3792,6 +3882,12 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                             }
                         }
 
+                    }
+
+                    // Bridges: the types outside the cycle that a wrapper's ranked chain reaches
+                    // (`wrapper::emit_bridge`). Generic over the rank, the decoy's included.
+                    #(for b in settled.bridges.iter().filter(|b| b.trait_ident == trait_.ident)) {
+                        #{wrapper::emit_bridge(trait_, *rank_loc, b)}
                     }
                 }
             }
@@ -3922,7 +4018,12 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                         if args.support_infinite_cycle {
                             let rule1_ok = rule1_registration_ok(trait_, impl_, &replacing_table);
                             let (shared_regs, binder_lts) =
-                                build_shared_registrations(impl_, &replacing_table, &decycle_path);
+                                build_shared_registrations(
+                                    impl_,
+                                    &replacing_table,
+                                    &decycle_path,
+                                    &settled,
+                                );
                             let register_once_fn =
                                 name!("__dcl_register_once_{}_{}", &trait_.ident, impl_ix);
                             // A preserved non-cyclic bound may still mention bare `Self`
@@ -4012,6 +4113,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                                             &replacing_table,
                                             sig,
                                             &decycle_path,
+                                            &settled,
                                         );
                                     // Open a registration scope FIRST and hold it for the rest
                                     // of the body: everything registered below is rolled back

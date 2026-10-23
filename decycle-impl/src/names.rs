@@ -121,6 +121,15 @@ pub(crate) fn bare_named_in<'ast>(
     v.found
 }
 
+/// Does `ty` name one of `names` by its bare name anywhere inside it ([`bare_named_in`])?
+///
+/// After the ranked engine's peel, the only bound on a routed trait whose target contains a cycle
+/// member without being headed by one is a wrapper the peel kept whole (`(B, Leaf): Loop`, the
+/// pair's impl taken over): it is an edge, like a bound on a member (`ranked::finalize::wrapper`).
+pub(crate) fn names_bare(ty: &Type, names: &HashSet<Ident>) -> bool {
+    !bare_named_in(ty, &|i| names.contains(i)).is_empty()
+}
+
 /// The idents of `generics`' type parameters — a bound on one targets the parameter, never a
 /// participant it may shadow.
 pub(crate) fn type_param_idents(generics: &Generics) -> HashSet<Ident> {

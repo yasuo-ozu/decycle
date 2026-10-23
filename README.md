@@ -384,13 +384,22 @@ is a compile error, `E0283` ("type annotations needed", on `…BaseRanked…<_>`
 - a supertrait: `trait Eval: Base`, whose ranked twin carries `Base`'s at the same rank;
 - a call by path, through the public trait: `crate::m::Base::base(self)`.
 
-The same holds for a call through an impl of the module whose ranked step cannot apply: a pair impl
+A call through an impl of the module is pinned by a bound on the whole wrapper: a pair impl
 `impl<X: Loop, Y: Loop> Loop for (X, Y)` called as `(B, crate::other::Leaf).step(n)`, with `Leaf`'s
-impl outside the module (a bound `(B, crate::other::Leaf): Loop` is read as the bounds of its parts,
-so it pins nothing). Call the pair by path, `<(B, Leaf) as crate::m::Loop>::step(&(B, Leaf), n)`,
-which needs `Leaf`'s impl in the module too, or the pair impl moved out of it. (Before 0.8 both
-shapes could compile, the first only on the next-generation trait solver, and then panic at the
-floor: "re-entry fn not registered", or "cycle limit reached" when bounded.)
+impl outside the module, under `where (B, crate::other::Leaf): Loop`. The engine keeps that bound
+whole next to its parts (`B: Loop`, `crate::other::Leaf: Loop`), and gives each type outside the
+cycle that the wrapper's impls reach (here `Leaf`; `Vec<U>` for a parameter `U`) a ranked impl
+forwarding every item to `Loop`, so the call, and the same call by path, work at any depth. Such an
+impl is written only where it cannot overlap another ranked impl; where it cannot be, the call
+through the wrapper is `E0283` (and by path `E0277`, on `Leaf: LoopRanked…`): a part named through
+a `use .. as` rename, a type alias or a relative path (`super::x::Leaf`), which may be a cycle
+member under another name; a part one of the module's impls may implement (`::std::vec::Vec<u8>`
+beside `impl<T: Loop> Loop for Vec<T>`); or one the module spells two ways (`Leaf` and
+`crate::other::Leaf`). Name the part by its path, once. A wrapper whose impl is outside the module
+has no ranked impl, so a call through it is reached by path only
+(`<(B, Leaf) as crate::m::Loop>::step(&(B, Leaf), n)`). (Before 0.8 the pair's call could compile,
+and then panic at the floor: "re-entry fn not registered", or "cycle limit reached" when bounded;
+the first shape did so only on the next-generation trait solver.)
 
 **At the floor (`support_infinite_cycle = false`).** No runtime machinery is emitted at all —
 this is the zero-cost mode. Recursion simply stops at the configured `recurse_level`, panicking
@@ -568,7 +577,11 @@ resolve in one pass.
     the ranked engine an `E0275` too, which may name its internal `…Ranked` traits. A wrapped
     bound is read as the obligations of its parts (a wrapper implements the trait when its type
     arguments do): `(B, crate::m::C): Eval` is the edge `B: Eval` plus the premise
-    `crate::m::C: Eval`, as written.
+    `crate::m::C: Eval`, as written. When the module implements the wrapper itself
+    (`impl<X: Eval, Y: Eval> Eval for (X, Y)`), the ranked engine also keeps the whole bound, so a
+    call through the wrapper works, and gives each type outside the cycle that the wrapper's impls
+    reach a ranked impl forwarding to the original trait (where that cannot overlap another impl;
+    see *Calls whose rank nothing pins*).
   - With `module`, the ranked engine reports such a cycle itself, in the module's terms, when it
     is certain: a bound (or a peeled part of one) that names one of the module's own structs,
     enums or unions by its path (`crate::m::C`, or `super::m::C` resolved against the module

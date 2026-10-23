@@ -2,14 +2,15 @@
 //!
 //! `self.base()` in an impl of another trait with no `Self: Base` bound, and a method call
 //! through an impl of the module whose step impl cannot apply (a pair impl with a part implemented
-//! outside the module), leave the rank to inference with only the floors left. The floor was then
-//! selected by elimination (on the next-generation trait solver for the first case, on every solver
-//! for the second) and the call panicked at run time. Each floor now has a decoy twin, so such a
-//! call is `E0283` (`tests/ui/ranked_floor_by_elimination*.rs`). The spellings below pin the rank
-//! and must keep compiling and running past the floor, on every solver: a `Self: Base` bound, a
-//! supertrait (`trait Eval: Base`), and the call by path, through the public trait. (For the pair,
-//! the public trait's impl needs every part implemented in the module, or the pair impl outside it:
-//! with the pair impl in the module and a part implemented outside, the call by path is `E0277`.)
+//! outside the module that gets no ranked impl forwarding to the trait), leave the rank to inference
+//! with only the floors left. The floor was then selected by elimination (on the next-generation
+//! trait solver for the first case, on every solver for the second) and the call panicked at run
+//! time. Each floor now has a decoy twin, so such a call is `E0283`
+//! (`tests/ui/ranked_floor_by_elimination*.rs`). The spellings below pin the rank and must keep
+//! compiling and running past the floor, on every solver: a `Self: Base` bound, a supertrait
+//! (`trait Eval: Base`), and the call by path, through the public trait. (A pair impl in the module
+//! with a part implemented outside it is called by method too, `tests/wrapper_bridge.rs`: the bound
+//! on the pair is kept whole, and the part gets a forwarding ranked impl.)
 
 #![allow(dead_code)]
 

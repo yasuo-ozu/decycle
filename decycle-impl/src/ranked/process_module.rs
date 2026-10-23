@@ -285,7 +285,8 @@ fn is_bare_trait_pred(pred: &WherePredicate, routed_traits: &HashSet<Ident>) -> 
 }
 
 /// Is the predicate's bounded type one the ranked chain descends — `Self`, one of the impl's own type
-/// parameters (`params`), or a type whose head is a participant? The same test as
+/// parameters (`params`), a type whose head is a participant, or a wrapper `peel` kept whole (one
+/// naming a participant by its bare name, [`crate::names::names_bare`])? The same test as
 /// `finalize::remove_cyclic_bounds`, which keys the head by its last segment.
 fn targets_participant(
     pred: &WherePredicate,
@@ -303,6 +304,7 @@ fn targets_participant(
         }
     }
     crate::helper::type_head_ident(&pt.bounded_ty).is_some_and(|h| heads.contains(&h))
+        || crate::names::names_bare(&pt.bounded_ty, heads)
 }
 
 /// The cyclic bounds of `im` for [`crate::premise_flow`]: each bound (`is_edge`) naming a routed
@@ -348,6 +350,48 @@ fn ranked_cycle_edges(
         }
     }
     out
+}
+
+/// Spell each bare name of `renamed` that a where-predicate's bounded type of `im` mentions as
+/// `self::Name` — unless one of `im`'s own generic parameters shadows it. See the caller.
+fn spell_renamed_relative(im: &mut ItemImpl, renamed: &HashSet<Ident>) {
+    use syn::visit_mut::VisitMut;
+    struct Spell<'a> {
+        renamed: &'a HashSet<Ident>,
+    }
+    impl VisitMut for Spell<'_> {
+        fn visit_type_path_mut(&mut self, tp: &mut TypePath) {
+            if tp.qself.is_none()
+                && tp.path.leading_colon.is_none()
+                && tp.path.segments.len() == 1
+                && self.renamed.contains(&tp.path.segments[0].ident)
+            {
+                let span = tp.path.segments[0].ident.span();
+                tp.path
+                    .segments
+                    .insert(0, PathSegment::from(Ident::new("self", span)));
+            }
+            syn::visit_mut::visit_type_path_mut(self, tp);
+        }
+    }
+    let shadowed: HashSet<Ident> = im
+        .generics
+        .params
+        .iter()
+        .filter_map(|p| match p {
+            GenericParam::Type(t) => Some(t.ident.clone()),
+            GenericParam::Const(c) => Some(c.ident.clone()),
+            GenericParam::Lifetime(_) => None,
+        })
+        .collect();
+    let renamed: HashSet<Ident> = renamed.difference(&shadowed).cloned().collect();
+    if let Some(wc) = &mut im.generics.where_clause {
+        for pred in wc.predicates.iter_mut() {
+            if let WherePredicate::Type(pt) = pred {
+                Spell { renamed: &renamed }.visit_type_mut(&mut pt.bounded_ty);
+            }
+        }
+    }
 }
 
 /// For each impl of one routed trait, which of its siblings' premises it may inherit — the
@@ -665,14 +709,58 @@ fn process_module_inner(
             adopts(im).then(|| type_head_ident(&im.self_ty)).flatten()
         })
         .collect();
+    // A type alias or a `use .. as` rename the module declares may be a cycle member under another
+    // name (`type L = B;`). In the bounds of the impls taken over, such a name is spelled `self::L`
+    // (the same item), which `nesting` then lifts through its relative-path alias: `peel` keeps no
+    // wrapper around it, and `finalize::wrapper` gives it no bridge, which would conflict with the
+    // member's own ranked impls (E0119). Read as the parts of a bound, it is what it always was.
+    let renamed: HashSet<Ident> = contents
+        .iter()
+        .flat_map(|item| match item {
+            Item::Type(t) => vec![t.ident.clone()],
+            Item::Use(u) => use_leaves(&u.tree)
+                .into_iter()
+                .filter_map(|leaf| match leaf {
+                    UseLeaf::Rename { local, .. } => Some(local.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        })
+        .filter(|ident| !cycle_self_heads.contains(ident))
+        .collect();
+    if !renamed.is_empty() {
+        for item in contents.iter_mut() {
+            if let Item::Impl(im) = item {
+                if adopts(im) {
+                    spell_renamed_relative(im, &renamed);
+                }
+            }
+        }
+    }
     // Peel wrapped cyclic bounds (`Vec<Box<Stmt>>: Tr` ⇒ `Stmt: Tr`) BEFORE validating, so the
-    // validation below only rejects heads that genuinely cannot be made rankable.
+    // validation below only rejects heads that genuinely cannot be made rankable. A wrapper an impl
+    // taken over implements is kept whole besides (`peel`'s module docs; `finalize::wrapper`).
+    let adopted: Vec<ItemImpl> = contents
+        .iter()
+        .filter_map(|item| match item {
+            Item::Impl(im) if adopts(im) => Some(im.clone()),
+            _ => None,
+        })
+        .collect();
+    let keep_whole = |ty: &Type, bound: &TypeParamBound| {
+        crate::ranked::finalize::wrapper::shape_matches(&adopted, ty, bound)
+    };
     for item in contents.iter_mut() {
         if let Item::Impl(im) = item {
             let impl_type_params = crate::names::type_param_idents(&im.generics);
-            crate::ranked::peel::peel_cyclic_bounds(im, &all_traits, &cycle_self_heads, &|ty| {
-                is_local_impl_bound_target(ty, &impl_type_params)
-            });
+            crate::ranked::peel::peel_cyclic_bounds(
+                im,
+                &all_traits,
+                &cycle_self_heads,
+                &|ty| is_local_impl_bound_target(ty, &impl_type_params),
+                &keep_whole,
+            );
         }
     }
     for item in contents.iter() {

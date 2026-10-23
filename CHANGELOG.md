@@ -228,7 +228,8 @@ as **0.8.0**, not as a 0.7 patch.
   of the ranked twin to inference: one on a type the impl has no bound for (`self.base()` in an impl
   of another trait, with no `Self: Base`), or one through an impl of the module whose step impl
   cannot apply (a pair impl `impl<X: Loop, Y: Loop> Loop for (X, Y)` called as
-  `(B, crate::other::Leaf).step(n)`, with `Leaf`'s impl outside the module). Where the step impl
+  `(B, Foreign).step(n)`, with `Foreign`'s impl outside the module and no ranked impl forwarding to
+  it: see the next entry for when it gets one). Where the step impl
   (`XxxRanked<(R,)>`) was ruled out, the floor (`XxxRanked<()>`) was the one impl left and was
   selected, though no frame had registered anything for it: the call compiled and panicked at run
   time, "re-entry fn not registered" (or "cycle limit reached" with
@@ -245,6 +246,31 @@ as **0.8.0**, not as a 0.7 patch.
   them on the next one, run
   `cargo +nightly test --test trybuild -- --ignored ui_compile_fail trybuild=ranked_floor_by_elimination`
   (it passes with the same snapshots).
+- **Ranked engine: a call through a wrapper whose parts are partly outside the cycle compiles and
+  runs.** `impl Loop for A where (B, crate::other::Leaf): Loop`, with the pair's impl in the module
+  (`impl<X: Loop, Y: Loop> Loop for (X, Y)`) and `Leaf: Loop` implemented outside it, could not call
+  through the pair: `(B, crate::other::Leaf).step(n)` panicked on the first call ("re-entry fn not
+  registered before the floor was reached"), and with the floor's decoy twin (above) it is `E0283`;
+  the same call by the trait path was `E0277` on `Leaf: LoopRanked…`. The bound was replaced by its
+  parts, so nothing fixed the rank of the call, and the pair's ranked step demanded
+  `Leaf: LoopRanked<R>`, which a type outside the cycle never had. The engine now keeps the
+  outermost wrapper the module implements next to its parts, as an edge, registers the floors of
+  the chain through it, and gives every type outside the cycle the chain reaches (here `Leaf`;
+  `Vec<U>` for a parameter `U`) a ranked impl that forwards each method, associated type and const
+  to the original trait — for a ranked supertrait too. The wrapper's floor (and its decoy) ranks its
+  inline bounds (`X: LoopRanked<()>`) instead of demanding the original trait, which closed an
+  `E0275` cycle through the members' delegating impls; with it, a cycle through a participating
+  container (`Wrap<Stmt>: Tr` with `impl<T: Tr> Tr for Wrap<T>`, `tests/nested_participant_cycle.rs`)
+  no longer overflows. No such impl is written where it could overlap another ranked impl: for a
+  part named through a `use .. as` rename, a type alias or a relative path, which may be a cycle
+  member under another name (such a name is now spelled `self::X` in the bounds of the impls taken
+  over, which reads the same); for a part an impl of the module may implement
+  (`::std::vec::Vec<u8>` beside `impl<T: Loop> Loop for Vec<T>`, which is planned through instead
+  when spelled `Vec<u8>`), or a path to a member (`crate::m::C`); or for a part the module spells
+  two ways (`Leaf` and `crate::other::Leaf`). There the bound reads as its parts, as before, and the
+  call through the wrapper stays `E0283` (`tests/ui/ranked_floor_by_elimination_tuple.rs`, which
+  pinned the call above and now pins a renamed part). A wrapper whose impl is outside the module is
+  still reached by path only (`tests/ui/wrapper_outside_method.rs`).
 - **The ranked engine's expansion is deterministic.** It emitted its per-trait items (the ranked
   twins and re-entry items, the dummy shadows, the inductive and the Final impls) in the iteration
   order of a `HashMap`, which `std` seeds per process: a module with several `#[decycle]` traits

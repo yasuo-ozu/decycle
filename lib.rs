@@ -119,7 +119,11 @@ pub use decycle_impl::structural;
 /// overflow (`E0275`); with the ranked engine an `E0275` too, which may name its internal `…Ranked`
 /// traits (but see the last point below). A wrapped bound is read as the obligations of its parts
 /// (a wrapper implements the trait when its type arguments do): `(B, crate::m::C): Eval` is the
-/// edge `B: Eval` and the premise `crate::m::C: Eval`, as written. An item that
+/// edge `B: Eval` and the premise `crate::m::C: Eval`, as written. When the module implements the
+/// wrapper itself (`impl<X: Eval, Y: Eval> Eval for (X, Y)`), the ranked engine also keeps the whole
+/// bound, so a call through the wrapper works, and gives each type outside the cycle that the
+/// wrapper's impls reach a ranked impl forwarding to the original trait (only where that cannot
+/// overlap another impl; otherwise the bound reads as its parts alone). An item that
 /// [`#[announce]`](https://docs.rs/announce) re-reads elsewhere, on the other hand, must spell every
 /// path absolutely. `module = path` gives the module's own absolute path — starting with `crate`
 /// (or `$crate` from a `macro_rules!`, or a leading `::` through `extern crate self as ..`),

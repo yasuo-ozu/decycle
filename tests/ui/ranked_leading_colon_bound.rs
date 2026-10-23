@@ -1,6 +1,6 @@
-//! A leading `::` is a path, so a bound `A: ::Ca` names the item `::Ca` itself, the opt-out, and is left as
-//! written, as in the structural engine: `::Ca` is a crate in edition 2018 on, and rustc says so.
-//! The ranked engine used to read it as the bare `Ca`, and rewrite it into the cycle.
+//! A leading `::` is a path, so a bound `A: ::Ca` names the item `::Ca` itself, the opt-out,
+//! left as written as in the structural engine (`::Ca` is a crate in edition 2018 on, as rustc
+//! says). The ranked engine used to read it as the bare `Ca`, and rewrite it into the cycle.
 use decycle::decycle;
 
 #[decycle]

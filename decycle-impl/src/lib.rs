@@ -147,8 +147,8 @@ pub(crate) fn randomize_impl_generics(
 /// lowers the crate's MSRV.)
 ///
 /// Arguments are not inspected. Everything that *acts* on the marker goes through
-/// [`is_decycle_attribute`], which rejects them; this bare predicate exists for the read-only
-/// [`analysis`] module (and `growth`), whose whole contract is to inspect a module without
+/// `is_decycle_attribute`, which rejects them; this bare predicate exists for the read-only
+/// `analysis` module (and `growth`), whose whole contract is to inspect a module without
 /// diagnosing it — its unit tests run it outside a `#[proc_macro_error]` entry point, where
 /// `abort!` could only panic. `decycle-macro` uses it for the attribute on the item itself.
 #[doc(hidden)]

@@ -132,12 +132,13 @@ fn expand(
     };
 
     // Only impls of traits annotated `#[decycle]` in this module participate — collect their idents
-    // and strip the `#[decycle]` attrs from the trait/use items. A marked trait alias or glob `use`,
-    // and a `#[decycle]` in a nested module, are rejected as the ranked engine rejects them.
+    // and strip the `#[decycle]` attrs from the trait/use items. A marked trait alias or glob
+    // `use`, and a `#[decycle]` in a nested module, are rejected as the ranked engine rejects them.
     let decycle_traits = collect_decycle_traits(brace_items, &decycle_crate);
     if brace_items.iter().any(|item| matches!(item, Item::Mod(_))) {
-        // On that abort the module is emitted as the ranked engine leaves it: its own markers taken,
-        // a nested module as written (which then expands on its own), not the caller's fallback.
+        // On that abort the module is emitted as the ranked engine leaves it: its own markers
+        // taken, a nested module as written (which then expands on its own), not the caller's
+        // fallback.
         proc_macro_error::set_dummy(as_written(module.clone(), scope));
         for item in module.content.iter().flat_map(|(_, items)| items) {
             if let Item::Mod(nested) = item {
@@ -409,44 +410,24 @@ fn is_cycle_edge(
 }
 
 /// Collect the idents of traits annotated `#[decycle]` (either a `#[decycle] trait Foo` or a
-/// `#[decycle] use path::Foo`) and strip the `#[decycle]` attribute from those items. A marked trait
-/// alias or glob `use` is rejected ([`crate::markers`]).
+/// `#[decycle] use path::Foo`) and strip the `#[decycle]` attributes from those items
+/// ([`crate::markers::take_marked`], which rejects a marked trait alias or glob `use`).
 fn collect_decycle_traits(items: &mut [Item], decycle_crate: &Ident) -> HashSet<String> {
     let mut traits = HashSet::new();
-    for item in items.iter_mut() {
-        match item {
-            Item::Trait(t) => {
-                if take_decycle_attr(&mut t.attrs, decycle_crate) {
-                    traits.insert(t.ident.to_string());
-                }
+    for marked in crate::markers::take_marked(items, decycle_crate) {
+        match marked {
+            crate::markers::Marked::Trait(t) => {
+                traits.insert(t.ident.to_string());
             }
-            Item::TraitAlias(a) => {
-                if take_decycle_attr(&mut a.attrs, decycle_crate) {
-                    crate::markers::reject_trait_alias(a)
-                }
+            crate::markers::Marked::Use(u, names) => {
+                traits.extend(names.iter().map(|i| i.to_string()));
+                // This engine reads no trait through the `use`: its name is all it takes, and the
+                // module's impls spell the trait by it. Nothing else may name the import (a
+                // stand-in that is only the real trait's copy, reached under a rename), so it
+                // would be reported unused.
+                u.attrs.push(parse_quote!(#[allow(unused_imports)]));
             }
-            Item::Use(u) => {
-                if take_decycle_attr(&mut u.attrs, decycle_crate) {
-                    traits.extend(
-                        crate::markers::routed_use_names(&u.tree)
-                            .into_iter()
-                            .map(|i| i.to_string()),
-                    );
-                    // This engine reads no trait through the `use`: its name is all it takes, and
-                    // the module's impls spell the trait by it. Nothing else may name the import
-                    // (a stand-in that is only the real trait's copy, reached under a rename), so
-                    // it would be reported unused.
-                    u.attrs.push(parse_quote!(#[allow(unused_imports)]));
-                }
-            }
-            _ => {}
         }
     }
     traits
-}
-
-fn take_decycle_attr(attrs: &mut Vec<Attribute>, decycle_crate: &Ident) -> bool {
-    let before = attrs.len();
-    attrs.retain(|a| !crate::is_decycle_attribute(a, decycle_crate));
-    attrs.len() != before
 }

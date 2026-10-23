@@ -190,6 +190,15 @@ as **0.8.0**, not as a 0.7 patch.
 
 ### Fixed
 
+- **The ranked engine takes every `#[decycle]` marker of an item, as the structural engine does.**
+  An item marked twice (`#[decycle] #[decycle] trait Tr`, as a macro that marks the items it emits
+  can leave one the user marked already) is marked once. The ranked engine took only the first
+  marker and re-emitted the second, which then failed as an unknown attribute (``cannot find
+  attribute `decycle` in this scope``; on a `use`, `place it inside module annotated with
+  #[decycle]`), or, with `decycle` imported into the module, announced the trait as if it stood
+  outside any `#[decycle]` module. Each marker is checked, the second one too: an argument list on
+  it is the error a first one gets (`#[decycle] takes no arguments on an item inside a #[decycle]
+  module`). A marker inside `#[cfg_attr(..)]` is still not read as one, by either engine.
 - **A cycle that alternates between traits shares its premises**, in both engines (`Expr: Eval`
   needing `Term: Size`, which needs `Expr: Eval`; three traits or more alike). Premises were shared
   among the impls of one trait only, so `Expr`, the cycle's only `Eval` impl, never received

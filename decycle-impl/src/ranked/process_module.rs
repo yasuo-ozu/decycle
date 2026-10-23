@@ -42,28 +42,11 @@ fn check_no_deep_super_paths(contents: &[Item]) {
     }
 }
 
-fn process_trait_path(item: &Item) -> Vec<Path> {
-    match item {
-        Item::Trait(ItemTrait { ident, .. }) => {
-            vec![crate::ident_to_path(ident)]
-        }
-        Item::TraitAlias(item_trait_alias) => crate::markers::reject_trait_alias(item_trait_alias),
-        Item::Use(ItemUse { tree, .. }) => crate::markers::routed_use_names(tree)
-            .into_iter()
-            .map(crate::ident_to_path)
-            .collect(),
-        _ => unreachable!(),
-    }
-}
-
 /// `(original_ident, local_alias)` for every `UseRename` (`use path::T as R;`) reachable
 /// from a `#[decycle] use` item — see `finalize::TraitRename`/L-C1. A plain `UseName`
 /// (`use path::T;`) needs no entry: the local name already matches the original.
-fn collect_trait_renames(item: &Item) -> Vec<(Ident, Ident)> {
-    let Item::Use(ItemUse { tree, .. }) = item else {
-        return Vec::new();
-    };
-    use_leaves(tree)
+fn collect_trait_renames(item: &ItemUse) -> Vec<(Ident, Ident)> {
+    use_leaves(&item.tree)
         .into_iter()
         .filter_map(|leaf| match leaf {
             UseLeaf::Rename { original, local } => Some((original.clone(), local.clone())),
@@ -544,37 +527,16 @@ fn process_module_inner(
     // The decycle crate name as passed to the macro (leading segment of `decycle = …`, default
     // `decycle`) — used to match `#[<crate>::decycle]` on inner items without reading the manifest.
     let decycle_crate = &decycle.segments.first().unwrap().ident;
-    let (traits, working_list, renames): (Vec<_>, Vec<_>, Vec<_>) = contents.iter_mut().fold(
-        Default::default(),
-        |(mut traits, mut working_list, mut renames), item| {
-            match item {
-                Item::Trait(ItemTrait { attrs, .. })
-                | Item::TraitAlias(ItemTraitAlias { attrs, .. })
-                | Item::Use(ItemUse { attrs, .. }) => {
-                    // detect and remove #[decycle] attribute
-                    let mut old_attrs = std::mem::take(attrs).into_iter();
-                    let mut flag = false;
-                    attrs.extend((&mut old_attrs).take_while(|attr| {
-                        if crate::is_decycle_attribute(attr, decycle_crate) {
-                            flag = true;
-                        }
-                        !flag
-                    }));
-                    attrs.extend(old_attrs);
-                    if flag {
-                        if let Item::Trait(item_trait) = item {
-                            traits.push(item_trait.clone());
-                        } else {
-                            working_list.extend(process_trait_path(item));
-                            renames.extend(collect_trait_renames(item));
-                        }
-                    }
-                }
-                _ => (),
+    let (mut traits, mut working_list, mut renames) = (Vec::new(), Vec::new(), Vec::new());
+    for marked in crate::markers::take_marked(contents, decycle_crate) {
+        match marked {
+            crate::markers::Marked::Trait(item_trait) => traits.push(item_trait.clone()),
+            crate::markers::Marked::Use(item_use, names) => {
+                working_list.extend(names.iter().map(crate::ident_to_path));
+                renames.extend(collect_trait_renames(item_use));
             }
-            (traits, working_list, renames)
-        },
-    );
+        }
+    }
     let all_traits: HashSet<Ident> = working_list
         .iter()
         .filter_map(|path| path.segments.last().map(|seg| seg.ident.clone()))

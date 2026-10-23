@@ -32,116 +32,30 @@ fn receiver_cast(r: &syn::Receiver, target: &Type, nonce: u64) -> TokenStream {
 /// Replace every `Self` type occurrence in `ty` with `replacement`. Descends into fn-pointer
 /// (`fn(&Self)`), trait-object (`dyn Fn(&Self)`) and `impl Trait` (`impl Fn(&Self)`) types too — a
 /// `Self` buried in a higher-order argument must be cast into `replacement`-space like any other.
+///
+/// It reaches the types of a type (qualified-path selves, `<..>` and `Fn(..)` type arguments, fn
+/// pointer arguments, the bounds of a trait object or `impl Trait`), and nothing else: not an
+/// associated-type binding or constraint (`Tr<Out = Self>`), not an expression (an array length,
+/// a const argument), and not a macro.
 pub(crate) fn subst_self(ty: &Type, replacement: &Type) -> Type {
-    match ty {
-        Type::Path(tp) if tp.qself.is_none() && tp.path.is_ident("Self") => replacement.clone(),
-        Type::Path(tp) => {
-            let mut tp = tp.clone();
-            // A `Self` in qself position (`<Self as Tr>::Out`) is substituted too. (Callers resolve
-            // `Self`-rooted projections via `normalize_projections` FIRST, so by the time a type
-            // reaches this substitution no unresolvable projection remains — this arm is
-            // belt-and-braces for the resolvable leftovers.)
-            if let Some(q) = &mut tp.qself {
-                *q.ty = subst_self(&q.ty, replacement);
-            }
-            for seg in tp.path.segments.iter_mut() {
-                subst_self_in_args(&mut seg.arguments, replacement);
-            }
-            Type::Path(tp)
-        }
-        Type::Reference(r) => {
-            let mut r = r.clone();
-            r.elem = Box::new(subst_self(&r.elem, replacement));
-            Type::Reference(r)
-        }
-        Type::Ptr(p) => {
-            let mut p = p.clone();
-            p.elem = Box::new(subst_self(&p.elem, replacement));
-            Type::Ptr(p)
-        }
-        Type::Tuple(t) => {
-            let mut t = t.clone();
-            t.elems = t.elems.iter().map(|e| subst_self(e, replacement)).collect();
-            Type::Tuple(t)
-        }
-        Type::Array(a) => {
-            let mut a = a.clone();
-            a.elem = Box::new(subst_self(&a.elem, replacement));
-            Type::Array(a)
-        }
-        Type::Slice(s) => {
-            let mut s = s.clone();
-            s.elem = Box::new(subst_self(&s.elem, replacement));
-            Type::Slice(s)
-        }
-        Type::Paren(p) => {
-            let mut p = p.clone();
-            p.elem = Box::new(subst_self(&p.elem, replacement));
-            Type::Paren(p)
-        }
-        Type::Group(g) => {
-            let mut g = g.clone();
-            g.elem = Box::new(subst_self(&g.elem, replacement));
-            Type::Group(g)
-        }
-        Type::BareFn(bf) => {
-            let mut bf = bf.clone();
-            for input in bf.inputs.iter_mut() {
-                input.ty = subst_self(&input.ty, replacement);
-            }
-            if let syn::ReturnType::Type(_, t) = &mut bf.output {
-                **t = subst_self(t, replacement);
-            }
-            Type::BareFn(bf)
-        }
-        Type::TraitObject(to) => {
-            let mut to = to.clone();
-            subst_self_in_bounds(&mut to.bounds, replacement);
-            Type::TraitObject(to)
-        }
-        Type::ImplTrait(it) => {
-            let mut it = it.clone();
-            subst_self_in_bounds(&mut it.bounds, replacement);
-            Type::ImplTrait(it)
-        }
-        other => other.clone(),
-    }
-}
-
-/// Substitute `Self` inside a path segment's arguments — both `<..>` and `Fn(..)`-sugar forms.
-fn subst_self_in_args(args: &mut PathArguments, replacement: &Type) {
-    match args {
-        PathArguments::AngleBracketed(ab) => {
-            for a in ab.args.iter_mut() {
-                if let GenericArgument::Type(t) = a {
-                    *t = subst_self(t, replacement);
+    struct SubstSelf<'a>(&'a Type);
+    impl syn::visit_mut::VisitMut for SubstSelf<'_> {
+        fn visit_type_mut(&mut self, ty: &mut Type) {
+            match ty {
+                Type::Path(tp) if tp.qself.is_none() && tp.path.is_ident("Self") => {
+                    *ty = self.0.clone()
                 }
+                _ => syn::visit_mut::visit_type_mut(self, ty),
             }
         }
-        PathArguments::Parenthesized(p) => {
-            for t in p.inputs.iter_mut() {
-                *t = subst_self(t, replacement);
-            }
-            if let syn::ReturnType::Type(_, t) = &mut p.output {
-                **t = subst_self(t, replacement);
-            }
-        }
-        PathArguments::None => {}
+        fn visit_assoc_type_mut(&mut self, _: &mut syn::AssocType) {}
+        fn visit_assoc_const_mut(&mut self, _: &mut syn::AssocConst) {}
+        fn visit_constraint_mut(&mut self, _: &mut syn::Constraint) {}
+        fn visit_expr_mut(&mut self, _: &mut syn::Expr) {}
     }
-}
-
-/// Substitute `Self` inside the trait bounds of a `dyn`/`impl Trait` type.
-fn subst_self_in_bounds(
-    bounds: &mut syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
-    replacement: &Type,
-) {
-    for b in bounds.iter_mut() {
-        if let syn::TypeParamBound::Trait(tb) = b {
-            for seg in tb.path.segments.iter_mut() {
-                subst_self_in_args(&mut seg.arguments, replacement);
-            }
-        }
-    }
+    let mut ty = ty.clone();
+    syn::visit_mut::VisitMut::visit_type_mut(&mut SubstSelf(replacement), &mut ty);
+    ty
 }
 
 /// A `::<T, N>` turbofish for a method's own type/const generics (lifetimes inferred), or empty.

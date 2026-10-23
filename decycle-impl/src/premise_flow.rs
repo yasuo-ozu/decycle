@@ -56,13 +56,14 @@ use syn::punctuated::Punctuated;
 use syn::visit::Visit;
 use syn::visit_mut::VisitMut;
 use syn::{
-    BoundLifetimes, Expr, GenericArgument, GenericParam, ItemImpl, Lifetime, LifetimeParam, Path,
-    PathArguments, PredicateLifetime, PredicateType, Token, TraitBound, TraitBoundModifier, Type,
+    BoundLifetimes, GenericArgument, GenericParam, ItemImpl, Lifetime, LifetimeParam, Path,
+    PathArguments, PredicateLifetime, PredicateType, TraitBound, TraitBoundModifier, Type,
     TypeParamBound, TypePath, WherePredicate,
 };
-use template_quote::{quote, ToTokens};
+use template_quote::quote;
 
 use crate::names::{bare_ident, local_type_head_ident, strip_parens};
+use crate::unify::{parenthesize, spelling, Apply, Matcher, Names, Params, Reading, Subst};
 
 /// One cyclic bound of an impl, as this pass follows it: the bound `trait_path` on `target`, a cycle
 /// member's type. A wrapped bound (`Box<Term<S>>: Size<T>`) is followed to the member inside it
@@ -133,12 +134,14 @@ pub(crate) enum Respell {
     /// or added, `Self` spelled as the reached impl's self type (the structural engine).
     Any,
     /// Only as the ranked engine's re-entry registration check (`reachable_side_bounds_ok`) spells
-    /// it. That check maps a reached impl's premises back into the terms of the impl reaching it by
-    /// substituting type parameters (in the bounded type and in the bound's `<..>` type arguments)
-    /// and compares them by spelling; a premise it would spell differently from this pass would not
-    /// be recognised there, and the registration of an impl that registered before would now be
-    /// skipped. So a premise with a trait bound is only shared when the two spellings agree under
-    /// any substitution: no lifetime but `'static` and no `for<..>`, no const parameter, no
+    /// it. That check maps a reached impl's premises back into the terms of the impl reaching it
+    /// through the same matcher, read as [`Reading::Registration`]: it substitutes type parameters
+    /// only (in the bounded type and in the bound's `<..>` type arguments) and compares the result
+    /// by spelling, where this pass maps lifetimes and const parameters too and respells what it
+    /// substitutes ([`Reading::Premises`]). A premise it would spell differently from this pass
+    /// would not be recognised there, and the registration of an impl that registered before would
+    /// now be skipped. So a premise with a trait bound is only shared when the two spellings agree
+    /// under any substitution: no lifetime but `'static` and no `for<..>`, no const parameter, no
     /// projection on a parameter (`T::Out`), no parameter in `Fn(..)` sugar, an associated-item
     /// constraint or a const argument of the bound; and a premise naming `Self` is not shared at
     /// all (the check reads `Self` as written: `Self: Debug` would not recognise `Term<R>: Debug`).
@@ -335,10 +338,6 @@ impl Premises {
     }
 }
 
-fn spelling(p: &impl ToTokens) -> String {
-    p.to_token_stream().to_string()
-}
-
 /// A premise's spelling, up to the names of the lifetimes its `for<..>` binders bind:
 /// `for<'x> &'x T: Debug` and `for<'y> &'y T: Debug` are one premise.
 fn key(p: &WherePredicate) -> String {
@@ -377,156 +376,6 @@ fn key(p: &WherePredicate) -> String {
     let mut p = p.clone();
     RenameLifetimes(&renames).visit_where_predicate_mut(&mut p);
     spelling(&p)
-}
-
-/// An impl's generic parameters: `names` its type and const parameters, `lifetimes` its lifetime
-/// parameters (spelled `'a`).
-struct Params {
-    names: HashSet<String>,
-    consts: HashSet<String>,
-    lifetimes: HashSet<String>,
-}
-
-impl Params {
-    fn of(im: &ItemImpl) -> Self {
-        let mut p = Params {
-            names: HashSet::new(),
-            consts: HashSet::new(),
-            lifetimes: HashSet::new(),
-        };
-        for param in &im.generics.params {
-            match param {
-                GenericParam::Type(t) => {
-                    p.names.insert(t.ident.to_string());
-                }
-                GenericParam::Const(c) => {
-                    p.names.insert(c.ident.to_string());
-                    p.consts.insert(c.ident.to_string());
-                }
-                GenericParam::Lifetime(l) => {
-                    p.lifetimes.insert(l.lifetime.to_string());
-                }
-            }
-        }
-        p
-    }
-
-    /// The parameter a type spelled as one bare name is, if it is one.
-    fn type_var(&self, ty: &Type) -> Option<String> {
-        let Type::Path(TypePath { qself: None, path }) = ty else {
-            return None;
-        };
-        let ident = path.get_ident()?.to_string();
-        self.names.contains(&ident).then_some(ident)
-    }
-
-    fn mentioned_by(&self, names: &Names) -> bool {
-        names.idents.iter().any(|i| self.names.contains(i))
-            || names.lifetimes.iter().any(|l| self.lifetimes.contains(l))
-    }
-}
-
-/// What a parameter of the reached impl stands for in the impl reaching it.
-#[derive(Clone)]
-enum Value {
-    Type(Type),
-    Const(Expr),
-    Lifetime(Lifetime),
-}
-
-impl Value {
-    fn render(&self) -> String {
-        match self {
-            Value::Type(t) => spelling(t),
-            Value::Const(e) => spelling(e),
-            Value::Lifetime(l) => spelling(l),
-        }
-    }
-}
-
-/// A mapping from a reached impl's parameters (by name; a lifetime as `'a`) to what they stand for.
-type Subst = HashMap<String, Value>;
-
-/// The names a syntax node mentions.
-#[derive(Default)]
-struct Names {
-    /// Every ident (types, consts, path segments, traits) but a lifetime's.
-    idents: HashSet<String>,
-    /// Every lifetime, `'a`.
-    lifetimes: HashSet<String>,
-    /// The lifetimes a `for<..>` inside the node binds.
-    bound: HashSet<String>,
-    /// The node holds tokens this visitor cannot see into (a macro, verbatim tokens).
-    opaque: bool,
-}
-
-impl Names {
-    fn of_predicate(p: &WherePredicate) -> Self {
-        let mut n = Names::default();
-        n.visit_where_predicate(p);
-        n
-    }
-    fn of_type(t: &Type) -> Self {
-        let mut n = Names::default();
-        n.visit_type(t);
-        n
-    }
-    fn of_expr(e: &Expr) -> Self {
-        let mut n = Names::default();
-        n.visit_expr(e);
-        n
-    }
-    fn of_value(v: &Value) -> Self {
-        match v {
-            Value::Type(t) => Names::of_type(t),
-            Value::Const(e) => Names::of_expr(e),
-            Value::Lifetime(l) => {
-                let mut n = Names::default();
-                n.visit_lifetime(l);
-                n
-            }
-        }
-    }
-}
-
-impl Visit<'_> for Names {
-    fn visit_ident(&mut self, i: &proc_macro2::Ident) {
-        self.idents.insert(i.to_string());
-    }
-    // Not recursing: the default would report the lifetime's ident as an ident.
-    fn visit_lifetime(&mut self, lt: &Lifetime) {
-        self.lifetimes.insert(lt.to_string());
-    }
-    fn visit_bound_lifetimes(&mut self, b: &BoundLifetimes) {
-        for p in &b.lifetimes {
-            if let GenericParam::Lifetime(l) = p {
-                self.bound.insert(l.lifetime.to_string());
-            }
-        }
-        syn::visit::visit_bound_lifetimes(self, b);
-    }
-    fn visit_macro(&mut self, m: &syn::Macro) {
-        self.opaque = true;
-        syn::visit::visit_macro(self, m);
-    }
-    fn visit_type(&mut self, t: &Type) {
-        if let Type::Verbatim(_) = t {
-            self.opaque = true;
-        }
-        syn::visit::visit_type(self, t);
-    }
-    fn visit_expr(&mut self, e: &Expr) {
-        if let Expr::Verbatim(_) = e {
-            self.opaque = true;
-        }
-        syn::visit::visit_expr(self, e);
-    }
-    fn visit_type_param_bound(&mut self, b: &TypeParamBound) {
-        if let TypeParamBound::Verbatim(_) = b {
-            self.opaque = true;
-        }
-        syn::visit::visit_type_param_bound(self, b);
-    }
 }
 
 // ----- by name ------------------------------------------------------------------------------
@@ -831,18 +680,6 @@ fn resolve_self(mut pred: WherePredicate, self_ty: &Type) -> Option<WherePredica
     (!Names::of_predicate(&pred).idents.contains("Self")).then_some(pred)
 }
 
-/// `ty`, parenthesized if it could not otherwise stand where a type parameter stood (`&'a T` with
-/// `T` = `dyn A + B`).
-fn parenthesize(ty: Type) -> Type {
-    match ty {
-        Type::TraitObject(_) | Type::ImplTrait(_) => Type::Paren(syn::TypeParen {
-            paren_token: Default::default(),
-            elem: Box::new(ty),
-        }),
-        other => other,
-    }
-}
-
 /// Would the ranked engine's registration check spell `q` (a premise of the impl with parameters
 /// `params`) as [`translate`] does, mapped on through any substitution of type parameters? See
 /// [`Respell::TypeParams`].
@@ -912,11 +749,7 @@ fn spelled_alike_by_ranked(q: &WherePredicate, params: &Params) -> bool {
 /// type the edge's target and its trait the edge's trait, if there is one. `receiver` are the
 /// parameters of the impl the edge belongs to.
 fn match_header(j: &ItemImpl, vars: &Params, edge: &CycleEdge, receiver: &Params) -> Option<Subst> {
-    let mut m = Matcher {
-        vars,
-        receiver,
-        subst: Subst::new(),
-    };
+    let mut m = Matcher::new(vars, receiver, Reading::Premises);
     let j_trait = &j.trait_.as_ref()?.1;
     (m.args(
         last_args_of_type(&j.self_ty)?,
@@ -932,214 +765,6 @@ fn last_args_of_type(ty: &Type) -> Option<&PathArguments> {
     match strip_parens(ty) {
         Type::Path(TypePath { qself: None, path }) => Some(&path.segments.last()?.arguments),
         _ => None,
-    }
-}
-
-/// First-order matching of a pattern (the reached impl's header, its parameters the variables)
-/// against the bound that reaches it (written in the receiving impl's terms). Fails on anything it
-/// cannot establish syntactically, which then reads as "this impl is not reached".
-struct Matcher<'a> {
-    vars: &'a Params,
-    receiver: &'a Params,
-    subst: Subst,
-}
-
-impl Matcher<'_> {
-    fn bind(&mut self, var: String, value: Value) -> bool {
-        match self.subst.get(&var) {
-            Some(old) => old.render() == value.render(),
-            None => {
-                self.subst.insert(var, value);
-                true
-            }
-        }
-    }
-
-    fn ty(&mut self, p: &Type, t: &Type) -> bool {
-        let (p, t) = (strip_parens(p), strip_parens(t));
-        if let Some(var) = self.vars.type_var(p) {
-            return self.bind(var, Value::Type(t.clone()));
-        }
-        match (p, t) {
-            (Type::Path(pp), Type::Path(tp)) if pp.qself.is_none() && tp.qself.is_none() => {
-                self.path(&pp.path, &tp.path)
-            }
-            (Type::Reference(pr), Type::Reference(tr)) => {
-                pr.mutability.is_some() == tr.mutability.is_some()
-                    && self.opt_lifetime(pr.lifetime.as_ref(), tr.lifetime.as_ref())
-                    && self.ty(&pr.elem, &tr.elem)
-            }
-            (Type::Ptr(pp), Type::Ptr(tp)) => {
-                pp.mutability.is_some() == tp.mutability.is_some() && self.ty(&pp.elem, &tp.elem)
-            }
-            (Type::Slice(ps), Type::Slice(ts)) => self.ty(&ps.elem, &ts.elem),
-            (Type::Array(pa), Type::Array(ta)) => {
-                self.ty(&pa.elem, &ta.elem) && self.expr(&pa.len, &ta.len)
-            }
-            (Type::Tuple(pt), Type::Tuple(tt)) => {
-                pt.elems.len() == tt.elems.len()
-                    && pt.elems.iter().zip(&tt.elems).all(|(a, b)| self.ty(a, b))
-            }
-            _ => self.opaque(
-                &Names::of_type(p),
-                &Names::of_type(t),
-                spelling(p) == spelling(t),
-            ),
-        }
-    }
-
-    fn path(&mut self, p: &Path, t: &Path) -> bool {
-        // `self::Foo` is `Foo`.
-        let (mut p, mut t) = (p.clone(), t.clone());
-        crate::names::strip_leading_self(&mut p);
-        crate::names::strip_leading_self(&mut t);
-        if p.leading_colon.is_some() != t.leading_colon.is_some()
-            || p.segments.len() != t.segments.len()
-        {
-            return false;
-        }
-        // A variable that is not the whole type (`T::Out`) cannot be matched by its shape.
-        if p.segments
-            .first()
-            .is_some_and(|s| self.vars.names.contains(&s.ident.to_string()))
-        {
-            return false;
-        }
-        // The pattern names a concrete item here; a target that is a parameter of the receiving impl
-        // spelled the same is something else.
-        if t.get_ident()
-            .is_some_and(|i| self.receiver.names.contains(&i.to_string()))
-        {
-            return false;
-        }
-        p.segments
-            .iter()
-            .zip(&t.segments)
-            .all(|(ps, ts)| ps.ident == ts.ident && self.args(&ps.arguments, &ts.arguments))
-    }
-
-    fn args(&mut self, p: &PathArguments, t: &PathArguments) -> bool {
-        match (p, t) {
-            (PathArguments::None, PathArguments::None) => true,
-            (PathArguments::AngleBracketed(pa), PathArguments::AngleBracketed(ta)) => {
-                self.arg_list(&pa.args, &ta.args)
-            }
-            (PathArguments::None, PathArguments::AngleBracketed(ta)) => {
-                self.arg_list(&Punctuated::new(), &ta.args)
-            }
-            (PathArguments::AngleBracketed(pa), PathArguments::None) => {
-                self.arg_list(&pa.args, &Punctuated::new())
-            }
-            (PathArguments::Parenthesized(pa), PathArguments::Parenthesized(ta)) => {
-                pa.inputs.len() == ta.inputs.len()
-                    && pa.inputs.iter().zip(&ta.inputs).all(|(a, b)| self.ty(a, b))
-                    && match (&pa.output, &ta.output) {
-                        (syn::ReturnType::Default, syn::ReturnType::Default) => true,
-                        (syn::ReturnType::Type(_, a), syn::ReturnType::Type(_, b)) => self.ty(a, b),
-                        _ => false,
-                    }
-            }
-            _ => false,
-        }
-    }
-
-    /// Arguments by kind: lifetimes pairwise (unless the target elides them all), and the type and
-    /// const arguments pairwise. An associated-item constraint of the target (`Tr<T, Out = u8>`)
-    /// selects no impl and is ignored; one in the pattern is not understood.
-    fn arg_list(
-        &mut self,
-        p: &Punctuated<GenericArgument, Token![,]>,
-        t: &Punctuated<GenericArgument, Token![,]>,
-    ) -> bool {
-        let mut p_lts = Vec::new();
-        let mut p_rest = Vec::new();
-        for a in p {
-            match a {
-                GenericArgument::Lifetime(l) => p_lts.push(l),
-                GenericArgument::Type(_) | GenericArgument::Const(_) => p_rest.push(a),
-                _ => return false,
-            }
-        }
-        let mut t_lts = Vec::new();
-        let mut t_rest = Vec::new();
-        for a in t {
-            match a {
-                GenericArgument::Lifetime(l) => t_lts.push(l),
-                GenericArgument::Type(_) | GenericArgument::Const(_) => t_rest.push(a),
-                _ => {}
-            }
-        }
-        // A target that elides its lifetimes fixes none of the pattern's.
-        if !t_lts.is_empty()
-            && (p_lts.len() != t_lts.len()
-                || !p_lts.iter().zip(&t_lts).all(|(a, b)| self.lifetime(a, b)))
-        {
-            return false;
-        }
-        p_rest.len() == t_rest.len() && p_rest.iter().zip(&t_rest).all(|(a, b)| self.arg(a, b))
-    }
-
-    fn arg(&mut self, p: &GenericArgument, t: &GenericArgument) -> bool {
-        match (p, t) {
-            (GenericArgument::Type(pt), GenericArgument::Type(tt)) => self.ty(pt, tt),
-            // A const parameter, spelled as a bare name, against a const expression.
-            (GenericArgument::Type(pt), GenericArgument::Const(te)) => match self.vars.type_var(pt)
-            {
-                Some(var) if self.vars.consts.contains(&var) => {
-                    self.bind(var, Value::Const(te.clone()))
-                }
-                _ => false,
-            },
-            (GenericArgument::Const(pe), GenericArgument::Const(te)) => self.expr(pe, te),
-            _ => false,
-        }
-    }
-
-    fn expr(&mut self, p: &Expr, t: &Expr) -> bool {
-        if let Expr::Path(ep) = p {
-            if ep.qself.is_none() {
-                if let Some(ident) = ep.path.get_ident() {
-                    let var = ident.to_string();
-                    if self.vars.consts.contains(&var) {
-                        return self.bind(var, Value::Const(t.clone()));
-                    }
-                }
-            }
-        }
-        self.opaque(
-            &Names::of_expr(p),
-            &Names::of_expr(t),
-            spelling(p) == spelling(t),
-        )
-    }
-
-    fn lifetime(&mut self, p: &Lifetime, t: &Lifetime) -> bool {
-        let var = p.to_string();
-        if self.vars.lifetimes.contains(&var) {
-            return self.bind(var, Value::Lifetime(t.clone()));
-        }
-        // `'_` in an impl header is a fresh lifetime of its own: anything matches it.
-        p.ident == "_" || (var == t.to_string() && !self.receiver.lifetimes.contains(&var))
-    }
-
-    fn opt_lifetime(&mut self, p: Option<&Lifetime>, t: Option<&Lifetime>) -> bool {
-        match (p, t) {
-            (Some(p), Some(t)) => self.lifetime(p, t),
-            (None, _) => true,
-            // The target elides it: nothing to bind, but a named lifetime of the pattern's own
-            // (`'static`) cannot be told to match.
-            (Some(p), None) => self.vars.lifetimes.contains(&p.to_string()) || p.ident == "_",
-        }
-    }
-
-    /// Two nodes this matcher does not take apart: they match when they are spelled the same and
-    /// neither names a parameter (of the pattern's impl, which would need binding, or of the
-    /// receiving impl, which the same spelling in the pattern does not mean).
-    fn opaque(&self, p: &Names, t: &Names, same: bool) -> bool {
-        same && !p.opaque
-            && !t.opaque
-            && !self.vars.mentioned_by(p)
-            && !self.receiver.mentioned_by(t)
     }
 }
 
@@ -1201,11 +826,7 @@ fn translate(
     if !renames.is_empty() {
         RenameLifetimes(&renames).visit_where_predicate_mut(&mut pred);
     }
-    let mut apply = Apply {
-        subst,
-        vars,
-        failed: false,
-    };
+    let mut apply = Apply::new(subst, vars, Reading::Premises);
     apply.visit_where_predicate_mut(&mut pred);
     if apply.failed {
         return None;
@@ -1246,127 +867,6 @@ impl VisitMut for RenameLifetimes<'_> {
     fn visit_lifetime_mut(&mut self, lt: &mut Lifetime) {
         if let Some(new) = self.0.get(&lt.to_string()) {
             *lt = new.clone();
-        }
-    }
-}
-
-/// Replace the reached impl's parameters by what they stand for.
-struct Apply<'a> {
-    subst: &'a Subst,
-    vars: &'a Params,
-    failed: bool,
-}
-
-impl Apply<'_> {
-    /// What the parameter `ident` maps to, when it is one.
-    fn value(&mut self, ident: &proc_macro2::Ident) -> Option<&Value> {
-        let name = ident.to_string();
-        if !self.vars.names.contains(&name) {
-            return None;
-        }
-        let v = self.subst.get(&name);
-        if v.is_none() {
-            self.failed = true;
-        }
-        v
-    }
-}
-
-/// The ident a value is, when it is spelled as one plain name.
-fn plain_name(v: &Value) -> Option<proc_macro2::Ident> {
-    match v {
-        Value::Type(Type::Path(TypePath { qself: None, path })) => path.get_ident().cloned(),
-        Value::Const(Expr::Path(ep)) if ep.qself.is_none() => ep.path.get_ident().cloned(),
-        _ => None,
-    }
-}
-
-impl VisitMut for Apply<'_> {
-    fn visit_type_mut(&mut self, ty: &mut Type) {
-        if let Type::Path(TypePath { qself: None, path }) = ty {
-            if path.leading_colon.is_none() {
-                if let Some(first) = path.segments.first() {
-                    let whole = path.segments.len() == 1 && first.arguments.is_none();
-                    let ident = first.ident.clone();
-                    match self.value(&ident).cloned() {
-                        Some(Value::Type(t)) if whole => {
-                            *ty = parenthesize(t);
-                            return;
-                        }
-                        // `T::Out`: only when `T` maps to a plain name.
-                        Some(v) if !whole => match plain_name(&v) {
-                            Some(name) => path.segments[0].ident = name,
-                            None => {
-                                self.failed = true;
-                                return;
-                            }
-                        },
-                        // A const parameter in a type position is a generic argument, handled by
-                        // `visit_generic_argument_mut`; anything else cannot be spelled here.
-                        Some(_) => {
-                            self.failed = true;
-                            return;
-                        }
-                        None => {}
-                    }
-                }
-            }
-        }
-        syn::visit_mut::visit_type_mut(self, ty);
-    }
-
-    fn visit_generic_argument_mut(&mut self, arg: &mut GenericArgument) {
-        if let GenericArgument::Type(Type::Path(TypePath { qself: None, path })) = arg {
-            if let Some(ident) = path.get_ident().cloned() {
-                if let Some(Value::Const(e)) = self.value(&ident).cloned() {
-                    *arg = GenericArgument::Const(match e {
-                        Expr::Lit(_) | Expr::Block(_) => e,
-                        other => syn::parse_quote!({ #other }),
-                    });
-                    return;
-                }
-            }
-        }
-        syn::visit_mut::visit_generic_argument_mut(self, arg);
-    }
-
-    fn visit_expr_mut(&mut self, e: &mut Expr) {
-        if let Expr::Path(ep) = e {
-            if ep.qself.is_none() && ep.path.leading_colon.is_none() {
-                if let Some(first) = ep.path.segments.first() {
-                    let whole = ep.path.segments.len() == 1 && first.arguments.is_none();
-                    let ident = first.ident.clone();
-                    match self.value(&ident).cloned() {
-                        Some(Value::Const(c)) if whole => {
-                            *e = match c {
-                                Expr::Lit(_) | Expr::Path(_) | Expr::Block(_) | Expr::Paren(_) => c,
-                                other => syn::parse_quote!((#other)),
-                            };
-                            return;
-                        }
-                        Some(v) => match plain_name(&v) {
-                            Some(name) => ep.path.segments[0].ident = name,
-                            None => {
-                                self.failed = true;
-                                return;
-                            }
-                        },
-                        None => {}
-                    }
-                }
-            }
-        }
-        syn::visit_mut::visit_expr_mut(self, e);
-    }
-
-    fn visit_lifetime_mut(&mut self, lt: &mut Lifetime) {
-        let name = lt.to_string();
-        if !self.vars.lifetimes.contains(&name) {
-            return;
-        }
-        match self.subst.get(&name) {
-            Some(Value::Lifetime(l)) => *lt = l.clone(),
-            _ => self.failed = true,
         }
     }
 }

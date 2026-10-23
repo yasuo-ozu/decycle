@@ -35,6 +35,8 @@ mod names;
 mod growth;
 // Carrying a cycle's premises along its bounds, across traits, shared by both engines.
 mod premise_flow;
+// Matching an impl header against a bound or an obligation, and substituting the match.
+mod unify;
 // `#[decycle(module = path)]`: qualifying the items re-emitted as written, and checking the path.
 mod module_path;
 // For `decycle-macro`, which reports an invalid `module = path` after expanding without it.

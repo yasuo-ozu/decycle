@@ -1,4 +1,5 @@
 use crate::generics_fmt::{param_decl, type_const_idents, DeclBounds};
+use crate::unify::Subst;
 use crate::helper::*;
 use proc_macro2::{Span, TokenStream};
 use proc_macro_error::*;
@@ -1128,7 +1129,7 @@ impl syn::visit_mut::VisitMut for RenameLifetimes<'_> {
 /// the impl the two spell the same type, but every consumer of a `CyclicBound` lives OUTSIDE it:
 ///
 /// * `reachable_side_bounds_ok` unifies the target against candidate impls' self types
-///   (`unify_impl_against_obligation`), and nothing ever unifies with the path `Self` — so a
+///   (`crate::unify::unify_obligation`), and nothing ever unifies with the path `Self` — so a
 ///   cyclic bound spelled `where Self: OtherTrait` failed the reachability check every time and
 ///   `build_shared_registrations` silently dropped its cross-edge registration, leaving the
 ///   callee's floor to hit the fail-closed "re-entry fn not registered" panic. The very same
@@ -1348,14 +1349,8 @@ fn bound_target_floor_is_unsized(
             .as_ref()
             .map(|(_, path, _)| nonlifetime_path_args(&path.segments.last().unwrap().arguments))
             .unwrap_or_default();
-        if unify_impl_against_obligation(
-            &pattern_vars,
-            &cand.self_ty,
-            &cand_targs,
-            target,
-            targs,
-        )
-        .is_none()
+        if crate::unify::unify_obligation(&pattern_vars, &cand.self_ty, &cand_targs, target, targs)
+            .is_none()
         {
             continue;
         }
@@ -1564,188 +1559,12 @@ fn impl_has_bare_param_cyclic_bound(
 // macro expansion.
 // ---------------------------------------------------------------------------------------------
 
-/// Unifies `pattern` (with `pattern_vars` free) against the ground type `concrete`, returning
-/// the induced substitution on success. Used to match a candidate impl's own `self_ty` pattern
-/// against a cyclic bound's concrete target type. Bails (`None`) on any structural mismatch —
-/// the caller fails closed on that.
-fn unify_type_pattern(
-    pattern_vars: &std::collections::HashSet<Ident>,
-    pattern: &Type,
-    concrete: &Type,
-) -> Option<HashMap<Ident, Type>> {
-    if let Type::Path(TypePath { qself: None, path }) = pattern {
-        if path.leading_colon.is_none()
-            && path.segments.len() == 1
-            && path.segments[0].arguments == PathArguments::None
-            && pattern_vars.contains(&path.segments[0].ident)
-        {
-            let mut m = HashMap::new();
-            m.insert(path.segments[0].ident.clone(), concrete.clone());
-            return Some(m);
-        }
-    }
-    match (pattern, concrete) {
-        (
-            Type::Path(TypePath { qself: None, path: pp }),
-            Type::Path(TypePath { qself: None, path: cp }),
-        ) => {
-            if pp.leading_colon.is_some() != cp.leading_colon.is_some()
-                || pp.segments.len() != cp.segments.len()
-            {
-                return None;
-            }
-            let mut out = HashMap::new();
-            for (ps, cs) in pp.segments.iter().zip(cp.segments.iter()) {
-                if ps.ident != cs.ident {
-                    return None;
-                }
-                match (&ps.arguments, &cs.arguments) {
-                    (PathArguments::None, PathArguments::None) => {}
-                    (PathArguments::AngleBracketed(pa), PathArguments::AngleBracketed(ca)) => {
-                        if pa.args.len() != ca.args.len() {
-                            return None;
-                        }
-                        for (pg, cg) in pa.args.iter().zip(ca.args.iter()) {
-                            match (pg, cg) {
-                                (GenericArgument::Type(pt), GenericArgument::Type(ct)) => {
-                                    merge_subst(&mut out, unify_type_pattern(pattern_vars, pt, ct)?)?;
-                                }
-                                (GenericArgument::Lifetime(_), GenericArgument::Lifetime(_)) => {}
-                                (GenericArgument::Const(pe), GenericArgument::Const(ce)) => {
-                                    if quote!(#pe).to_string() != quote!(#ce).to_string() {
-                                        return None;
-                                    }
-                                }
-                                _ => return None,
-                            }
-                        }
-                    }
-                    _ => return None,
-                }
-            }
-            Some(out)
-        }
-        (Type::Tuple(pt), Type::Tuple(ct)) => {
-            if pt.elems.len() != ct.elems.len() {
-                return None;
-            }
-            let mut out = HashMap::new();
-            for (p, c) in pt.elems.iter().zip(ct.elems.iter()) {
-                merge_subst(&mut out, unify_type_pattern(pattern_vars, p, c)?)?;
-            }
-            Some(out)
-        }
-        (Type::Reference(pr), Type::Reference(cr)) => {
-            if pr.mutability.is_some() != cr.mutability.is_some() {
-                return None;
-            }
-            unify_type_pattern(pattern_vars, &pr.elem, &cr.elem)
-        }
-        (Type::Paren(p), _) => unify_type_pattern(pattern_vars, &p.elem, concrete),
-        (_, Type::Paren(c)) => unify_type_pattern(pattern_vars, pattern, &c.elem),
-        // C2 (defensive): a `<Recv as Trait>::Assoc` projection self. Normally unreachable —
-        // C2's `normalize_obligation_targets` pre-pass rewrites the projections a caller emits
-        // to concrete types first — but if an un-normalized one survives (a rule miss), a
-        // structural match here keeps it off the string-eq catch-all below, which fails on any
-        // lifetime/whitespace skew.
-        (
-            Type::Path(TypePath {
-                qself: Some(pq),
-                path: pp,
-            }),
-            Type::Path(TypePath {
-                qself: Some(cq),
-                path: cp,
-            }),
-        ) => {
-            if pq.position != cq.position {
-                return None;
-            }
-            let mut out = unify_type_pattern(pattern_vars, &pq.ty, &cq.ty)?;
-            if pp.leading_colon.is_some() != cp.leading_colon.is_some()
-                || pp.segments.len() != cp.segments.len()
-            {
-                return None;
-            }
-            for (ps, cs) in pp.segments.iter().zip(cp.segments.iter()) {
-                if ps.ident != cs.ident {
-                    return None;
-                }
-                match (&ps.arguments, &cs.arguments) {
-                    (PathArguments::None, PathArguments::None) => {}
-                    (PathArguments::AngleBracketed(pa), PathArguments::AngleBracketed(ca)) => {
-                        if pa.args.len() != ca.args.len() {
-                            return None;
-                        }
-                        for (pg, cg) in pa.args.iter().zip(ca.args.iter()) {
-                            match (pg, cg) {
-                                (GenericArgument::Type(pt), GenericArgument::Type(ct)) => {
-                                    merge_subst(&mut out, unify_type_pattern(pattern_vars, pt, ct)?)?;
-                                }
-                                (GenericArgument::Lifetime(_), GenericArgument::Lifetime(_)) => {}
-                                (GenericArgument::Const(pe), GenericArgument::Const(ce)) => {
-                                    if quote!(#pe).to_string() != quote!(#ce).to_string() {
-                                        return None;
-                                    }
-                                }
-                                _ => return None,
-                            }
-                        }
-                    }
-                    _ => return None,
-                }
-            }
-            Some(out)
-        }
-        _ => (quote!(#pattern).to_string() == quote!(#concrete).to_string()).then(HashMap::new),
-    }
-}
-
-/// Merges `add` into `base`, failing if a variable would be bound to two syntactically
-/// different types (a genuine ambiguity — the caller fails closed on that too).
-fn merge_subst(base: &mut HashMap<Ident, Type>, add: HashMap<Ident, Type>) -> Option<()> {
-    for (k, v) in add {
-        match base.get(&k) {
-            Some(existing) if quote!(#existing).to_string() != quote!(#v).to_string() => {
-                return None
-            }
-            _ => {
-                base.insert(k, v);
-            }
-        }
-    }
-    Some(())
-}
-
-/// Replaces every bare single-segment type in `subst`'s domain with its mapped type.
-fn apply_type_subst(ty: &Type, subst: &HashMap<Ident, Type>) -> Type {
-    struct Sub<'a>(&'a HashMap<Ident, Type>);
-    impl syn::visit_mut::VisitMut for Sub<'_> {
-        fn visit_type_mut(&mut self, ty: &mut Type) {
-            if let Type::Path(TypePath { qself: None, path }) = ty {
-                if path.leading_colon.is_none()
-                    && path.segments.len() == 1
-                    && path.segments[0].arguments == PathArguments::None
-                {
-                    if let Some(rep) = self.0.get(&path.segments[0].ident) {
-                        *ty = rep.clone();
-                        return;
-                    }
-                }
-            }
-            syn::visit_mut::visit_type_mut(self, ty);
-        }
-    }
-    let mut t = ty.clone();
-    syn::visit_mut::VisitMut::visit_type_mut(&mut Sub(subst), &mut t);
-    t
-}
-
 /// C2: rewrite projection obligation targets to their concrete form per the caller's
 /// `also_rank` normalize rules, BEFORE ranking. A cross-edge whose bounded type (or a bound's
 /// generic-arg subterm) is a projection like `<G as EmptyGroup>::Fill<Substruct>` is invisible
-/// to `unify_type_pattern` and untouched by `TraitReplacer`; the caller knows the concrete
-/// equal (`Group<Substruct,O,C>`) at emission time and passes the pair. Applied to every impl's
+/// to the registration check's unifier (`crate::unify`) and untouched by `TraitReplacer`; the
+/// caller knows the concrete equal (`Group<Substruct,O,C>`) at emission time and passes the pair.
+/// Applied to every impl's
 /// `Generics` (where-clause + param bounds) so every downstream stage sees a plain concrete
 /// member. Matched by canonical-string structural equality (both sides are ground, concrete
 /// types the caller fully controls the spelling of — no pattern variables, no unifier needed
@@ -1789,14 +1608,14 @@ fn strip_leading_colon(path: &mut Path) {
 /// impl's side (`u8: Fixed<Y>` with a DIFFERENT, registering-impl-local `Y`) after substitution
 /// makes both bounded types read `u8`. The registering impl's own side (`own_side`, called with
 /// `subst = None`) is intentionally left unsubstituted — it already reads in its own terms.
-fn format_side_bound(bt: &Type, tb: &TraitBound, subst: Option<&HashMap<Ident, Type>>) -> String {
+fn format_side_bound(bt: &Type, tb: &TraitBound, subst: Option<&Subst>) -> String {
     let mut tb = tb.clone();
     if let Some(s) = subst {
         for seg in tb.path.segments.iter_mut() {
             if let PathArguments::AngleBracketed(ab) = &mut seg.arguments {
                 for arg in ab.args.iter_mut() {
                     if let GenericArgument::Type(t) = arg {
-                        *t = apply_type_subst(t, s);
+                        *t = crate::unify::substitute(t, s);
                     }
                 }
             }
@@ -1819,11 +1638,11 @@ fn format_side_bound(bt: &Type, tb: &TraitBound, subst: Option<&HashMap<Ident, T
 fn side_predicate_strings(
     generics: &Generics,
     replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
-    subst: Option<&HashMap<Ident, Type>>,
+    subst: Option<&Subst>,
 ) -> Vec<String> {
     let g = remove_cyclic_bounds(generics, replacing_table, false);
     let sub = |ty: &Type| match subst {
-        Some(s) => apply_type_subst(ty, s),
+        Some(s) => crate::unify::substitute(ty, s),
         None => ty.clone(),
     };
     let is_relaxed = |tb: &TraitBound| matches!(tb.modifier, TraitBoundModifier::Maybe(_));
@@ -1865,54 +1684,21 @@ fn side_predicate_strings(
 /// Is every non-cyclic bound reachable through `target_ty: target_trait`'s cyclic-bound graph
 /// already among `registering_impl`'s own bounds? Walks the graph breadth-first: at each
 /// `(trait, ty)` node, finds every impl of `trait` whose `self_ty` structurally matches `ty`
-/// (`unify_type_pattern`), collects that impl's own side bounds (substituted into
+/// (`crate::unify::unify_obligation`, the registration reading), collects that impl's own side
+/// bounds (substituted into
 /// `registering_impl`'s terms), and continues through that impl's own cyclic bounds
 /// (substituted the same way). Fails closed — returns `false` — the moment anything can't be
 /// established syntactically: an unknown trait, no matching impl, more than one matching impl
 /// (ambiguous — treated as needing the union, but an actual mismatch between them still fails
-/// via `merge_subst`/string comparison), or an impl type param left unresolved by unification.
-/// Unify a candidate impl against a concrete obligation, matching BOTH the impl's self type and
-/// its trait own-arguments (`impl<T> Cast<T> for A` against the obligation `A: Cast<i64>` binds
-/// `T = i64`). A trait's own type-generic is determined by the trait argument, NOT the self type,
-/// so unifying the self type alone (as this used to) leaves such a `T` forever unbound and wrongly
-/// rejects the whole registration. Const/lifetime trait args match by the same rules
-/// `unify_type_pattern` uses inside a path's argument list.
-fn unify_impl_against_obligation(
-    pattern_vars: &std::collections::HashSet<Ident>,
-    cand_self: &Type,
-    cand_targs: &[GenericArgument],
-    obl_self: &Type,
-    obl_targs: &[GenericArgument],
-) -> Option<HashMap<Ident, Type>> {
-    let mut subst = unify_type_pattern(pattern_vars, cand_self, obl_self)?;
-    if cand_targs.len() != obl_targs.len() {
-        return None;
-    }
-    for (pg, cg) in cand_targs.iter().zip(obl_targs.iter()) {
-        match (pg, cg) {
-            (GenericArgument::Type(pt), GenericArgument::Type(ct)) => {
-                merge_subst(&mut subst, unify_type_pattern(pattern_vars, pt, ct)?)?;
-            }
-            (GenericArgument::Lifetime(_), GenericArgument::Lifetime(_)) => {}
-            (GenericArgument::Const(pe), GenericArgument::Const(ce)) => {
-                if quote!(#pe).to_string() != quote!(#ce).to_string() {
-                    return None;
-                }
-            }
-            _ => return None,
-        }
-    }
-    Some(subst)
-}
-
+/// by spelling), or an impl type param left unresolved by unification.
 /// Apply a type substitution to every `GenericArgument::Type` in a trait arg list (const/lifetime
 /// args pass through), so a reachable-bound's trait args carry the same substitution its target
 /// type does when the reachability walk descends through a cross-edge.
-fn apply_targs_subst(targs: &[GenericArgument], subst: &HashMap<Ident, Type>) -> Vec<GenericArgument> {
+fn apply_targs_subst(targs: &[GenericArgument], subst: &Subst) -> Vec<GenericArgument> {
     targs
         .iter()
         .map(|g| match g {
-            GenericArgument::Type(t) => GenericArgument::Type(apply_type_subst(t, subst)),
+            GenericArgument::Type(t) => GenericArgument::Type(crate::unify::substitute(t, subst)),
             other => other.clone(),
         })
         .collect()
@@ -1995,12 +1781,16 @@ fn reachable_side_bounds_ok(
                     nonlifetime_path_args(&path.segments.last().unwrap().arguments)
                 })
                 .unwrap_or_default();
-            let Some(subst) =
-                unify_impl_against_obligation(&pattern_vars, &cand.self_ty, &cand_targs, &ty, &targs)
-            else {
+            let Some(subst) = crate::unify::unify_obligation(
+                &pattern_vars,
+                &cand.self_ty,
+                &cand_targs,
+                &ty,
+                &targs,
+            ) else {
                 continue;
             };
-            if pattern_vars.iter().any(|v| !subst.contains_key(v)) {
+            if pattern_vars.iter().any(|v| !subst.contains_key(&v.to_string())) {
                 return false;
             }
             matched_any = true;
@@ -2012,7 +1802,7 @@ fn reachable_side_bounds_ok(
             for cb in cyclic_where_bounds(cand, replacing_table) {
                 queue.push_back((
                     cb.trait_ident,
-                    apply_type_subst(&cb.target, &subst),
+                    crate::unify::substitute(&cb.target, &subst),
                     apply_targs_subst(&cb.targs, &subst),
                 ));
             }
@@ -3643,7 +3433,7 @@ fn ranked_supertrait(
     let implemented_here = own_impls.iter().all(|im| {
         sup_impls.iter().any(|cand| {
             let vars = crate::names::type_param_idents(&cand.generics);
-            unify_type_pattern(&vars, &cand.self_ty, &im.self_ty).is_some()
+            crate::unify::unify_type(&vars, &cand.self_ty, &im.self_ty).is_some()
         })
     });
     implemented_here.then(|| sup.clone())
@@ -3782,7 +3572,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
     // C2: flatten the normalize rules and rewrite every impl's obligation targets before
     // indexing, so a projection cross-edge (`<G as EmptyGroup>::Fill<Substruct>`) is a plain
     // concrete member bound (`Group<Substruct,O,C>`) everywhere downstream —
-    // `cyclic_where_bounds`, `unify_type_pattern`, `TraitReplacer`, and the leaf/inductive/Final
+    // `cyclic_where_bounds`, `crate::unify`, `TraitReplacer`, and the leaf/inductive/Final
     // loops all see it as an ordinary `Type::Path{qself:None}` bound. `normalize_rules.is_empty()`
     // (the default) makes `normalize_obligation_targets` an early-return no-op, so this is
     // byte-identical to today for every SCC that doesn't opt in.

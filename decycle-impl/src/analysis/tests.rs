@@ -624,3 +624,27 @@ fn the_graph_is_the_same_every_time() {
         assert_eq!(render(), first);
     }
 }
+
+/// A leading `::` on one segment (`::Tr`) is a path like any other, the opt-out: an impl of `::Tr`
+/// is no node, and a bound naming `::Tr` no edge.
+#[test]
+fn a_leading_colon_is_a_path() {
+    let m: syn::ItemMod = parse_quote! {
+        mod ast {
+            #[decycle]
+            pub trait Tr { fn f(&self); }
+            pub enum Expr { A }
+            pub enum Stmt { B }
+            pub enum Leaf { C }
+            impl Tr for Expr where Stmt: ::Tr, Leaf: Tr { fn f(&self) {} }
+            impl Tr for Stmt where Expr: Tr { fn f(&self) {} }
+            impl ::Tr for Leaf where Expr: Tr { fn f(&self) {} }
+        }
+    };
+    assert_eq!(nodes(&m), vec!["Expr", "Stmt"], "`impl ::Tr for Leaf` is no node");
+    assert_eq!(
+        edges(&m),
+        vec![("Stmt".into(), EdgeKind::Direct, "Expr".into())],
+        "`Stmt: ::Tr` is no edge"
+    );
+}

@@ -2,9 +2,10 @@
 //! it.
 //!
 //! A cycle participant — a routed trait, or a type implementing one — is named by its **bare** name
-//! or by the no-op `self::` form of it. Any other path (`crate::m::Term`, `super::Term`,
-//! `::dep::Term`) names the item itself, which merely shares the last segment: that is the opt-out,
-//! and such a path takes no part in the cycle.
+//! or by the no-op `self::` form of it ([`bare_ident`]). Any other path (`crate::m::Term`,
+//! `super::Term`, `::dep::Term`, and a leading `::` on one segment, `::Term`) names the item
+//! itself, which merely shares the last segment: that is the opt-out, and such a path takes no part
+//! in the cycle.
 
 use std::collections::HashSet;
 use syn::visit::Visit;
@@ -28,21 +29,19 @@ pub(crate) fn strip_leading_self(path: &mut Path) {
     }
 }
 
-/// The one ident `path` spells once a no-op leading `self::` is stripped ([`strip_leading_self`]):
-/// `Tr` and `self::Tr` spell `Tr`; `crate::m::Tr` and `super::Tr` spell none.
-///
-/// This is the spelling the ranked engine (and [`crate::analysis`]) take a routed trait by, in an
-/// impl header and in a bound. A leading `::` is not looked at, so `::Tr` spells `Tr` here;
-/// [`bare_ident`] is the same rule with a leading `::` refused.
-pub(crate) fn routed_ident(path: &Path) -> Option<&Ident> {
+/// The ident `path` names a cycle participant by: its bare name (`Tr`), or the no-op `self::` form
+/// (`self::Tr`). Any other path (`crate::m::Tr`, `super::Term`, `::other::B`, `::Tr`) names the
+/// item itself, the opt-out — in an impl header, a bound, and a type alike, in both engines.
+pub(crate) fn bare_ident(path: &Path) -> Option<&Ident> {
+    if path.leading_colon.is_some() {
+        return None;
+    }
     let mut segments = path.segments.iter();
     let first = segments.next()?;
     match (segments.next(), segments.next()) {
         (None, _) => Some(&first.ident),
         (Some(second), None)
-            if path.leading_colon.is_none()
-                && first.ident == "self"
-                && matches!(first.arguments, PathArguments::None) =>
+            if first.ident == "self" && matches!(first.arguments, PathArguments::None) =>
         {
             Some(&second.ident)
         }
@@ -50,22 +49,13 @@ pub(crate) fn routed_ident(path: &Path) -> Option<&Ident> {
     }
 }
 
-/// Is `bound` a trait bound whose path spells ([`routed_ident`]) one of `routed`? A crate-rooted
-/// or `super::` spelling is the caller's documented opt-out and never a cycle edge.
+/// Is `bound` a trait bound whose path names ([`bare_ident`]) one of `routed`? Any other spelling
+/// is the caller's documented opt-out and never a cycle edge.
 pub(crate) fn is_routed_bound(bound: &TypeParamBound, routed: &HashSet<Ident>) -> bool {
     let TypeParamBound::Trait(TraitBound { path, .. }) = bound else {
         return false;
     };
-    routed_ident(path).is_some_and(|ident| routed.contains(ident))
-}
-
-/// The ident `path` names a cycle participant by: its bare name, or the no-op `self::` form. Any
-/// other path (`crate::m::Tr`, `super::Term`, `::other::B`) names the item itself, the opt-out.
-pub(crate) fn bare_ident(path: &Path) -> Option<&Ident> {
-    if path.leading_colon.is_some() {
-        return None;
-    }
-    routed_ident(path)
+    bare_ident(path).is_some_and(|ident| routed.contains(ident))
 }
 
 /// The head ident of a type, but **only** when the type is spelled as a module-local item — a bare

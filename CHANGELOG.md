@@ -154,6 +154,12 @@ as **0.8.0**, not as a 0.7 patch.
   behind a macro. Beside that, the impls of one trait in a cycle still take the union of each
   other's premises by name, as in the ranked engine: a predicate is only given to an impl that
   declares every generic parameter it names, and a `Self`-mentioning one is not.
+- **Breaking (ranked): a leading `::` on a one-segment trait path is a path, the opt-out**, as it
+  already was in the structural engine and for types in both: `impl ::Tr for X`, `where Y: ::Tr`
+  and `<Y as ::Tr>::f` name the item `::Tr` itself, not the module's `Tr`, and are left as written.
+  The ranked engine read them as the bare `Tr` and rewrote them into the cycle, so a spelling that
+  names nothing in edition 2018 on (`::Tr` is a crate there) compiled and ran; rustc now reports it
+  (``E0405: cannot find crate `Tr` in the list of imported crates``). Write `Tr` (or `self::Tr`).
 - **Breaking (structural): a `#[decycle(structural)]` module rejects three forms the ranked engine
   already rejects, with the same errors:**
   - a glob `#[decycle] use path::*;`, which compiled and routed no trait (`glob is not supported in

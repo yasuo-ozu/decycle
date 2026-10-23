@@ -46,6 +46,10 @@ impl TraitReplacer {
     /// replacement was made; `path` is left untouched on a non-match (the self:: peel is
     /// only used to LOOK UP the match, never applied unless one is found).
     fn try_replace_path(&self, path: &mut Path) -> bool {
+        // `::Trait` is a path to the item itself, the opt-out: left as written.
+        if path.leading_colon.is_some() {
+            return false;
+        }
         let offset = self_offset(path);
         let rest_len = path.segments.len() - offset;
         if rest_len != 1 && rest_len != 2 {
@@ -72,6 +76,10 @@ impl TraitReplacer {
     /// before the QSelf position (optionally preceded by a no-op leading `self`).
     fn try_replace_qself_path(&self, qself: &mut Option<QSelf>, path: &mut Path) -> bool {
         if let Some(ref mut qs) = qself {
+            // `<_ as ::Trait>::method` names the item itself, the opt-out: left as written.
+            if path.leading_colon.is_some() {
+                return false;
+            }
             // A leading `self` can only be part of the "as Trait" portion when there's a
             // segment after it still within that portion (qs.position > 1).
             let offset = if qs.position > 1 { self_offset(path) } else { 0 };
@@ -214,7 +222,8 @@ fn remove_cyclic_bounds(
         // re-emitted at other module depths, where that prefix no longer denotes the same item.
         let names_cyclic_trait =
             last_names_cyclic && crate::helper::path_is_depth_fragile(&trait_path);
-        let bare_names_cyclic = last_names_cyclic && probe.segments.len() == 1;
+        let bare_names_cyclic = crate::names::bare_ident(&trait_path)
+            .is_some_and(|ident| replacing_table.contains_key(ident));
         let is_bareparam_target = matches!(&ty, Type::Path(TypePath { qself: None, path })
             if path.segments.len() == 1 && param_idents.contains(&path.segments[0].ident));
         let is_self_target = matches!(&ty, Type::Path(TypePath { qself: None, path })
@@ -1163,7 +1172,7 @@ fn cyclic_where_bounds(
             let TypeParamBound::Trait(tb) = b else {
                 continue;
             };
-            if tb.path.segments.len() == 1 {
+            if tb.path.leading_colon.is_none() && tb.path.segments.len() == 1 {
                 let seg = &tb.path.segments[0];
                 if replacing_table.contains_key(&seg.ident) {
                     // C1: fresh-rename the union of the predicate binder (`for<'a> B<'a>: Cb`)
@@ -1514,7 +1523,8 @@ fn impl_has_bare_param_cyclic_bound(
     let is_cyclic = |bounds: &Punctuated<TypeParamBound, Token![+]>| {
         bounds.iter().any(|b| match b {
             TypeParamBound::Trait(tb) => {
-                tb.path.segments.len() == 1
+                tb.path.leading_colon.is_none()
+                    && tb.path.segments.len() == 1
                     && replacing_table.contains_key(&tb.path.segments[0].ident)
             }
             _ => false,
@@ -3232,7 +3242,7 @@ fn check_assoc_type_self(in_order: &[&(ItemTrait, usize, Vec<ItemImpl>)]) {
             // DIFFERENT item that merely shares a last segment with a decycle trait.
             let has_decycle_bound = bounds.iter().any(|bound| {
                 if let TypeParamBound::Trait(TraitBound { path, .. }) = bound {
-                    if path.segments.len() == 1 {
+                    if path.leading_colon.is_none() && path.segments.len() == 1 {
                         return decycle_idents.contains(&path.segments[0].ident);
                     }
                 }

@@ -19,7 +19,7 @@
 //!        Stmt -Direct-> Expr   (the bound named `Expr` itself)
 //! ```
 
-use crate::names::{is_routed_bound, routed_ident};
+use crate::names::{bare_ident, is_routed_bound};
 use proc_macro2::Ident;
 use safegraph::VecGraph;
 use std::collections::{HashMap, HashSet};
@@ -183,12 +183,13 @@ fn self_head(im: &ItemImpl) -> Option<Ident> {
     crate::names::local_type_head_ident(&im.self_ty)
 }
 
-/// Does this impl's trait path name a routed trait in the form the engines adopt — a single segment
-/// after `self::`-normalisation? A crate-rooted or `super::` spelling is the documented opt-out.
+/// Does this impl's trait path name a routed trait in the form the engines adopt — bare, or
+/// `self::` ([`bare_ident`])? Any other spelling (`crate::m::Tr`, `super::Tr`, `::Tr`) is the
+/// documented opt-out.
 fn impls_routed_trait(im: &ItemImpl, routed: &HashSet<Ident>) -> bool {
     im.trait_
         .as_ref()
-        .and_then(|(_, path, _)| routed_ident(path))
+        .and_then(|(_, path, _)| bare_ident(path))
         .is_some_and(|ident| routed.contains(ident))
 }
 

@@ -66,12 +66,12 @@ pub(crate) fn is_local_impl_bound_target(ty: &Type, impl_type_params: &HashSet<I
     ident == "Self" || impl_type_params.contains(ident)
 }
 
-/// Does `im` implement a routed trait in the spelling the engine takes over — a single segment after
-/// `self::`-normalisation?
+/// Does `im` implement a routed trait in the spelling the engine takes over — bare, or `self::`
+/// (`crate::names::bare_ident`)?
 fn impls_routed_trait(im: &ItemImpl, all_traits: &HashSet<Ident>) -> bool {
     im.trait_
         .as_ref()
-        .and_then(|(_, trait_path, _)| crate::names::routed_ident(trait_path))
+        .and_then(|(_, trait_path, _)| crate::names::bare_ident(trait_path))
         .is_some_and(|ident| all_traits.contains(ident))
 }
 
@@ -176,8 +176,8 @@ fn validate_impl_where_bounds(
             // lifts the depth-fragile `super::` spelling so it survives re-emission); only
             // the bare/`self::`-qualified form participates in ranking at all, so there's
             // no reliable syntactic way to tell "meant to be ranked, mis-qualified" apart
-            // from this deliberate opt-out.
-            if path.segments.len() != 1 {
+            // from this deliberate opt-out. A leading `::` (`::Foo`) is such a path too.
+            if path.leading_colon.is_some() || path.segments.len() != 1 {
                 continue;
             }
             let last_segment = &path.segments[0];
@@ -398,7 +398,7 @@ fn sharing_sources(members: &[&ItemImpl], trait_ident: &Ident) -> Vec<Vec<usize>
             }
             let names_this_trait = pt.bounds.iter().any(|b| {
                 matches!(b, TypeParamBound::Trait(TraitBound { path, .. })
-                    if crate::names::routed_ident(path) == Some(trait_ident))
+                    if crate::names::bare_ident(path) == Some(trait_ident))
             });
             if !names_this_trait {
                 continue;

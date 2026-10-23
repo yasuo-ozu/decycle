@@ -147,27 +147,24 @@ fn reject_duplicate(args: &Args) {
 /// used to fail incomprehensibly later (the inner expansion trips over the outer's generated
 /// paths on a module, and redefines names on a trait — E0252 with an unusable rustc suggestion).
 ///
-/// Matches the same spellings `decycle_impl::is_decycle_attribute` accepts on inner items: bare
-/// `#[decycle]`, or two-segment `#[<crate>::decycle]` where `<crate>` is `decycle` or the leading
-/// segment of the `decycle = …` path argument.
+/// Recognised as the engines recognise a marker on an inner item
+/// (`decycle_impl::names_decycle_attribute`): bare `#[decycle]`, or two-segment
+/// `#[<crate>::decycle]` where `<crate>` is `decycle` or the leading segment of the `decycle = …`
+/// path argument.
 fn pending_decycle_attr(attrs: &[Attribute], decycle_path: &Path) -> Option<proc_macro2::Span> {
-    let decycle_crate = decycle_path.segments.first().map(|seg| &seg.ident);
-    attrs.iter().find_map(|attr| {
-        let path = attr.path();
-        let matched = path.is_ident("decycle")
-            || (path.segments.len() == 2
-                && (path.segments[0].ident == "decycle"
-                    || Some(&path.segments[0].ident) == decycle_crate)
-                && path.segments[1].ident == "decycle");
-        matched.then(|| syn::spanned::Spanned::span(attr))
-    })
+    // A parsed path has a first segment; without one only `decycle` names the crate.
+    let decycle = Ident::new("decycle", proc_macro2::Span::call_site());
+    let decycle_crate = decycle_path.segments.first().map_or(&decycle, |seg| &seg.ident);
+    attrs
+        .iter()
+        .find(|attr| decycle_impl::names_decycle_attribute(attr, Some(decycle_crate)))
+        .map(syn::spanned::Spanned::span)
 }
 
 /// Is `attr` a `#[decycle]` marker, in either spelling: bare, or two-segment `<x>::decycle`? The
 /// args are not known where this is used, so `<x>` is not tied to one crate name.
 fn names_decycle(attr: &Attribute) -> bool {
-    let path = attr.path();
-    path.is_ident("decycle") || (path.segments.len() == 2 && path.segments[1].ident == "decycle")
+    decycle_impl::names_decycle_attribute(attr, None)
 }
 
 /// Drop the `#[decycle]` markers from the direct items of `module`, for the dummy set before the

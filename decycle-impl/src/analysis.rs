@@ -161,7 +161,7 @@ pub(crate) fn routed_traits(
 fn has_decycle_attr(attrs: &[Attribute], decycle_crate: &Ident) -> bool {
     attrs
         .iter()
-        .any(|a| crate::names_decycle_attribute(a, decycle_crate))
+        .any(|a| crate::names_decycle_attribute(a, Some(decycle_crate)))
 }
 
 /// Head idents of the types implementing a routed trait here — the engines' `cycle_self_heads`.

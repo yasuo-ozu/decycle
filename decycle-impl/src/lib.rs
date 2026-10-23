@@ -136,8 +136,10 @@ pub(crate) fn randomize_impl_generics(
 }
 
 /// Does `attr`'s PATH name decycle — the bare `#[decycle]` or the two-segment `#[<crate>::decycle]`
-/// form, where `<crate>` is the decycle crate name *as passed to the macro* (`decycle_crate` — the
-/// leading segment of the `decycle = …` path argument, default `decycle`)?
+/// form, where `<crate>` is `decycle` or the decycle crate name *as passed to the macro*
+/// (`decycle_crate` — the leading segment of the `decycle = …` path argument, default `decycle`)?
+/// With no crate name (`None`), any `<crate>` is accepted: `decycle-macro` uses that before the
+/// arguments naming it are parsed, to strip the markers from the fallback it sets first.
 ///
 /// We deliberately do NOT read the consumer's `Cargo.toml` to discover a dependency rename: a renamed
 /// decycle must be named explicitly via `#[decycle(decycle = ::my_rename)]`, and the two-segment inner
@@ -148,12 +150,15 @@ pub(crate) fn randomize_impl_generics(
 /// [`is_decycle_attribute`], which rejects them; this bare predicate exists for the read-only
 /// [`analysis`] module (and `growth`), whose whole contract is to inspect a module without
 /// diagnosing it — its unit tests run it outside a `#[proc_macro_error]` entry point, where
-/// `abort!` could only panic.
-fn names_decycle_attribute(attr: &Attribute, decycle_crate: &Ident) -> bool {
+/// `abort!` could only panic. `decycle-macro` uses it for the attribute on the item itself.
+#[doc(hidden)]
+pub fn names_decycle_attribute(attr: &Attribute, decycle_crate: Option<&Ident>) -> bool {
     let path = attr.path();
     path.is_ident("decycle")
         || (path.segments.len() == 2
-            && (path.segments[0].ident == "decycle" || &path.segments[0].ident == decycle_crate)
+            && decycle_crate.map_or(true, |name| {
+                path.segments[0].ident == "decycle" || path.segments[0].ident == *name
+            })
             && path.segments[1].ident == "decycle")
 }
 
@@ -171,7 +176,7 @@ fn names_decycle_attribute(attr: &Attribute, decycle_crate: &Ident) -> bool {
 /// scans (`ranked::process_module`, `structural::collect_decycle_traits`) and the nested-module
 /// check. `#[decycle()]` — an empty list — is accepted, being no argument at all.
 fn is_decycle_attribute(attr: &Attribute, decycle_crate: &Ident) -> bool {
-    if !names_decycle_attribute(attr, decycle_crate) {
+    if !names_decycle_attribute(attr, Some(decycle_crate)) {
         return false;
     }
     use syn::spanned::Spanned;

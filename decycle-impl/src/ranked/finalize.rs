@@ -1,6 +1,6 @@
 use crate::generics_fmt::{param_decl, type_const_idents, DeclBounds};
-use crate::unify::Subst;
 use crate::helper::*;
+use crate::unify::Subst;
 use proc_macro2::{Span, TokenStream};
 use proc_macro_error::*;
 use std::collections::HashMap;
@@ -86,14 +86,20 @@ impl TraitReplacer {
             }
             // A leading `self` can only be part of the "as Trait" portion when there's a
             // segment after it still within that portion (qs.position > 1).
-            let offset = if qs.position > 1 { self_offset(path) } else { 0 };
+            let offset = if qs.position > 1 {
+                self_offset(path)
+            } else {
+                0
+            };
             // In `<_ as Trait>::method`, qself.position is 1 and path is `Trait::method`.
             // Check if the first (post-`self::`) segment is a trait in our table.
             if qs.position > offset && qs.position <= path.segments.len() {
                 let first_ident = &path.segments[offset].ident;
                 if let Some((rank_loc, replacement)) = self.table.get(first_ident) {
-                    let orig_args =
-                        std::mem::replace(&mut path.segments[offset].arguments, PathArguments::None);
+                    let orig_args = std::mem::replace(
+                        &mut path.segments[offset].arguments,
+                        PathArguments::None,
+                    );
                     // Build the replacement: replace segments[offset] with the ranked path segments
                     let mut new_segments: Punctuated<PathSegment, Token![::]> = Punctuated::new();
                     for seg in &replacement.segments {
@@ -681,10 +687,7 @@ fn emit_impl_items_delegate(
             ImplItem::Const(ImplItemConst { ident, ty, .. }) => output.extend(quote! {
                 const #ident: #ty = #path::#ident;
             }),
-            other => abort!(
-                other,
-                "unsupported item in an impl of a #[decycle] trait"
-            ),
+            other => abort!(other, "unsupported item in an impl of a #[decycle] trait"),
         }
     }
     output
@@ -935,8 +938,7 @@ fn distinct_lifetimes_in(tys: impl Iterator<Item = Type>) -> Vec<Lifetime> {
     struct Collector(Vec<Lifetime>);
     impl<'ast> syn::visit::Visit<'ast> for Collector {
         fn visit_lifetime(&mut self, l: &'ast Lifetime) {
-            if l.ident != "_" && l.ident != "static" && !self.0.iter().any(|s| s.ident == l.ident)
-            {
+            if l.ident != "_" && l.ident != "static" && !self.0.iter().any(|s| s.ident == l.ident) {
                 self.0.push(l.clone());
             }
         }
@@ -1611,7 +1613,10 @@ fn normalize_obligation_targets(impl_: &mut ItemImpl, rules: &[(Type, Type)]) {
     if rules.is_empty() {
         return;
     }
-    syn::visit_mut::VisitMut::visit_generics_mut(&mut NormalizeTargets { rules }, &mut impl_.generics);
+    syn::visit_mut::VisitMut::visit_generics_mut(
+        &mut NormalizeTargets { rules },
+        &mut impl_.generics,
+    );
 }
 
 /// Strips a leading `::` (global-path) marker so `::core::fmt::Debug` and `core::fmt::Debug`
@@ -1799,9 +1804,7 @@ fn reachable_side_bounds_ok(
             let cand_targs = cand
                 .trait_
                 .as_ref()
-                .map(|(_, path, _)| {
-                    nonlifetime_path_args(&path.segments.last().unwrap().arguments)
-                })
+                .map(|(_, path, _)| nonlifetime_path_args(&path.segments.last().unwrap().arguments))
                 .unwrap_or_default();
             let Some(subst) = crate::unify::unify_obligation(
                 &pattern_vars,
@@ -1812,7 +1815,10 @@ fn reachable_side_bounds_ok(
             ) else {
                 continue;
             };
-            if pattern_vars.iter().any(|v| !subst.contains_key(&v.to_string())) {
+            if pattern_vars
+                .iter()
+                .any(|v| !subst.contains_key(&v.to_string()))
+            {
                 return false;
             }
             matched_any = true;
@@ -1944,7 +1950,11 @@ fn normalize_reentry_sig(tf: &TraitItemFn, s_ty: &Type, trait_path_full: &Path) 
 /// Which of the trait's / method's type+const params (and `S`) the normalized fn-pointer
 /// type actually mentions. A type alias rejects unused generics (E0091), so the alias
 /// declares — and the floor instantiates — exactly this subset, in declaration order.
-fn reentry_used_mask(trait_: &ItemTrait, norm: &NormSig, s_ident: &Ident) -> (bool, Vec<bool>, Vec<bool>) {
+fn reentry_used_mask(
+    trait_: &ItemTrait,
+    norm: &NormSig,
+    s_ident: &Ident,
+) -> (bool, Vec<bool>, Vec<bool>) {
     struct Used(std::collections::HashSet<String>);
     impl<'ast> syn::visit::Visit<'ast> for Used {
         fn visit_ident(&mut self, i: &'ast Ident) {
@@ -2031,7 +2041,10 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize, _decycle: &Path) -> T
     // `super::super::` prefix), which is exactly what that surrounding impl already provides
     // (including its own `type Assoc = ...;`, copied verbatim from the user's impl).
     let ranked_trait_ident = name!("{}Ranked", trait_ident);
-    let ranked_args_at_leaf = trait_.generics.ty_generics().insert(rank_loc, parse_quote!(()));
+    let ranked_args_at_leaf = trait_
+        .generics
+        .ty_generics()
+        .insert(rank_loc, parse_quote!(()));
     let ranked_trait_path_leaf: Path = parse_quote!(#ranked_trait_ident #ranked_args_at_leaf);
 
     let mut tg = trait_.generics.clone();
@@ -2266,7 +2279,10 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize, _decycle: &Path) -> T
                 _ => None,
             })
             .fold(Vec::new(), |mut acc: Vec<WherePredicate>, w| {
-                if !acc.iter().any(|x| quote!(#x).to_string() == quote!(#w).to_string()) {
+                if !acc
+                    .iter()
+                    .any(|x| quote!(#x).to_string() == quote!(#w).to_string())
+                {
                     acc.push(w);
                 }
                 acc
@@ -2563,14 +2579,19 @@ fn rule2_targets(
         .collect();
     let mut out = Vec::new();
     for cb in cbs {
-        let headed =
-            crate::helper::type_head_ident(&cb.target).is_some_and(|h| heads.contains(&h));
+        let headed = crate::helper::type_head_ident(&cb.target).is_some_and(|h| heads.contains(&h));
         let is_wrapper = !headed && crate::names::names_bare(&cb.target, &heads);
         let plan = cb
             .binder
             .is_empty()
             .then(|| {
-                wrapper::Planner::plan(replacing_table, impl_, &cb.target, &cb.trait_ident, &cb.targs)
+                wrapper::Planner::plan(
+                    replacing_table,
+                    impl_,
+                    &cb.target,
+                    &cb.trait_ident,
+                    &cb.targs,
+                )
             })
             .flatten()
             .filter(|p| settled.admits(p));
@@ -2578,7 +2599,13 @@ fn rule2_targets(
             plan.as_ref()
                 .is_some_and(|p| wrapper::registration_ok(impl_, p, 0, replacing_table))
         } else {
-            reachable_side_bounds_ok(impl_, &cb.target, &cb.trait_ident, &cb.targs, replacing_table)
+            reachable_side_bounds_ok(
+                impl_,
+                &cb.target,
+                &cb.trait_ident,
+                &cb.targs,
+                replacing_table,
+            )
         };
         if ok {
             out.push(cb);
@@ -2981,69 +3008,69 @@ impl Parse for FinalizeArgs {
 }
 
 fn parse_rest(input: ParseStream) -> Result<FinalizeArgs> {
-        let _crate_identity: LitStr = input.parse()?;
-        let crate_version: LitStr = input.parse()?;
-        let expected_version = env!("CARGO_PKG_VERSION");
-        if crate_version.value() != expected_version {
-            abort!(
-                Span::call_site(),
-                "version mismatch: expected '{}', got '{}'",
-                expected_version,
-                crate_version.value()
-            )
-        }
+    let _crate_identity: LitStr = input.parse()?;
+    let crate_version: LitStr = input.parse()?;
+    let expected_version = env!("CARGO_PKG_VERSION");
+    if crate_version.value() != expected_version {
+        abort!(
+            Span::call_site(),
+            "version mismatch: expected '{}', got '{}'",
+            expected_version,
+            crate_version.value()
+        )
+    }
 
-        let traits_content;
-        braced!(traits_content in input);
-        let traits = parse_comma_separated(&traits_content)?;
+    let traits_content;
+    braced!(traits_content in input);
+    let traits = parse_comma_separated(&traits_content)?;
 
-        let contents_content;
-        braced!(contents_content in input);
-        let contents = parse_comma_separated(&contents_content)?;
+    let contents_content;
+    braced!(contents_content in input);
+    let contents = parse_comma_separated(&contents_content)?;
 
-        let lit: LitInt = input.parse()?;
-        let recurse_level = lit.base10_parse()?;
+    let lit: LitInt = input.parse()?;
+    let recurse_level = lit.base10_parse()?;
 
-        let support_infinite_cycle = if input.is_empty() {
-            false
-        } else {
-            let lit: LitBool = input.parse()?;
-            lit.value
-        };
+    let support_infinite_cycle = if input.is_empty() {
+        false
+    } else {
+        let lit: LitBool = input.parse()?;
+        lit.value
+    };
 
-        let renames = if input.is_empty() {
-            Vec::new()
-        } else {
-            let renames_content;
-            bracketed!(renames_content in input);
-            parse_comma_separated::<TraitRename>(&renames_content)?
-                .into_iter()
-                .map(|r| (r.original, r.local))
-                .collect()
-        };
+    let renames = if input.is_empty() {
+        Vec::new()
+    } else {
+        let renames_content;
+        bracketed!(renames_content in input);
+        parse_comma_separated::<TraitRename>(&renames_content)?
+            .into_iter()
+            .map(|r| (r.original, r.local))
+            .collect()
+    };
 
-        // C2: the carrier's `also_rank` trailing group. Backward-compatible: an old carrier
-        // simply has no trailing tokens here (`input.is_empty()` ⇒ `Vec::new()`).
-        let also_rank = if input.is_empty() {
-            Vec::new()
-        } else {
-            let content;
-            braced!(content in input);
-            parse_comma_separated::<AlsoRank>(&content)?
-        };
+    // C2: the carrier's `also_rank` trailing group. Backward-compatible: an old carrier
+    // simply has no trailing tokens here (`input.is_empty()` ⇒ `Vec::new()`).
+    let also_rank = if input.is_empty() {
+        Vec::new()
+    } else {
+        let content;
+        braced!(content in input);
+        parse_comma_separated::<AlsoRank>(&content)?
+    };
 
-        Ok(FinalizeArgs {
-            working_list: Vec::new(),
-            traits,
-            contents,
-            recurse_level,
-            support_infinite_cycle,
-            renames,
-            also_rank,
-            // D1: the carrier grammar doesn't serialize this field — only a direct,
-            // programmatic caller of `finalize` sets it.
-            decycle_path: None,
-        })
+    Ok(FinalizeArgs {
+        working_list: Vec::new(),
+        traits,
+        contents,
+        recurse_level,
+        support_infinite_cycle,
+        renames,
+        also_rank,
+        // D1: the carrier grammar doesn't serialize this field — only a direct,
+        // programmatic caller of `finalize` sets it.
+        decycle_path: None,
+    })
 }
 
 impl FinalizeArgs {
@@ -3301,8 +3328,10 @@ fn in_declaration_order<'a>(
 /// definition because the ranked trait's associated type bound refers to the original
 /// trait, causing a cycle through the Final impl.
 fn check_assoc_type_self(in_order: &[&(ItemTrait, usize, Vec<ItemImpl>)]) {
-    let decycle_idents: std::collections::HashSet<&Ident> =
-        in_order.iter().map(|(trait_, _, _)| &trait_.ident).collect();
+    let decycle_idents: std::collections::HashSet<&Ident> = in_order
+        .iter()
+        .map(|(trait_, _, _)| &trait_.ident)
+        .collect();
 
     for (trait_, _, impls) in in_order.iter().copied() {
         for trait_item in &trait_.items {
@@ -3643,9 +3672,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
     // (the programmatic `FinalizeArgs`) are renamed here.
     let mut traits = args.traits.clone();
     for (original, local) in &args.renames {
-        let applied = traits
-            .iter()
-            .any(|t| is_carried(t) && &t.ident == local);
+        let applied = traits.iter().any(|t| is_carried(t) && &t.ident == local);
         if applied {
             continue;
         }
@@ -3720,7 +3747,10 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
             let mut impl_ = impl_.clone();
             normalize_obligation_targets(&mut impl_, &normalize_rules);
             let Some(seg) = impl_.trait_.as_ref().and_then(|t| t.1.segments.last()) else {
-                abort!(impl_, "decycle also_rank: a foreign impl must be a trait impl");
+                abort!(
+                    impl_,
+                    "decycle also_rank: a foreign impl must be a trait impl"
+                );
             };
             let seg_ident = seg.ident.clone();
             match replacing_table.get_mut(&seg_ident) {
@@ -3774,7 +3804,11 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
         let n = last.segments.len();
         Path {
             leading_colon: last.leading_colon,
-            segments: last.segments.into_iter().take(n.saturating_sub(1)).collect(),
+            segments: last
+                .segments
+                .into_iter()
+                .take(n.saturating_sub(1))
+                .collect(),
         }
     });
 
@@ -4237,7 +4271,13 @@ fn carried_name(
     renames: &[(Ident, Ident)],
 ) -> Ident {
     let mock = entry.mock();
-    let Some(used) = entry.key.path().segments.last().map(|seg| seg.ident.clone()) else {
+    let Some(used) = entry
+        .key
+        .path()
+        .segments
+        .last()
+        .map(|seg| seg.ident.clone())
+    else {
         return item_ident.clone();
     };
     let Some(path) = mock else {
@@ -4391,11 +4431,19 @@ mod tests {
         // Leaf: `impl CaRanked<()> for A` — rank_loc 0 on a generics-free trait, rank spelled
         // exactly `floor_rank()`.
         let leaf = squish(&quote!(#ranked_ca<()> for A).to_string());
-        assert!(hay.contains(&leaf), "leaf floor rank is not spelled `()`:\n{}", out);
+        assert!(
+            hay.contains(&leaf),
+            "leaf floor rank is not spelled `()`:\n{}",
+            out
+        );
         // Final: `Self: shadowing_module::ranked_traits::CaRanked<((),)>` — exactly
         // `initial_rank(1)`.
         let fin = squish(&quote!(#sm::#rm::#ranked_ca<((),)>).to_string());
-        assert!(hay.contains(&fin), "Final initial rank is not spelled `((),)`:\n{}", out);
+        assert!(
+            hay.contains(&fin),
+            "Final initial rank is not spelled `((),)`:\n{}",
+            out
+        );
     }
 
     /// Every floor has its decoy twin (`decoy_rank`) in both modes: the same header at the decoy
@@ -4416,7 +4464,12 @@ mod tests {
             let hay = squish(&out);
             let decoy = super::decoy_rank_name();
             let decl = squish(&quote!(pub enum #decoy {}).to_string());
-            assert_eq!(hay.matches(&decl).count(), 1, "decoy rank not declared once:\n{}", out);
+            assert_eq!(
+                hay.matches(&decl).count(),
+                1,
+                "decoy rank not declared once:\n{}",
+                out
+            );
             let ranked_ca = super::ranked_trait_name(&ca_trait.ident);
             let ranked_cb = super::ranked_trait_name(&cb_trait.ident);
             for (floor, twin) in [
@@ -4424,7 +4477,10 @@ mod tests {
                     quote!(#ranked_ca<()> for A where A: ::core::fmt::Debug),
                     quote!(#ranked_ca<#decoy> for A where A: ::core::fmt::Debug),
                 ),
-                (quote!(#ranked_cb<()> for B), quote!(#ranked_cb<#decoy> for B)),
+                (
+                    quote!(#ranked_cb<()> for B),
+                    quote!(#ranked_cb<#decoy> for B),
+                ),
             ] {
                 let (floor, twin) = (squish(&floor.to_string()), squish(&twin.to_string()));
                 assert!(hay.contains(&floor), "no floor `{}`:\n{}", floor, out);
@@ -4453,19 +4509,31 @@ mod tests {
         // The ONE fp recipe (target = Self, sized; no trait targs; empty method generics —
         // the same argument shape `build_rule1_registrations` and the floor use):
         let fp = super::fingerprint_expr(
-            &decycle_path, &quote!(Self), false, &ca_trait.generics, &[], Some(&m_generics),
+            &decycle_path,
+            &quote!(Self),
+            false,
+            &ca_trait.generics,
+            &[],
+            Some(&m_generics),
         );
 
         // (1) finalize's rule-1 registration (emitted INSIDE shadowing_module ⇒ bare
         // `ranked_traits` prefix) appears verbatim in the output:
         let rm = super::ranked_traits_module_name();
         let rule1 = super::emit_registration(
-            &decycle_path, &quote!(#rm), ca_ident, &m_ident,
-            &quote!(Self), &[], &[], fp.clone(),
+            &decycle_path,
+            &quote!(#rm),
+            ca_ident,
+            &m_ident,
+            &quote!(Self),
+            &[],
+            &[],
+            fp.clone(),
         );
         assert!(
             hay.contains(&squish(&rule1.to_string())),
-            "hand-built registration does not byte-agree with rule 1's prologue:\n{}", out
+            "hand-built registration does not byte-agree with rule 1's prologue:\n{}",
+            out
         );
 
         // (2) the sibling-scope (C4 / wrapper-macro) spelling — identical statement modulo the
@@ -4473,8 +4541,14 @@ mod tests {
         // way. Pin the exact emitted shape:
         let sm = super::shadowing_module_name();
         let hand = super::emit_registration(
-            &decycle_path, &quote!(#sm::#rm), ca_ident, &m_ident,
-            &quote!(Self), &[], &[], fp.clone(),
+            &decycle_path,
+            &quote!(#sm::#rm),
+            ca_ident,
+            &m_ident,
+            &quote!(Self),
+            &[],
+            &[],
+            fp.clone(),
         );
         let mk = super::reentry_marker_name(ca_ident, &m_ident);
         let re = super::reentry_fn_name(ca_ident, &m_ident);
@@ -4484,7 +4558,10 @@ mod tests {
                 #sm::#rm::#re::<Self> as *const ()
             );
         };
-        assert_eq!(squish(&hand.to_string()), squish(&expected_hand.to_string()));
+        assert_eq!(
+            squish(&hand.to_string()),
+            squish(&expected_hand.to_string())
+        );
 
         // (3) the floor's lookup names the SAME marker instantiation and the SAME fp
         // expression (emit_impl_items_leaf; bare `#mk` — the floor lives inside
@@ -4494,7 +4571,8 @@ mod tests {
         );
         assert!(
             hay.contains(&squish(&floor_lookup.to_string())),
-            "floor lookup key does not byte-agree with the registration recipe:\n{}", out
+            "floor lookup key does not byte-agree with the registration recipe:\n{}",
+            out
         );
     }
 

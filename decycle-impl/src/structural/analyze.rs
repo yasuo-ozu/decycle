@@ -55,7 +55,13 @@ impl Model {
         let mut edges = Vec::new();
         for im in participating() {
             let src = position(&pair(im)).expect("every participating impl is a node");
-            for pred in im.item.generics.where_clause.iter().flat_map(|w| &w.predicates) {
+            for pred in im
+                .item
+                .generics
+                .where_clause
+                .iter()
+                .flat_map(|w| &w.predicates)
+            {
                 let WherePredicate::Type(pt) = pred else {
                     continue;
                 };

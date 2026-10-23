@@ -95,14 +95,14 @@ macro_rules! pair {
 }
 
 pair!(pair_ranked []);
-pair!(pair_module [module = crate::pair_module]);
+pair!(pair_module[module = crate::pair_module]);
 pair!(pair_bounded [support_infinite_cycle = false, recurse_level = 40]);
-pair!(pair_structural [structural]);
+pair!(pair_structural[structural]);
 
 #[test]
 fn a_call_through_a_pair_with_a_foreign_part() {
-    use pair_ranked::Loop as _;
     use pair_module::Loop as _;
+    use pair_ranked::Loop as _;
     use pair_structural::Loop as _;
     // `A.step(n)` is `B.step(n - 1) + 100` and `B.step(m)` is `A.step(m - 1) + 1`.
     assert_eq!(pair_ranked::A.step(5), 302);
@@ -785,7 +785,8 @@ pub mod overlap {
             if n == 0 {
                 0
             } else {
-                B.step(n - 1) + <crate::overlap::C as crate::overlap::Loop>::step(&crate::overlap::C, n)
+                B.step(n - 1)
+                    + <crate::overlap::C as crate::overlap::Loop>::step(&crate::overlap::C, n)
             }
         }
     }

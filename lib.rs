@@ -1,8 +1,6 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![doc(html_logo_url = "https://raw.githubusercontent.com/yasuo-ozu/decycle/main/decycle.png")]
-#![doc(
-    html_favicon_url = "https://raw.githubusercontent.com/yasuo-ozu/decycle/main/decycle.png"
-)]
+#![doc(html_favicon_url = "https://raw.githubusercontent.com/yasuo-ozu/decycle/main/decycle.png")]
 #![doc = include_str!("README.md")]
 
 #[doc(hidden)]
@@ -371,7 +369,6 @@ pub mod __reentry {
 
         type Undo = ((&'static str, u64), Option<*const ()>);
 
-
         /// Puts back the entries that were *displaced* inside one registration scope.
         ///
         /// Registration is no longer last-writer-wins. [`scope`] returns this guard, the generated
@@ -476,9 +473,7 @@ pub mod __reentry {
         /// generated method prologue opens one of these before its registrations and holds it for
         /// the rest of the body, so the entries stay live for exactly the descent they serve.
         pub fn scope() -> Registration {
-            let mark = UNDO
-                .try_with(|u| u.borrow().len())
-                .unwrap_or(usize::MAX);
+            let mark = UNDO.try_with(|u| u.borrow().len()).unwrap_or(usize::MAX);
             Registration { mark }
         }
 
@@ -562,7 +557,6 @@ pub mod __reentry {
     }
 
     pub use imp::{lookup, register, scope, Registration};
-
 }
 
 #[doc(hidden)]

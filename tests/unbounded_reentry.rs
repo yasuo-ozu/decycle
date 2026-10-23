@@ -415,8 +415,14 @@ mod fold_m {
 #[test]
 fn impl_trait_arg_multi_closure_past_floor() {
     use fold_m::Fold;
-    assert_eq!(fold_m::A.fold((|v| v + 7) as fn(usize) -> usize, 25), 25 + 7);
-    assert_eq!(fold_m::A.fold((|v| v + 1000) as fn(usize) -> usize, 25), 25 + 1000);
+    assert_eq!(
+        fold_m::A.fold((|v| v + 7) as fn(usize) -> usize, 25),
+        25 + 7
+    );
+    assert_eq!(
+        fold_m::A.fold((|v| v + 1000) as fn(usize) -> usize, 25),
+        25 + 1000
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -585,7 +591,8 @@ fn closure_instantiation_is_rejected_up_front() {
     let c_small = move |v: usize| v + small as usize;
     let got = std::panic::catch_unwind(move || fold_m::A.fold(c_small, 40));
     let msg = got.err().map(|e| {
-        e.downcast_ref::<String>().cloned()
+        e.downcast_ref::<String>()
+            .cloned()
             .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
             .unwrap_or_default()
     });

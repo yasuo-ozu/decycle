@@ -1,11 +1,11 @@
+use crate::helper::type_head_ident;
+use crate::names::{use_leaves, UseLeaf};
 use proc_macro2::Span;
 use proc_macro2::TokenStream;
 use proc_macro_error::*;
 use std::collections::HashSet;
 use syn::spanned::Spanned;
 use syn::*;
-use crate::helper::type_head_ident;
-use crate::names::{use_leaves, UseLeaf};
 use template_quote::quote;
 
 /// A `super::super::…`-rooted path (2+ leading `super` segments) written by the user
@@ -267,7 +267,11 @@ fn is_ranked_edge(
     participants: &HashSet<Ident>,
 ) -> bool {
     is_bare_trait_pred(pred, routed_traits)
-        && targets_participant(pred, participants, &crate::premise_flow::impl_param_idents(im))
+        && targets_participant(
+            pred,
+            participants,
+            &crate::premise_flow::impl_param_idents(im),
+        )
 }
 
 /// Does the predicate carry a bound the engine treats as a cycle edge — a bare (or
@@ -320,7 +324,12 @@ fn ranked_cycle_edges(
 ) -> Vec<crate::premise_flow::CycleEdge> {
     let type_params = crate::names::type_param_idents(&im.generics);
     let mut out = Vec::new();
-    for pred in im.generics.where_clause.iter().flat_map(|wc| &wc.predicates) {
+    for pred in im
+        .generics
+        .where_clause
+        .iter()
+        .flat_map(|wc| &wc.predicates)
+    {
         let WherePredicate::Type(pt) = pred else {
             continue;
         };
@@ -346,7 +355,12 @@ fn ranked_cycle_edges(
             if !crate::names::bare_ident(&tb.path).is_some_and(|t| all_traits.contains(t)) {
                 continue;
             }
-            out.push(crate::premise_flow::CycleEdge::new(target.clone(), pt, tb, impls));
+            out.push(crate::premise_flow::CycleEdge::new(
+                target.clone(),
+                pt,
+                tb,
+                impls,
+            ));
         }
     }
     out
@@ -480,7 +494,9 @@ fn sharing_sources(members: &[&ItemImpl], trait_ident: &Ident) -> Vec<Vec<usize>
     };
     let graph = crate::graph::compose(
         names.iter().cloned(),
-        edges.iter().map(|(from, to)| (position(from), position(to), ())),
+        edges
+            .iter()
+            .map(|(from, to)| (position(from), position(to), ())),
     );
     let reach = crate::graph::reachable(&graph);
     (0..members.len())
@@ -668,7 +684,8 @@ fn process_module_inner(
             if let Item::Impl(im) = item {
                 for it in &im.items {
                     if let ImplItem::Fn(f) = it {
-                        if let Some(a) = f.attrs.iter().find(|a| a.path().is_ident("track_caller")) {
+                        if let Some(a) = f.attrs.iter().find(|a| a.path().is_ident("track_caller"))
+                        {
                             abort!(
                                 a,
                                 "decycle: `#[track_caller]` on method `{}` in an unbounded #[decycle] cycle is not supported — the re-entry fn-pointer indirection loses the caller location past the recursion floor", f.sig.ident;
@@ -889,10 +906,11 @@ fn process_module_inner(
             _ => None,
         })
         .collect();
-    let local_cycle_heads: HashSet<Ident> =
-        cycle_self_heads.intersection(&local_types).cloned().collect();
-    let alias_items =
-        crate::ranked::nesting::defuse_nesting(
+    let local_cycle_heads: HashSet<Ident> = cycle_self_heads
+        .intersection(&local_types)
+        .cloned()
+        .collect();
+    let alias_items = crate::ranked::nesting::defuse_nesting(
         &mut contents,
         &local_cycle_heads,
         &all_traits,

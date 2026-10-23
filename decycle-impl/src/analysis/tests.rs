@@ -641,7 +641,11 @@ fn a_leading_colon_is_a_path() {
             impl ::Tr for Leaf where Expr: Tr { fn f(&self) {} }
         }
     };
-    assert_eq!(nodes(&m), vec!["Expr", "Stmt"], "`impl ::Tr for Leaf` is no node");
+    assert_eq!(
+        nodes(&m),
+        vec!["Expr", "Stmt"],
+        "`impl ::Tr for Leaf` is no node"
+    );
     assert_eq!(
         edges(&m),
         vec![("Stmt".into(), EdgeKind::Direct, "Expr".into())],

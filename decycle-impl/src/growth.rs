@@ -144,8 +144,11 @@ fn routed_trait_names(items: &[Item], decycle: &Path) -> HashSet<String> {
         return HashSet::new();
     };
     let decycle_crate = &first.ident;
-    let marked =
-        |attrs: &[syn::Attribute]| attrs.iter().any(|a| crate::is_decycle_attribute(a, decycle_crate));
+    let marked = |attrs: &[syn::Attribute]| {
+        attrs
+            .iter()
+            .any(|a| crate::is_decycle_attribute(a, decycle_crate))
+    };
     analysis::routed_traits(items, &marked)
         .iter()
         .map(|ident| ident.to_string())
@@ -400,7 +403,12 @@ fn check_method(sig: &Signature, block: &syn::Block, callees: &Callees) -> syn::
         /// function; a type-rooted path (`B::eval`) may be an inherent method with an unrelated
         /// signature.
         fn path_names_trait_method(&self, p: &ExprPath) -> bool {
-            if !p.path.segments.last().is_some_and(|s| &s.ident == self.name) {
+            if !p
+                .path
+                .segments
+                .last()
+                .is_some_and(|s| &s.ident == self.name)
+            {
                 return false;
             }
             let owner = match &p.qself {
@@ -424,9 +432,8 @@ fn check_method(sig: &Signature, block: &syn::Block, callees: &Callees) -> syn::
         /// Is this method call's receiver one the cycle's own trait method can be reached through —
         /// `self` (or a projection of it), or a cycle member named outright (`B.eval(..)`)?
         fn receiver_reaches_cycle(&self, receiver: &Expr) -> bool {
-            root_ident(receiver).is_some_and(|id| {
-                id == "self" || self.callees.members.contains(&id.to_string())
-            })
+            root_ident(receiver)
+                .is_some_and(|id| id == "self" || self.callees.members.contains(&id.to_string()))
         }
     }
     impl<'ast> Visit<'ast> for V<'ast> {

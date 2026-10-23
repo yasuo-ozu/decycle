@@ -554,8 +554,10 @@ fn freshen_binder_lifetimes(mut pred: WherePredicate, taken: &HashSet<String>) -
             if let syn::GenericParam::Lifetime(l) = p {
                 let old = l.lifetime.ident.to_string();
                 if taken.contains(&old) {
-                    let fresh =
-                        syn::Lifetime::new(&format!("'{}__decycle_hr", old), l.lifetime.ident.span());
+                    let fresh = syn::Lifetime::new(
+                        &format!("'{}__decycle_hr", old),
+                        l.lifetime.ident.span(),
+                    );
                     rename.insert(l.lifetime.to_string(), fresh.clone());
                     l.lifetime = fresh;
                 }

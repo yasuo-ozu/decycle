@@ -122,12 +122,7 @@ fn make_impls(model: &Model, scc: &Scc, im: &ImplBlock) -> syn::Result<TokenStre
     let adt = model.adts.get(&m).unwrap();
     let m_ident = &adt.ident;
     let self_args = &im.self_args;
-    let trait_path = im
-        .item
-        .trait_
-        .as_ref()
-        .map(|(_, p, _)| p.clone())
-        .unwrap();
+    let trait_path = im.item.trait_.as_ref().map(|(_, p, _)| p.clone()).unwrap();
 
     // natural self type `M<self_args>` and its terminator `__MTerm<self_args>` (same layout).
     let (natural, term_ty): (Type, Type) = if self_args.is_empty() {
@@ -1010,15 +1005,14 @@ fn forward_args(
     let cast = cast_ident(nonce);
     for a in &sig.inputs {
         if let syn::FnArg::Typed(pt) = a {
-            let id = match &*pt.pat {
-                syn::Pat::Ident(pi) => &pi.ident,
-                _ => {
-                    return Err(syn::Error::new(
+            let id =
+                match &*pt.pat {
+                    syn::Pat::Ident(pi) => &pi.ident,
+                    _ => return Err(syn::Error::new(
                         pt.span(),
                         "#[decycle(structural)]: only simple identifier parameters are supported",
-                    ))
-                }
-            };
+                    )),
+                };
             let ty = normalize_projections(&pt.ty, ctx, 0)?;
             if mentions_self(&ty) {
                 // A trait object may NOT be punned: `dyn Fn(&A)` and `dyn Fn(&ATerm)` are
@@ -1105,9 +1099,11 @@ fn mentions_self(ty: &Type) -> bool {
     match ty {
         Type::Path(tp) => {
             tp.qself.as_ref().is_some_and(|q| mentions_self(&q.ty))
-                || tp.path.segments.iter().any(|seg| {
-                    seg.ident == "Self" || args_mention_self(&seg.arguments)
-                })
+                || tp
+                    .path
+                    .segments
+                    .iter()
+                    .any(|seg| seg.ident == "Self" || args_mention_self(&seg.arguments))
         }
         Type::Reference(r) => mentions_self(&r.elem),
         Type::Ptr(p) => mentions_self(&p.elem),
@@ -1132,9 +1128,11 @@ fn args_mention_self(args: &PathArguments) -> bool {
             GenericArgument::Type(t) => mentions_self(t),
             GenericArgument::AssocType(at) => mentions_self(&at.ty),
             GenericArgument::Constraint(c) => c.bounds.iter().any(|b| match b {
-                syn::TypeParamBound::Trait(tb) => {
-                    tb.path.segments.iter().any(|s| args_mention_self(&s.arguments))
-                }
+                syn::TypeParamBound::Trait(tb) => tb
+                    .path
+                    .segments
+                    .iter()
+                    .any(|s| args_mention_self(&s.arguments)),
                 _ => false,
             }),
             _ => false,
@@ -1552,7 +1550,9 @@ fn reduce_generics(
                 syn::TypeParamBound::Trait(tb) if trait_key(&tb.path)
                     .is_some_and(|key| refs.iter().any(|r| scc.contains(r, &key))));
             match b {
-                syn::TypeParamBound::Trait(tb) if is_cyclic_bound => cyclic_paths.push(tb.path.clone()),
+                syn::TypeParamBound::Trait(tb) if is_cyclic_bound => {
+                    cyclic_paths.push(tb.path.clone())
+                }
                 _ => noncyclic.push(b.clone()),
             }
         }

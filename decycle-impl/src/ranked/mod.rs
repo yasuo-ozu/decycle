@@ -8,5 +8,5 @@ mod opt_out;
 pub(crate) mod peel;
 pub(crate) mod process_module;
 
-pub use process_module::{process_module, process_module_at};
 pub use finalize::{check_trait, check_trait_structural};
+pub use process_module::{process_module, process_module_at};

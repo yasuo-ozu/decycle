@@ -142,7 +142,12 @@ pub(crate) fn peel_cyclic_bounds(
         if !shadows_member {
             for b in &cyclic {
                 let mut kept = Vec::new();
-                kept_wrappers(&pt.bounded_ty, cycle_self_heads, &|ty| keep_whole(ty, b), &mut kept);
+                kept_wrappers(
+                    &pt.bounded_ty,
+                    cycle_self_heads,
+                    &|ty| keep_whole(ty, b),
+                    &mut kept,
+                );
                 for w in kept {
                     push(syn::parse_quote!(#binder #w: #b), &mut out);
                 }
@@ -288,7 +293,10 @@ fn kept_wrappers(
                 }
             }
         }
-        Type::Tuple(t) => t.elems.iter().for_each(|e| kept_wrappers(e, heads, keep, out)),
+        Type::Tuple(t) => t
+            .elems
+            .iter()
+            .for_each(|e| kept_wrappers(e, heads, keep, out)),
         Type::Reference(r) => kept_wrappers(&r.elem, heads, keep, out),
         Type::Ptr(p) => kept_wrappers(&p.elem, heads, keep, out),
         Type::Array(a) => kept_wrappers(&a.elem, heads, keep, out),
@@ -340,7 +348,10 @@ fn bare_wrapper(ty: &Type, heads: &HashSet<Ident>) -> Option<Type> {
 /// Recursion is unaffected: an outer path's generic arguments are still visited, so a genuine
 /// member nested inside a foreign wrapper (`crate::other::Wrap<Stmt>`) is still found.
 fn cycle_types_within(ty: &Type, cycle_self_heads: &HashSet<Ident>) -> Vec<Type> {
-    bare_spelled(crate::names::bare_named_in(ty, &|i| cycle_self_heads.contains(i))).collect()
+    bare_spelled(crate::names::bare_named_in(ty, &|i| {
+        cycle_self_heads.contains(i)
+    }))
+    .collect()
 }
 
 /// The members found, in the canonical BARE spelling, exactly as the trait side is normalised

@@ -141,9 +141,9 @@ macro_rules! dense_cycle_module {
     ($decycle_attr:meta, $mod_name:ident) => {
         #[$decycle_attr]
         mod $mod_name {
+            use super::{compute_types, storage_types, validation_types};
             #[decycle]
             use super::{Cache, Compute, Process, Serialize, Transform, Validate};
-            use super::{compute_types, storage_types, validation_types};
             use std::fmt::Debug;
 
             pub struct ProcessorA<T>(pub T);

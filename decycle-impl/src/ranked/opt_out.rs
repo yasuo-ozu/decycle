@@ -51,8 +51,8 @@
 //! fallback drops the global bounds of the `#[decycle]` traits ([`quiet`]): the impls hold
 //! unconditionally, the bodies still type-check, and the new errors stand alone.
 
-use crate::names::strip_leading_self;
 use crate::module_path::ModuleScope;
+use crate::names::strip_leading_self;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use syn::visit::Visit;
 use syn::{

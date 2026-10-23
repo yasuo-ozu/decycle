@@ -21,12 +21,12 @@
 //! `&Self`); the signature is canonicalized against the trait's declaration before codegen.
 
 use proc_macro2::{Span, TokenStream};
-use template_quote::{quote, ToTokens};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use syn::{
     parse_quote, spanned::Spanned, Attribute, GenericArgument, GenericParam, Ident, ImplItem, Item,
     ItemEnum, ItemImpl, ItemMod, ItemStruct, Path, PathArguments, ReturnType, Type, WherePredicate,
 };
+use template_quote::{quote, ToTokens};
 
 mod analyze;
 mod codegen;
@@ -360,7 +360,12 @@ fn cycle_edges(
     adt_names: &HashSet<String>,
 ) -> Vec<crate::premise_flow::CycleEdge> {
     let mut out = Vec::new();
-    for pred in im.generics.where_clause.iter().flat_map(|wc| &wc.predicates) {
+    for pred in im
+        .generics
+        .where_clause
+        .iter()
+        .flat_map(|wc| &wc.predicates)
+    {
         let WherePredicate::Type(pt) = pred else {
             continue;
         };

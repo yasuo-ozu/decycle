@@ -31,7 +31,11 @@ fn reentry_b(n: u32) -> u32 {
 /// The E3 no-targ/no-marg fp recipe: seed folded once with the target's layout — exactly
 /// `fingerprint_expr(_, target, false, <no trait generics>, &[], Some(<empty>))`.
 fn fp_of<T>() -> u64 {
-    fp_fold(FP_SEED, core::mem::size_of::<T>(), core::mem::align_of::<T>())
+    fp_fold(
+        FP_SEED,
+        core::mem::size_of::<T>(),
+        core::mem::align_of::<T>(),
+    )
 }
 
 /// Call a looked-up entry the way a generated floor does: transmute to the fn type and invoke.
@@ -76,7 +80,13 @@ fn registration_is_idempotent_and_per_instantiation() {
     register::<HandMk<SameLayoutAsA>>(fp_of::<SameLayoutAsA>(), reentry_b as *const ());
     assert_eq!(fp_of::<MemberA>(), fp_of::<SameLayoutAsA>());
     assert_eq!(call(lookup::<HandMk<MemberA>>(fp_of::<MemberA>()), 41), 42);
-    assert_eq!(call(lookup::<HandMk<SameLayoutAsA>>(fp_of::<SameLayoutAsA>()), 40), 42);
+    assert_eq!(
+        call(
+            lookup::<HandMk<SameLayoutAsA>>(fp_of::<SameLayoutAsA>()),
+            40
+        ),
+        42
+    );
 }
 
 /// Registration is FRAME-SCOPED: an inner registration of the SAME key shadows the outer one
@@ -127,6 +137,9 @@ fn fnv_fold_constants_locked() {
     assert_eq!(FP_SEED, 0xcbf29ce484222325);
     let acc = (FP_SEED ^ 8).wrapping_mul(FP_PRIME);
     assert_eq!(fp_fold(FP_SEED, 8, 8), (acc ^ 8).wrapping_mul(FP_PRIME));
-    assert_eq!(fp_fold_word(FP_SEED, 7), (FP_SEED ^ 7).wrapping_mul(FP_PRIME));
+    assert_eq!(
+        fp_fold_word(FP_SEED, 7),
+        (FP_SEED ^ 7).wrapping_mul(FP_PRIME)
+    );
     assert_ne!(fp_fold(FP_SEED, 8, 8), fp_fold(FP_SEED, 16, 8));
 }

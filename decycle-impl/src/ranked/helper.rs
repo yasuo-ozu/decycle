@@ -6,7 +6,8 @@ use template_quote::quote;
 
 /// Rejection for a `#[decycle]` trait named with `Fn(...)`-sugar (`where B: Cb(usize) -> usize`):
 /// the ranked-trait rewrite must splice a `Rank` argument, which parenthesized args can't carry.
-const PARENTHESIZED_ARGS_MSG: &str = "unsupported parenthesized generic arguments on a #[decycle] trait";
+const PARENTHESIZED_ARGS_MSG: &str =
+    "unsupported parenthesized generic arguments on a #[decycle] trait";
 
 /// The head (outermost path) ident of a type: `Box` for `Box<Stmt>`, `Stmt` for `Stmt<S>`.
 /// `None` for a non-path type (`&Stmt`, `(A, B)`) or a `<T as Tr>::X` qself.

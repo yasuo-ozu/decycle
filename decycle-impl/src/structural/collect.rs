@@ -60,10 +60,14 @@ pub(crate) struct Model {
 impl Model {
     /// The declaration of `name` in trait `trait_key`, when that trait is declared in this module.
     pub fn trait_method_sig(&self, trait_key: &str, name: &Ident) -> Option<&syn::Signature> {
-        self.traits.get(trait_key)?.items.iter().find_map(|it| match it {
-            syn::TraitItem::Fn(f) if f.sig.ident == *name => Some(&f.sig),
-            _ => None,
-        })
+        self.traits
+            .get(trait_key)?
+            .items
+            .iter()
+            .find_map(|it| match it {
+                syn::TraitItem::Fn(f) if f.sig.ident == *name => Some(&f.sig),
+                _ => None,
+            })
     }
 
     /// Is this trait declared in the module (as opposed to `#[decycle] use`-imported)?

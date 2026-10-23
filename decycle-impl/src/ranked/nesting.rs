@@ -27,8 +27,8 @@
 
 use proc_macro2::{Group, Ident, Spacing, TokenStream, TokenTree};
 use proc_macro_error::abort;
-use syn::spanned::Spanned;
 use std::collections::HashSet;
+use syn::spanned::Spanned;
 use syn::visit_mut::VisitMut;
 use syn::{
     ExprPath, GenericParam, Generics, Item, ItemImpl, Macro, Path, PathArguments, PathSegment,
@@ -316,11 +316,13 @@ impl AliasHeads<'_> {
                         if let Some(TokenTree::Group(g)) = toks.get(i + 2) {
                             out.push(toks[i].clone());
                             out.push(toks[i + 1].clone());
-                            let nested_allowlisted = EXPRESSION_CODE_MACROS
-                                .contains(&id.to_string().as_str());
+                            let nested_allowlisted =
+                                EXPRESSION_CODE_MACROS.contains(&id.to_string().as_str());
                             if nested_allowlisted {
-                                let mut ng =
-                                    Group::new(g.delimiter(), self.rewrite_macro_tokens(g.stream()));
+                                let mut ng = Group::new(
+                                    g.delimiter(),
+                                    self.rewrite_macro_tokens(g.stream()),
+                                );
                                 ng.set_span(g.span());
                                 out.push(TokenTree::Group(ng));
                             } else {
@@ -645,9 +647,7 @@ fn relative_path_root_in_tokens(tokens: &TokenStream) -> Option<proc_macro2::Spa
 /// The span of a `use` tree's leading `super`/`self` segment, if it has one.
 fn relative_use_root(tree: &syn::UseTree) -> Option<proc_macro2::Span> {
     match tree {
-        syn::UseTree::Path(p) => {
-            (p.ident == "super" || p.ident == "self").then(|| p.ident.span())
-        }
+        syn::UseTree::Path(p) => (p.ident == "super" || p.ident == "self").then(|| p.ident.span()),
         syn::UseTree::Group(g) => g.items.iter().find_map(relative_use_root),
         _ => None,
     }

@@ -646,7 +646,9 @@ mod assoc_name_and_generics {
         #[decycle]
         use super::NameClash;
         #[derive(Default)]
-        pub struct A<'a, 'b, const N: usize, T>(pub ::core::marker::PhantomData<(&'a T, &'b [(); N])>);
+        pub struct A<'a, 'b, const N: usize, T>(
+            pub ::core::marker::PhantomData<(&'a T, &'b [(); N])>,
+        );
         #[derive(Default)]
         pub struct B<'a, T>(pub ::core::marker::PhantomData<&'a T>);
         impl<'a, 'b, const N: usize, T> NameClash<'a> for A<'a, 'b, N, T> {

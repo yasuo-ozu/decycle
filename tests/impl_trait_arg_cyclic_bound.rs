@@ -157,7 +157,10 @@ mod generic_cyclic_bound_m {
 fn impl_generic_cyclic_trait_arg_past_floor() {
     use generic_cyclic_bound_m::Sink as _;
     // 15 "+1" on unwind, then other (B).feed(1) = 1 + 1 = 2.
-    assert_eq!(generic_cyclic_bound_m::A.sink(generic_cyclic_bound_m::B, 15), 17);
+    assert_eq!(
+        generic_cyclic_bound_m::A.sink(generic_cyclic_bound_m::B, 15),
+        17
+    );
 }
 
 // -------------------------------------------------------------------------------------------

@@ -446,4 +446,3 @@ fn test_cross_instantiation_cycle() {
         assert_eq!(Wrap(1u16).step(1500), 1500);
     });
 }
-

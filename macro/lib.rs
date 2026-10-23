@@ -154,7 +154,10 @@ fn reject_duplicate(args: &Args) {
 fn pending_decycle_attr(attrs: &[Attribute], decycle_path: &Path) -> Option<proc_macro2::Span> {
     // A parsed path has a first segment; without one only `decycle` names the crate.
     let decycle = Ident::new("decycle", proc_macro2::Span::call_site());
-    let decycle_crate = decycle_path.segments.first().map_or(&decycle, |seg| &seg.ident);
+    let decycle_crate = decycle_path
+        .segments
+        .first()
+        .map_or(&decycle, |seg| &seg.ident);
     attrs
         .iter()
         .find(|attr| decycle_impl::names_decycle_attribute(attr, Some(decycle_crate)))
@@ -201,7 +204,10 @@ pub fn decycle(attr: TokenStream, input: TokenStream) -> TokenStream {
         _ => input.clone().into(),
     });
     let args = parse_macro_input!(attr as Args);
-    let decycle_path = args.decycle.clone().unwrap_or_else(|| parse_quote!(::decycle));
+    let decycle_path = args
+        .decycle
+        .clone()
+        .unwrap_or_else(|| parse_quote!(::decycle));
 
     if let Some(module) = module {
         // Applied twice? Abort here, where it can still be said plainly. The dummy is the raw
@@ -380,10 +386,12 @@ fn parse_check_args(args: &proc_macro2::TokenStream) -> Result<bool> {
         return Ok(false);
     }
     syn::custom_keyword!(structural);
-    syn::parse2::<structural>(args.clone()).map(|_| true).map_err(|e| {
-        Error::new(
+    syn::parse2::<structural>(args.clone())
+        .map(|_| true)
+        .map_err(|e| {
+            Error::new(
             e.span(),
             "`decycle::check` takes no argument, or `structural` (`decycle::check(structural)`)",
         )
-    })
+        })
 }

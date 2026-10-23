@@ -33,8 +33,8 @@ mod graph;
 // How a module names its own items (bare or `self::`), as both engines read it.
 mod names;
 // The checks both engines make of a module's `#[decycle]` markers.
-mod markers;
 mod growth;
+mod markers;
 // Carrying a cycle's premises along its bounds, across traits, shared by both engines.
 mod premise_flow;
 // Matching an impl header against a bound or an obligation, and substituting the match.
@@ -260,7 +260,11 @@ pub(crate) fn is_symbol_attr(a: &Attribute) -> bool {
 
 /// The symbol-defining attributes among `attrs` (see [`is_symbol_attr`]).
 pub(crate) fn symbol_attrs(attrs: &[Attribute]) -> Vec<Attribute> {
-    attrs.iter().filter(|a| is_symbol_attr(a)).cloned().collect()
+    attrs
+        .iter()
+        .filter(|a| is_symbol_attr(a))
+        .cloned()
+        .collect()
 }
 
 fn get_random() -> u64 {

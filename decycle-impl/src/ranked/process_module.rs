@@ -653,9 +653,11 @@ fn process_module_inner(
     let adopts = |im: &ItemImpl| {
         impls_routed_trait(im, &all_traits) && !self_ty_spelled_by_path(&im.self_ty)
     };
-    // Head idents of the types that IMPLEMENT a cyclic trait here — the only heads a bare cyclic
-    // where-bound may target (besides `Self` / an impl type-param). A bound whose head is a foreign
-    // container (`Box<Stmt>: Tr`) has no ranked impl to descend through, so it's flagged below.
+    // Head idents of the types that IMPLEMENT a cyclic trait here, of the impls taken over
+    // (`adopts`) — the only heads a bare cyclic where-bound may target (besides `Self` / an impl
+    // type-param). A bound whose head is a foreign container (`Box<Stmt>: Tr`) has no ranked impl
+    // to descend through, so it's flagged below. Peeling and validating leave self types as they
+    // are, so these are also the heads of the impls split off below for `finalize`.
     let cycle_self_heads: HashSet<Ident> = contents
         .iter()
         .filter_map(|item| {
@@ -739,13 +741,10 @@ fn process_module_inner(
     // one trait unioned each other's. Scope each impl's inheritance to the impls its own cyclic
     // bounds (transitively) obligate instead — see `sharing_sources` and `crate::premise_flow`.
     // The heads `finalize` reads a bare bound as an edge on (`remove_cyclic_bounds`): those of the
-    // impls taken over. A bare bound on any other type is a premise, shared like one.
-    let adopted_heads: HashSet<Ident> = contents
-        .iter()
-        .filter_map(|im| type_head_ident(&im.self_ty))
-        .collect();
+    // impls taken over, `cycle_self_heads`. A bare bound on any other type is a premise, shared
+    // like one.
     let is_edge = |im: &ItemImpl, pred: &WherePredicate| {
-        is_ranked_edge(im, pred, &all_traits, &adopted_heads)
+        is_ranked_edge(im, pred, &all_traits, &cycle_self_heads)
     };
     // The same premises, carried along every cyclic bound, whatever its trait, with the reached
     // impl's parameters mapped through the bound (`crate::premise_flow`). The by-name union below
@@ -758,7 +757,7 @@ fn process_module_inner(
         let impls: Vec<&ItemImpl> = contents.iter().collect();
         let edges: Vec<Vec<crate::premise_flow::CycleEdge>> = impls
             .iter()
-            .map(|im| ranked_cycle_edges(im, &impls, &all_traits, &adopted_heads, &is_edge))
+            .map(|im| ranked_cycle_edges(im, &impls, &all_traits, &cycle_self_heads, &is_edge))
             .collect();
         let by_name: Vec<(Vec<usize>, Vec<Vec<usize>>)> = all_traits
             .iter()

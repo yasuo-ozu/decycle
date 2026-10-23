@@ -154,6 +154,16 @@ as **0.8.0**, not as a 0.7 patch.
   behind a macro. Beside that, the impls of one trait in a cycle still take the union of each
   other's premises by name, as in the ranked engine: a predicate is only given to an impl that
   declares every generic parameter it names, and a `Self`-mentioning one is not.
+- **Breaking (structural): a `#[decycle(structural)]` module rejects three forms the ranked engine
+  already rejects, with the same errors:**
+  - a glob `#[decycle] use path::*;`, which compiled and routed no trait (`glob is not supported in
+    #[decycle] use`; name the traits, `use path::{Tr, Other};`);
+  - a `#[decycle]` anywhere inside a nested module, which compiled: a nested `#[decycle] mod` was
+    expanded on its own, and a marked item of a plain nested module as if outside any `#[decycle]`
+    module (`#[decycle] is not supported in nested modules`; move the module out of the
+    `#[decycle]` module);
+  - `#[decycle]` on a trait alias (`#[decycle] is not supported on a trait alias`). The marker used
+    to be left on the alias, where it failed as an unknown attribute.
 
 ### Removed
 

@@ -132,8 +132,24 @@ fn expand(
     };
 
     // Only impls of traits annotated `#[decycle]` in this module participate — collect their idents
-    // and strip the `#[decycle]` attrs from the trait/use items.
+    // and strip the `#[decycle]` attrs from the trait/use items. A marked trait alias or glob `use`,
+    // and a `#[decycle]` in a nested module, are rejected as the ranked engine rejects them.
     let decycle_traits = collect_decycle_traits(brace_items, &decycle_crate);
+    if brace_items.iter().any(|item| matches!(item, Item::Mod(_))) {
+        // On that abort the module is emitted as the ranked engine leaves it: its own markers taken,
+        // a nested module as written (which then expands on its own), not the caller's fallback.
+        proc_macro_error::set_dummy(as_written(module.clone(), scope));
+        for item in module.content.iter().flat_map(|(_, items)| items) {
+            if let Item::Mod(nested) = item {
+                crate::markers::check_submodule(nested, &decycle_crate);
+            }
+        }
+    }
+    let brace_items = &mut module
+        .content
+        .as_mut()
+        .expect("an inline module, checked above")
+        .1;
 
     let mut items = brace_items.clone();
 
@@ -393,7 +409,8 @@ fn is_cycle_edge(
 }
 
 /// Collect the idents of traits annotated `#[decycle]` (either a `#[decycle] trait Foo` or a
-/// `#[decycle] use path::Foo`) and strip the `#[decycle]` attribute from those items.
+/// `#[decycle] use path::Foo`) and strip the `#[decycle]` attribute from those items. A marked trait
+/// alias or glob `use` is rejected ([`crate::markers`]).
 fn collect_decycle_traits(items: &mut [Item], decycle_crate: &Ident) -> HashSet<String> {
     let mut traits = HashSet::new();
     for item in items.iter_mut() {
@@ -403,9 +420,18 @@ fn collect_decycle_traits(items: &mut [Item], decycle_crate: &Ident) -> HashSet<
                     traits.insert(t.ident.to_string());
                 }
             }
+            Item::TraitAlias(a) => {
+                if take_decycle_attr(&mut a.attrs, decycle_crate) {
+                    crate::markers::reject_trait_alias(a)
+                }
+            }
             Item::Use(u) => {
                 if take_decycle_attr(&mut u.attrs, decycle_crate) {
-                    traits.extend(crate::names::use_names(&u.tree).map(|i| i.to_string()));
+                    traits.extend(
+                        crate::markers::routed_use_names(&u.tree)
+                            .into_iter()
+                            .map(|i| i.to_string()),
+                    );
                     // This engine reads no trait through the `use`: its name is all it takes, and
                     // the module's impls spell the trait by it. Nothing else may name the import
                     // (a stand-in that is only the real trait's copy, reached under a rename), so

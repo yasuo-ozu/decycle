@@ -1,0 +1,13 @@
+error: glob is not supported in #[decycle] use
+  --> tests/ui/structural_glob_use.rs:15:21
+   |
+15 |     use crate::ext::*;
+   |                     ^
+
+warning: unused import: `crate::ext::*`
+  --> tests/ui/structural_glob_use.rs:15:9
+   |
+15 |     use crate::ext::*;
+   |         ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

@@ -32,6 +32,8 @@ mod generics_fmt;
 mod graph;
 // How a module names its own items (bare or `self::`), as both engines read it.
 mod names;
+// The checks both engines make of a module's `#[decycle]` markers.
+mod markers;
 mod growth;
 // Carrying a cycle's premises along its bounds, across traits, shared by both engines.
 mod premise_flow;

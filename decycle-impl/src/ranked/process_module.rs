@@ -42,46 +42,15 @@ fn check_no_deep_super_paths(contents: &[Item]) {
     }
 }
 
-fn check_submodule(module: &ItemMod, decycle_crate: &Ident) {
-    use syn::visit::Visit;
-    struct Visitor<'a> {
-        decycle_crate: &'a Ident,
-    }
-    impl<'ast, 'a> Visit<'ast> for Visitor<'a> {
-        fn visit_attribute(&mut self, i: &'ast syn::Attribute) {
-            if crate::is_decycle_attribute(i, self.decycle_crate) {
-                abort!(&i, "#[decycle] is not supported in nested modules")
-            }
-            syn::visit::visit_attribute(self, i);
-        }
-    }
-    Visitor { decycle_crate }.visit_item_mod(module);
-}
-
 fn process_trait_path(item: &Item) -> Vec<Path> {
     match item {
         Item::Trait(ItemTrait { ident, .. }) => {
             vec![crate::ident_to_path(ident)]
         }
-        Item::TraitAlias(item_trait_alias) => {
-            // A trait alias has no body to carry through the macro ping-pong (there's no
-            // `ItemTrait` to embed), so `#[decycle]` on one silently produced a bogus
-            // working-list entry with nothing behind it. Reject it cleanly instead.
-            abort!(
-                &item_trait_alias.ident,
-                "#[decycle] is not supported on a trait alias"
-            )
-        }
-        Item::Use(ItemUse { tree, .. }) => use_leaves(tree)
+        Item::TraitAlias(item_trait_alias) => crate::markers::reject_trait_alias(item_trait_alias),
+        Item::Use(ItemUse { tree, .. }) => crate::markers::routed_use_names(tree)
             .into_iter()
-            .map(|leaf| match leaf {
-                UseLeaf::Name(ident) | UseLeaf::Rename { local: ident, .. } => {
-                    crate::ident_to_path(ident)
-                }
-                UseLeaf::Glob(use_glob) => {
-                    abort!(use_glob, "glob is not supported in #[decycle] use")
-                }
-            })
+            .map(crate::ident_to_path)
             .collect(),
         _ => unreachable!(),
     }
@@ -639,7 +608,7 @@ fn process_module_inner(
     for item in contents.iter() {
         match item {
             Item::Mod(item_mod) => {
-                check_submodule(item_mod, decycle_crate);
+                crate::markers::check_submodule(item_mod, decycle_crate);
             }
             // A `macro_rules!` DEFINITION is transparent: it introduces no item the rewrite has to
             // see, and it is re-emitted in place among the raw contents — ahead of the nested helper

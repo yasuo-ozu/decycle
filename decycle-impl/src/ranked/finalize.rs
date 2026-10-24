@@ -4,7 +4,7 @@ use crate::names::trait_fns;
 use crate::unify::Subst;
 use proc_macro2::{Span, TokenStream};
 use proc_macro_error::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::*;
@@ -271,7 +271,7 @@ fn remove_cyclic_bounds(
 /// The head idents of every type that IMPLEMENTS a cyclic trait in this module — the set of targets
 /// a rank-lowered bound can actually descend into. Derived from `replacing_table` (which already
 /// holds each cyclic trait's impls), so no extra plumbing from `process_module` is needed.
-fn cycle_self_heads(replacing_table: &Table) -> std::collections::HashSet<Ident> {
+fn cycle_self_heads(replacing_table: &Table) -> HashSet<Ident> {
     replacing_table
         .values()
         .flat_map(|(_, _, impls)| impls.iter())
@@ -1195,7 +1195,7 @@ fn is_syntactically_unsized(ty: &Type) -> bool {
 
 /// The idents of `generics`' type params that are declared `?Sized` (inline or in the
 /// where-clause).
-fn maybe_unsized_type_params(generics: &Generics) -> std::collections::HashSet<Ident> {
+fn maybe_unsized_type_params(generics: &Generics) -> HashSet<Ident> {
     generics
         .params
         .iter()
@@ -1225,7 +1225,7 @@ fn maybe_unsized_type_params(generics: &Generics) -> std::collections::HashSet<I
 /// layout fold from the key — which stays sound because EVERY site that keys the same floor
 /// computes the flag the same way (see `impl_self_may_be_unsized` /
 /// `bound_target_floor_is_unsized`) — whereas being wrong the other way is a hard compile error.
-fn type_may_be_unsized(ty: &Type, maybe_unsized: &std::collections::HashSet<Ident>) -> bool {
+fn type_may_be_unsized(ty: &Type, maybe_unsized: &HashSet<Ident>) -> bool {
     if is_syntactically_unsized(ty) {
         return true;
     }
@@ -1639,12 +1639,12 @@ fn reachable_side_bounds_ok(
     target_targs: &[GenericArgument],
     replacing_table: &Table,
 ) -> bool {
-    let own_side: std::collections::HashSet<String> =
+    let own_side: HashSet<String> =
         side_predicate_strings(&registering_impl.generics, replacing_table, None)
             .into_iter()
             .collect();
 
-    let mut visited: std::collections::HashSet<(Ident, String)> = Default::default();
+    let mut visited: HashSet<(Ident, String)> = Default::default();
     let mut queue: std::collections::VecDeque<(Ident, Type, Vec<GenericArgument>)> =
         Default::default();
     queue.push_back((
@@ -1840,53 +1840,39 @@ fn reentry_used_mask(
     norm: &NormSig,
     s_ident: &Ident,
 ) -> (bool, Vec<bool>, Vec<bool>) {
-    struct Used(std::collections::HashSet<String>);
-    impl<'ast> syn::visit::Visit<'ast> for Used {
-        fn visit_ident(&mut self, i: &'ast Ident) {
-            self.0.insert(i.to_string());
-        }
-    }
-    let mut used = Used(Default::default());
-    for (_, ty) in &norm.params {
-        syn::visit::Visit::visit_type(&mut used, ty);
-    }
-    if let Some(t) = &norm.output_ty {
-        syn::visit::Visit::visit_type(&mut used, t);
-    }
-    let mask = |params: &Generics| -> Vec<bool> {
-        params
-            .params
+    let (used, _) = used_names(norm);
+    let mask = |g: &Generics| -> Vec<bool> {
+        type_const_idents(g)
             .iter()
-            .filter(|p| !matches!(p, GenericParam::Lifetime(_)))
-            .map(|p| match p {
-                GenericParam::Type(t) => used.0.contains(&t.ident.to_string()),
-                GenericParam::Const(c) => used.0.contains(&c.ident.to_string()),
-                GenericParam::Lifetime(_) => unreachable!(),
-            })
+            .map(|i| used.contains(&i.to_string()))
             .collect()
     };
     (
-        used.0.contains(&s_ident.to_string()),
+        used.contains(&s_ident.to_string()),
         mask(&trait_.generics),
         mask(&norm.sig.generics),
     )
 }
 
-fn used_lifetime_idents(norm: &NormSig) -> std::collections::HashSet<String> {
-    struct Used(std::collections::HashSet<String>);
+/// The idents, and the lifetime names, that the parameter and output types of `norm` use (a
+/// lifetime's ident counts as an ident too).
+fn used_names(norm: &NormSig) -> (HashSet<String>, HashSet<String>) {
+    #[derive(Default)]
+    struct Used(HashSet<String>, HashSet<String>);
     impl<'ast> syn::visit::Visit<'ast> for Used {
+        fn visit_ident(&mut self, i: &'ast Ident) {
+            self.0.insert(i.to_string());
+        }
         fn visit_lifetime(&mut self, l: &'ast Lifetime) {
-            self.0.insert(l.ident.to_string());
+            self.1.insert(l.ident.to_string());
+            syn::visit::visit_lifetime(self, l);
         }
     }
-    let mut used = Used(Default::default());
-    for (_, ty) in &norm.params {
+    let mut used = Used::default();
+    for ty in norm.params.iter().map(|(_, t)| t).chain(&norm.output_ty) {
         syn::visit::Visit::visit_type(&mut used, ty);
     }
-    if let Some(t) = &norm.output_ty {
-        syn::visit::Visit::visit_type(&mut used, t);
-    }
-    used.0
+    (used.0, used.1)
 }
 
 /// How the re-entry machinery (inside `ranked_traits`) names the ORIGINAL trait: through the
@@ -1972,7 +1958,7 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize) -> TokenStream {
                 .chain(norm.output_ty.as_ref()),
             &s_ident,
         );
-        let used_lts = used_lifetime_idents(&norm);
+        let (_, used_lts) = used_names(&norm);
 
         let (m_lts, m_tycon) = split_lifetimes(&norm.sig.generics.params);
         // C3: `normalize_reentry_sig` only bare-`Self`-substitutes the signature (params +
@@ -2286,7 +2272,7 @@ fn rule2_targets(
         format!("{}|{}|{}", tr, quote!(#ty), quote!(#(#targs),*))
     };
     let cbs = cyclic_where_bounds(impl_, replacing_table);
-    let mut seen: std::collections::HashSet<String> = cbs
+    let mut seen: HashSet<String> = cbs
         .iter()
         .map(|cb| key(&cb.trait_ident, &cb.target, &cb.targs))
         .collect();
@@ -2938,7 +2924,7 @@ fn in_declaration_order<'a>(
     traits: &[ItemTrait],
     replacing_table: &'a Table,
 ) -> Vec<&'a (ItemTrait, usize, Vec<ItemImpl>)> {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     traits
         .iter()
         .filter(|trait_| seen.insert(trait_.ident.clone()))
@@ -2951,7 +2937,7 @@ fn in_declaration_order<'a>(
 /// definition because the ranked trait's associated type bound refers to the original
 /// trait, causing a cycle through the Final impl.
 fn check_assoc_type_self(in_order: &[&(ItemTrait, usize, Vec<ItemImpl>)]) {
-    let decycle_idents: std::collections::HashSet<&Ident> = in_order
+    let decycle_idents: HashSet<&Ident> = in_order
         .iter()
         .map(|(trait_, _, _)| &trait_.ident)
         .collect();
@@ -3192,10 +3178,10 @@ fn build_supertrait_registrations(
     }
     let rt = quote!(#{name!("ranked_traits")});
     let self_unsized = impl_self_may_be_unsized(impl_);
-    let mut seen: std::collections::HashSet<Ident> = Default::default();
+    let mut seen: HashSet<Ident> = Default::default();
     let mut queue: Vec<&ItemTrait> = vec![trait_];
     while let Some(sub) = queue.pop() {
-        let sub_params: std::collections::HashSet<String> = type_const_idents(&sub.generics)
+        let sub_params: HashSet<String> = type_const_idents(&sub.generics)
             .iter()
             .map(Ident::to_string)
             .collect();
@@ -3371,8 +3357,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
     // already covered (a no-op rename, or a collision with another listed trait's own name —
     // either would otherwise double-define the same dummy ident).
     let renamed_original_dummies: Vec<Ident> = {
-        let mut seen: std::collections::HashSet<String> =
-            replacing_table.keys().map(|i| i.to_string()).collect();
+        let mut seen: HashSet<String> = replacing_table.keys().map(|i| i.to_string()).collect();
         let mut out = Vec::new();
         for (original, local) in &args.renames {
             if original != local && seen.insert(original.to_string()) {

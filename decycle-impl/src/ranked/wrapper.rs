@@ -28,7 +28,6 @@
 //! that may name one type — because a bridge that overlaps is E0119 on code that compiled before.
 
 use super::*;
-use std::collections::HashSet;
 use syn::visit_mut::VisitMut;
 
 // `finalize`'s `parse_quote!` (template-quote interpolation), under a name the glob import of `syn`

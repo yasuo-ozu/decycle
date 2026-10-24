@@ -113,9 +113,7 @@ fn mentions(ty: &Type, idents: &HashSet<Ident>) -> bool {
 }
 
 fn mentions_self(ty: &Type) -> bool {
-    let mut s = HashSet::new();
-    s.insert(Ident::new("Self", Span::call_site()));
-    mentions(ty, &s)
+    mentions(ty, &HashSet::from([Ident::new("Self", Span::call_site())]))
 }
 
 /// The bare routed-trait bounds of `im` that its ranked copies rank-lower — the ones
@@ -129,15 +127,11 @@ fn cyclic_requirements(
     let mut out = Vec::new();
     let mut push = |target: &Type, b: &TypeParamBound, binder: bool| {
         let TypeParamBound::Trait(tb) = b else { return };
-        let mut path = tb.path.clone();
-        crate::names::strip_leading_self(&mut path);
-        if path.leading_colon.is_some() || path.segments.len() != 1 {
+        // A bare or `self::` spelling of a ranked trait, whose last segment is the trait's.
+        if !crate::names::bare_ident(&tb.path).is_some_and(|i| table.contains_key(i)) {
             return;
         }
-        let seg = &path.segments[0];
-        if !table.contains_key(&seg.ident) {
-            return;
-        }
+        let seg = tb.path.segments.last().unwrap();
         let participant = is_bare_param(target, &params)
             || is_self_type(target)
             || crate::helper::type_head_ident(target).is_some_and(|h| heads.contains(&h))
@@ -157,13 +151,9 @@ fn cyclic_requirements(
             push(&target, b, false);
         }
     }
-    if let Some(wc) = &im.generics.where_clause {
-        for pred in &wc.predicates {
-            if let WherePredicate::Type(pt) = pred {
-                for b in &pt.bounds {
-                    push(&pt.bounded_ty, b, pt.lifetimes.is_some());
-                }
-            }
+    for pt in crate::names::type_predicates(&im.generics) {
+        for b in &pt.bounds {
+            push(&pt.bounded_ty, b, pt.lifetimes.is_some());
         }
     }
     out
@@ -314,22 +304,16 @@ fn may_unify(a: &Type, avars: &HashSet<Ident>, b: &Type, bvars: &HashSet<Ident>)
             }
             match (&la.arguments, &lb.arguments) {
                 (PathArguments::AngleBracketed(x), PathArguments::AngleBracketed(y)) => {
-                    let xt: Vec<&Type> = x
-                        .args
-                        .iter()
-                        .filter_map(|g| match g {
-                            GenericArgument::Type(t) => Some(t),
-                            _ => None,
-                        })
-                        .collect();
-                    let yt: Vec<&Type> = y
-                        .args
-                        .iter()
-                        .filter_map(|g| match g {
-                            GenericArgument::Type(t) => Some(t),
-                            _ => None,
-                        })
-                        .collect();
+                    fn types(args: &AngleBracketedGenericArguments) -> Vec<&Type> {
+                        args.args
+                            .iter()
+                            .filter_map(|g| match g {
+                                GenericArgument::Type(t) => Some(t),
+                                _ => None,
+                            })
+                            .collect()
+                    }
+                    let (xt, yt) = (types(x), types(y));
                     xt.len() != yt.len()
                         || xt
                             .iter()
@@ -356,20 +340,9 @@ fn may_unify(a: &Type, avars: &HashSet<Ident>, b: &Type, bvars: &HashSet<Ident>)
         }
         (Type::Array(x), Type::Array(y)) => may_unify(&x.elem, avars, &y.elem, bvars),
         (Type::Slice(x), Type::Slice(y)) => may_unify(&x.elem, avars, &y.elem, bvars),
-        (Type::Path(_), Type::Path(_)) => true, // a projection on either side
-        (Type::Path(TypePath { qself: Some(_), .. }), _)
-        | (_, Type::Path(TypePath { qself: Some(_), .. })) => true,
-        (Type::Tuple(_), _)
-        | (Type::Reference(_), _)
-        | (Type::Ptr(_), _)
-        | (Type::Array(_), _)
-        | (Type::Slice(_), _)
-        | (Type::Path(_), _)
-            if is_plain_kind(b) =>
-        {
-            false
-        }
-        _ => true,
+        // Two different plain kinds are different types; a projection on either side, or any other
+        // kind, may be anything.
+        _ => !(is_plain_kind(a) && is_plain_kind(b)),
     }
 }
 

@@ -98,6 +98,20 @@ pub(crate) fn wrap_angle(inner: &TokenStream) -> TokenStream {
     }
 }
 
+/// `params` split into its lifetimes and the rest (its type and const parameters), each in order.
+pub(crate) fn split_lifetimes<'a>(
+    params: impl IntoIterator<Item = &'a GenericParam>,
+) -> (Vec<&'a GenericParam>, Vec<&'a GenericParam>) {
+    params
+        .into_iter()
+        .partition(|p| matches!(p, GenericParam::Lifetime(_)))
+}
+
+/// The items of `items` whose `mask` entry is set, in order.
+pub(crate) fn masked<'a, T>(items: &'a [T], mask: &'a [bool]) -> impl Iterator<Item = &'a T> {
+    items.iter().zip(mask).filter(|(_, k)| **k).map(|(t, _)| t)
+}
+
 /// The idents of `generics`' type and const parameters, in order — the arguments a turbofish names
 /// (lifetimes are left to inference).
 pub(crate) fn type_const_idents(generics: &Generics) -> Vec<Ident> {

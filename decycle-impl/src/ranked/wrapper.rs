@@ -271,12 +271,7 @@ fn ranked_supers(
     targs: &[GenericArgument],
     table: &Table,
 ) -> Vec<(Ident, Vec<GenericArgument>)> {
-    let tparams: Vec<&GenericParam> = trait_
-        .generics
-        .params
-        .iter()
-        .filter(|p| !matches!(p, GenericParam::Lifetime(_)))
-        .collect();
+    let (_, tparams) = split_lifetimes(&trait_.generics.params);
     let mut subst = Subst::new();
     for (p, a) in tparams.iter().zip(targs.iter()) {
         if let (GenericParam::Type(tp), GenericArgument::Type(t)) = (p, a) {
@@ -897,37 +892,13 @@ pub(super) fn emit_bridge(trait_: &ItemTrait, rank_loc: usize, b: &BridgeReq) ->
     let ranked_args = trait_.generics.ty_generics().insert(rank_loc, pq!(#rank));
     let real = original_trait_path(trait_);
     let ty = &b.ty;
-    let trait_lts: Vec<&GenericParam> = trait_
-        .generics
-        .params
-        .iter()
-        .filter(|p| matches!(p, GenericParam::Lifetime(_)))
-        .collect();
-    let trait_rest: Vec<&GenericParam> = trait_
-        .generics
-        .params
-        .iter()
-        .filter(|p| !matches!(p, GenericParam::Lifetime(_)))
-        .collect();
-    let own_lts: Vec<&GenericParam> = b
-        .params
-        .iter()
-        .filter(|p| matches!(p, GenericParam::Lifetime(_)))
-        .collect();
-    let own_rest: Vec<&GenericParam> = b
-        .params
-        .iter()
-        .filter(|p| !matches!(p, GenericParam::Lifetime(_)))
-        .collect();
+    let (trait_lts, trait_rest) = split_lifetimes(&trait_.generics.params);
+    let (own_lts, own_rest) = split_lifetimes(&b.params);
     // A where-clause only when it is not global: on a type and trait with no parameter at all, a
     // false global bound is the `trivial_bounds` error, and the body states the obligation anyway.
     let generic = !b.params.is_empty() || !trait_.generics.params.is_empty();
-    let trait_where: Vec<&WherePredicate> = trait_
-        .generics
-        .where_clause
-        .iter()
-        .flat_map(|w| w.predicates.iter())
-        .collect();
+    let trait_where: Vec<&WherePredicate> =
+        crate::names::where_predicates(&trait_.generics).collect();
     let mut items = TokenStream::new();
     for item in &trait_.items {
         match item {

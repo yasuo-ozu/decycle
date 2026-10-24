@@ -1,4 +1,4 @@
-use crate::generics_fmt::{param_decl, type_const_idents, DeclBounds};
+use crate::generics_fmt::{masked, param_decl, split_lifetimes, type_const_idents, DeclBounds};
 use crate::helper::*;
 use crate::names::trait_fns;
 use crate::unify::Subst;
@@ -1950,31 +1950,14 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize) -> TokenStream {
         .insert(rank_loc, parse_quote!(()));
     let ranked_trait_path_leaf: Path = parse_quote!(#ranked_trait_ident #ranked_args_at_leaf);
 
+    let mut self_subst = SelfSubst {
+        s_ty: &s_ty,
+        trait_path: &trait_path_full,
+    };
     let mut tg = trait_.generics.clone();
-    syn::visit_mut::VisitMut::visit_generics_mut(
-        &mut SelfSubst {
-            s_ty: &s_ty,
-            trait_path: &trait_path_full,
-        },
-        &mut tg,
-    );
-    let trait_lts: Vec<GenericParam> = tg
-        .params
-        .iter()
-        .filter(|p| matches!(p, GenericParam::Lifetime(_)))
-        .cloned()
-        .collect();
-    let trait_tycon: Vec<GenericParam> = tg
-        .params
-        .iter()
-        .filter(|p| !matches!(p, GenericParam::Lifetime(_)))
-        .cloned()
-        .collect();
-    let trait_where: Vec<WherePredicate> = tg
-        .where_clause
-        .as_ref()
-        .map(|w| w.predicates.iter().cloned().collect())
-        .unwrap_or_default();
+    syn::visit_mut::VisitMut::visit_generics_mut(&mut self_subst, &mut tg);
+    let (trait_lts, trait_tycon) = split_lifetimes(&tg.params);
+    let trait_where: Vec<&WherePredicate> = crate::names::where_predicates(&tg).collect();
 
     for tf in trait_fns(trait_) {
         let orig_sig = &tf.sig;
@@ -2009,22 +1992,7 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize) -> TokenStream {
         );
         let used_lts = used_lifetime_idents(&norm);
 
-        let m_lts: Vec<GenericParam> = norm
-            .sig
-            .generics
-            .params
-            .iter()
-            .filter(|p| matches!(p, GenericParam::Lifetime(_)))
-            .cloned()
-            .collect();
-        let m_tycon: Vec<GenericParam> = norm
-            .sig
-            .generics
-            .params
-            .iter()
-            .filter(|p| !matches!(p, GenericParam::Lifetime(_)))
-            .cloned()
-            .collect();
+        let (m_lts, m_tycon) = split_lifetimes(&norm.sig.generics.params);
         // C3: `normalize_reentry_sig` only bare-`Self`-substitutes the signature (params +
         // output type) — a `Self::Assoc` PROJECTION surviving in the copied method
         // where-clause (e.g. a span-tying surface `A: Spanned<Span = Self::SpanParam>`)
@@ -2035,46 +2003,26 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize) -> TokenStream {
         // #trait_ident #trait_args` is already in `#re`'s own where-clause below, so the
         // projection resolves; the Final impl's `type SpanParam = S;` bottoms it out in one
         // hop. A no-op for any where-clause with no `Self`-prefixed multi-segment path.
-        let m_where: Vec<WherePredicate> = norm
-            .sig
-            .generics
-            .where_clause
-            .as_ref()
-            .map(|w| w.predicates.iter().cloned().collect::<Vec<_>>())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|mut w| {
-                syn::visit_mut::VisitMut::visit_where_predicate_mut(
-                    &mut SelfSubst {
-                        s_ty: &s_ty,
-                        trait_path: &trait_path_full,
-                    },
-                    &mut w,
-                );
+        let m_where: Vec<WherePredicate> = crate::names::where_predicates(&norm.sig.generics)
+            .map(|w| {
+                let mut w = w.clone();
+                syn::visit_mut::VisitMut::visit_where_predicate_mut(&mut self_subst, &mut w);
                 w
             })
             .collect();
         // Alias generics: used lifetimes, then S (if used), then used type/const params.
         let alias_lts: Vec<&GenericParam> = trait_lts
             .iter()
-            .chain(m_lts.iter())
+            .chain(&m_lts)
+            .copied()
             .filter(|p| match p {
                 GenericParam::Lifetime(l) => used_lts.contains(&l.lifetime.ident.to_string()),
                 _ => false,
             })
             .collect();
-        let alias_tycon: Vec<&GenericParam> = trait_tycon
-            .iter()
-            .zip(tmask.iter())
-            .filter(|(_, k)| **k)
-            .map(|(p, _)| p)
-            .chain(
-                m_tycon
-                    .iter()
-                    .zip(mmask.iter())
-                    .filter(|(_, k)| **k)
-                    .map(|(p, _)| p),
-            )
+        let alias_tycon: Vec<&GenericParam> = masked(&trait_tycon, &tmask)
+            .chain(masked(&m_tycon, &mmask))
+            .copied()
             .collect();
         let fresh = &norm.fresh;
         let m_ident = &norm.sig.ident;
@@ -2095,17 +2043,11 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize) -> TokenStream {
         // signature-position patterns — those may carry `mut` (valid in the `#re` fn's own
         // param list at its declaration below, invalid as a call-argument expression).
         let param_pats: Vec<&TokenStream> = norm.arg_idents.iter().collect();
-        let out_tokens = match &norm.output_ty {
-            Some(t) => quote!(-> #t),
-            None => quote!(),
-        };
+        let out_tokens = norm.output_ty.as_ref().map(|t| quote!(-> #t));
         // The alias's own body types — projecting any `Self::Assoc` through the ranked trait
         // at the leaf instead of the real one (see the comment above `ranked_trait_path_leaf`).
         let alias_param_tys: Vec<&Type> = norm_alias.params.iter().map(|(_, t)| t).collect();
-        let alias_out_tokens = match &norm_alias.output_ty {
-            Some(t) => quote!(-> #t),
-            None => quote!(),
-        };
+        let alias_out_tokens = norm_alias.output_ty.as_ref().map(|t| quote!(-> #t));
         // Only emit the alias's `where` clause when its body actually contains an
         // associated-type projection needing it — see `any_type_has_projection`'s doc comment.
         let alias_needs_bound = any_type_has_projection(
@@ -2121,14 +2063,7 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize) -> TokenStream {
         // `Self`), naming that projection at the floor needs `A: Spanned` in scope — the plain
         // `S: <ranked trait>` bound above doesn't provide it. Harmless when unneeded: a
         // satisfiable bound on a concrete, masked-in `A` at the floor.
-        let m_tycon_alias: Vec<GenericParam> = norm_alias
-            .sig
-            .generics
-            .params
-            .iter()
-            .filter(|p| !matches!(p, GenericParam::Lifetime(_)))
-            .cloned()
-            .collect();
+        let (_, m_tycon_alias) = split_lifetimes(&norm_alias.sig.generics.params);
         // The alias declares BOTH the trait's type params (`alias_tycon`) and the method's
         // (`m_tycon_alias`) with `DeclBounds::Unsized` — every bound stripped. That is fine while the
         // signature merely NAMES those params, but not when a bound PROJECTS through one. A
@@ -2141,56 +2076,45 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize) -> TokenStream {
         // copies a user signature must carry the premises that signature projects through. Restating
         // a method-level `where Atom: Spanned` on the trait does NOT help — those are dropped here
         // too — so this is the only place it can be fixed.
-        let alias_method_bounds: Vec<WherePredicate> = alias_tycon
-            .iter()
-            .copied()
-            .cloned()
-            .chain(
-                m_tycon_alias
-                    .iter()
-                    .zip(mmask.iter())
-                    .filter(|(_, k)| **k)
-                    .map(|(p, _)| p.clone()),
-            )
+        let mut alias_method_bounds: Vec<WherePredicate> = Vec::new();
+        for p in alias_tycon.iter().chain(masked(&m_tycon_alias, &mmask)) {
+            let GenericParam::Type(t) = p else { continue };
+            // Drop a user-written `?Sized`. The param is DECLARED with `DeclBounds::Unsized`
+            // below, which already emits `T: ?::core::marker::Sized`; repeating the relaxation
+            // here is a *second* relaxed bound on the same param, which rustc rejects with E0203
+            // ("duplicate relaxed `Sized` bounds"). Nothing is lost — the declaration makes
+            // exactly the same statement. If the relaxation was the param's only bound, the
+            // predicate disappears entirely.
+            let bounds: Punctuated<TypeParamBound, Token![+]> = t
+                .bounds
+                .iter()
+                .filter(|b| {
+                    !matches!(b, TypeParamBound::Trait(tb)
+                        if matches!(tb.modifier, TraitBoundModifier::Maybe(_)))
+                })
+                .cloned()
+                .collect();
+            if bounds.is_empty() {
+                continue;
+            }
+            let ident = &t.ident;
+            let w: WherePredicate = parse_quote!(#ident: #bounds);
             // `alias_tycon` と `m_tycon_alias` は重なりうるので、同じ述語を二度書かない。
             // rustc は重複を受け入れるが、生成物を読む人には無駄なノイズになる。
-            .filter_map(|p| match &p {
-                GenericParam::Type(t) if !t.bounds.is_empty() => {
-                    // Drop a user-written `?Sized`. The param is DECLARED with
-                    // `DeclBounds::Unsized` below, which already emits
-                    // `T: ?::core::marker::Sized`; repeating the relaxation here is a *second*
-                    // relaxed bound on the same param, which rustc rejects with E0203
-                    // ("duplicate relaxed `Sized` bounds"). Nothing is lost — the declaration
-                    // makes exactly the same statement. If the relaxation was the param's only
-                    // bound, the predicate disappears entirely.
-                    let bounds: Punctuated<TypeParamBound, Token![+]> = t
-                        .bounds
-                        .iter()
-                        .filter(|b| {
-                            !matches!(b, TypeParamBound::Trait(tb)
-                                if matches!(tb.modifier, TraitBoundModifier::Maybe(_)))
-                        })
-                        .cloned()
-                        .collect();
-                    if bounds.is_empty() {
-                        return None;
-                    }
-                    let ident = &t.ident;
-                    Some(parse_quote!(#ident: #bounds))
-                }
-                _ => None,
-            })
-            .fold(Vec::new(), |mut acc: Vec<WherePredicate>, w| {
-                if !acc
-                    .iter()
-                    .any(|x| quote!(#x).to_string() == quote!(#w).to_string())
-                {
-                    acc.push(w);
-                }
-                acc
-            });
+            if !alias_method_bounds
+                .iter()
+                .any(|x| quote!(#x).to_string() == quote!(#w).to_string())
+            {
+                alias_method_bounds.push(w);
+            }
+        }
         let orig_margs = type_const_idents(&orig_sig.generics);
         let do_turbofish = !orig_margs.is_empty() && !sig_has_impl_trait_input(orig_sig);
+        let call = quote! {
+            <#s_ident as #trait_path_full>::#m_ident
+            #(if do_turbofish) { ::<#(#orig_margs),*> }
+            (#(#param_pats),*)
+        };
 
         out.extend(quote! {
             #[allow(dead_code, non_camel_case_types)]
@@ -2250,18 +2174,8 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize) -> TokenStream {
             {
                 // As in the floor (`emit_impl_items_leaf`): don't nest a redundant, always-
                 // present `{ ... }` when there's no `unsafe` to scope it for.
-                #(if unsafety.is_some()) {
-                    unsafe {
-                        <#s_ident as #trait_path_full>::#m_ident
-                        #(if do_turbofish) { ::<#(#orig_margs),*> }
-                        (#(#param_pats),*)
-                    }
-                }
-                #(if unsafety.is_none()) {
-                    <#s_ident as #trait_path_full>::#m_ident
-                    #(if do_turbofish) { ::<#(#orig_margs),*> }
-                    (#(#param_pats),*)
-                }
+                #(if unsafety.is_some()) { unsafe { #call } }
+                #(else) { #call }
             }
         });
     }

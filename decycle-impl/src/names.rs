@@ -130,16 +130,17 @@ pub(crate) fn names_bare(ty: &Type, names: &HashSet<Ident>) -> bool {
     !bare_named_in(ty, &|i| names.contains(i)).is_empty()
 }
 
+/// The predicates of `generics`' `where`-clause, in order.
+pub(crate) fn where_predicates(generics: &Generics) -> impl Iterator<Item = &WherePredicate> {
+    generics.where_clause.iter().flat_map(|wc| &wc.predicates)
+}
+
 /// The type predicates of `generics`' `where`-clause (`T: Bound`, `for<'a> X<'a>: Bound`), in order.
 pub(crate) fn type_predicates(generics: &Generics) -> impl Iterator<Item = &PredicateType> {
-    generics
-        .where_clause
-        .iter()
-        .flat_map(|wc| &wc.predicates)
-        .filter_map(|pred| match pred {
-            WherePredicate::Type(pt) => Some(pt),
-            _ => None,
-        })
+    where_predicates(generics).filter_map(|pred| match pred {
+        WherePredicate::Type(pt) => Some(pt),
+        _ => None,
+    })
 }
 
 /// The methods of `trait_`, in order.

@@ -30,11 +30,7 @@ pub fn type_head_ident(ty: &Type) -> Option<Ident> {
 /// names only need to be unique and deterministic, and dropping the two-character prefix keeps
 /// both: `r#loop` and `loop` cannot co-exist as one module's items in the first place.
 pub fn unraw(ident: &Ident) -> String {
-    let name = ident.to_string();
-    match name.strip_prefix("r#") {
-        Some(stripped) => stripped.to_owned(),
-        None => name,
-    }
+    syn::ext::IdentExt::unraw(ident).to_string()
 }
 
 /// Is `path` **depth-fragile** — i.e. does its meaning change when the item carrying it is re-emitted
@@ -207,13 +203,7 @@ pub trait GenericsScheme {
 impl GenericsScheme for Generics {
     fn push_predicate(&self, predicate: WherePredicate) -> Self {
         let mut g = self.clone();
-        g.where_clause
-            .get_or_insert(WhereClause {
-                where_token: Default::default(),
-                predicates: Default::default(),
-            })
-            .predicates
-            .push(predicate);
+        g.make_where_clause().predicates.push(predicate);
         g
     }
 
@@ -257,35 +247,6 @@ impl GenericsScheme for Generics {
                 args,
                 gt_token: self.gt_token.unwrap_or_default(),
             })
-        }
-    }
-}
-
-impl GenericsScheme for Path {
-    fn push_predicate(&self, _predicate: WherePredicate) -> Self {
-        unimplemented!()
-    }
-
-    fn insert(&self, index: usize, param: TypeParam) -> Self {
-        let mut path = self.clone();
-        let ident = &param.ident;
-        let ty = Type::Path(TypePath {
-            qself: None,
-            path: syn::parse_quote!(#ident),
-        });
-        path_insert_type_arg(&mut path, index, ty);
-        path
-    }
-
-    fn impl_generics(&self) -> TokenStream {
-        quote!()
-    }
-
-    fn ty_generics(&self) -> PathArguments {
-        if let Some(last_segment) = self.segments.last() {
-            last_segment.arguments.clone()
-        } else {
-            PathArguments::None
         }
     }
 }

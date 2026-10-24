@@ -3301,7 +3301,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                                 #[allow(unused_variables, unused_mut)]
                                 impl #{g.impl_generics()}
                                 #{name!("{}Ranked", &trait_.ident)}
-                                #{impl_.trait_.as_ref().unwrap().1.ty_generics().insert(*rank_loc, rank)}
+                                #{impl_.trait_.as_ref().unwrap().1.segments.last().unwrap().arguments.insert(*rank_loc, rank)}
                                 for #{&impl_.self_ty} #{&g.where_clause} {
                                     #{emit_impl_items_leaf(impl_, trait_, body, &decycle_path)}
                                 }
@@ -3607,14 +3607,14 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                     #{&impl_.trait_.as_ref().unwrap().1.segments.last().unwrap().arguments}
                     for #{&impl_.self_ty} #{g.push_predicate(parse_quote!(
                         Self: #{name!("shadowing_module")}::#{name!("ranked_traits")}::#{name!("{}Ranked", &trait_.ident)}
-                        #{impl_.trait_.as_ref().unwrap().1.ty_generics().insert(*rank_loc, initial_rank.clone())}
+                        #{impl_.trait_.as_ref().unwrap().1.segments.last().unwrap().arguments.insert(*rank_loc, initial_rank.clone())}
                     )).where_clause}
                     {
                         #{emit_impl_items_delegate(
                             impl_,
                             quote!(
                                 <Self as #{name!("shadowing_module")}::#{name!("ranked_traits")}::#{name!("{}Ranked", &trait_.ident)}
-                                #{impl_.trait_.as_ref().unwrap().1.ty_generics().insert(*rank_loc, initial_rank.clone())} >
+                                #{impl_.trait_.as_ref().unwrap().1.segments.last().unwrap().arguments.insert(*rank_loc, initial_rank.clone())} >
                             ),
                             bareparam,
                         )}

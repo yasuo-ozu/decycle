@@ -100,14 +100,14 @@ pub(crate) fn codegen_scc(model: &Model, scc: &Scc) -> syn::Result<TokenStream> 
 pub(crate) fn make_term_item(member: &Adt, nonce: u64) -> TokenStream {
     let term = term_ident(&member.ident.to_string(), nonce);
     let m_id = &member.ident;
-    let vis = member.vis();
+    let vis = &member.vis;
     let decl = params_decl(&member.generics, DeclBounds::Keep);
     let uses = params_use(&member.generics);
     let decl_angle = wrap_angle(&decl);
     let use_angle = wrap_angle(&uses);
     // Replicate the type's `#[cfg]`s so a cfg-gated cyclic type's terminator strips with it (else the
     // terminator would wrap a type rustc removed → E0412).
-    let cfgs = crate::extract_cfg_attrs(member.attrs());
+    let cfgs = crate::extract_cfg_attrs(&member.attrs);
     let where_clause = member.generics.where_clause.as_ref();
     quote! {
         #(#cfgs)*
@@ -208,7 +208,7 @@ fn make_impls(model: &Model, scc: &Scc, im: &ImplBlock) -> syn::Result<TokenStre
     // if either is cfg-gated out, the generated machinery (which references the natural type) must
     // strip with it rather than reference a removed item.
     let mut cfgs = crate::extract_cfg_attrs(&im.item.attrs);
-    cfgs.extend(crate::extract_cfg_attrs(adt.attrs()));
+    cfgs.extend(crate::extract_cfg_attrs(&adt.attrs));
 
     Ok(quote! {
         #assertions

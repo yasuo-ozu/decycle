@@ -6,30 +6,12 @@ use super::*;
 pub(crate) struct Adt {
     pub ident: Ident,
     pub generics: syn::Generics,
-    /// The full item, used to clone its shape when building the `Rec` mirror.
-    pub item: Item,
-}
-
-impl Adt {
     /// The natural type's visibility — the generated `__MTerm` copies it so a private cycle type is
     /// wrapped by a private terminator (no `pub`-over-private `private_interfaces` mismatch).
-    pub fn vis(&self) -> &syn::Visibility {
-        match &self.item {
-            Item::Struct(s) => &s.vis,
-            Item::Enum(e) => &e.vis,
-            _ => &syn::Visibility::Inherited,
-        }
-    }
-
+    pub vis: syn::Visibility,
     /// The type's own attributes (so its `#[cfg]`s can be replicated onto the generated terminator
     /// and impls — see [`crate::extract_cfg_attrs`]).
-    pub fn attrs(&self) -> &[syn::Attribute] {
-        match &self.item {
-            Item::Struct(s) => &s.attrs,
-            Item::Enum(e) => &e.attrs,
-            _ => &[],
-        }
-    }
+    pub attrs: Vec<syn::Attribute>,
 }
 
 /// One `impl Trait for Type { .. }` block in the module.
@@ -77,17 +59,26 @@ impl Model {
         for it in items {
             match it {
                 Item::Struct(ItemStruct {
-                    ident, generics, ..
+                    attrs,
+                    vis,
+                    ident,
+                    generics,
+                    ..
                 })
                 | Item::Enum(ItemEnum {
-                    ident, generics, ..
+                    attrs,
+                    vis,
+                    ident,
+                    generics,
+                    ..
                 }) => {
                     adts.insert(
                         ident.to_string(),
                         Adt {
                             ident: ident.clone(),
                             generics: generics.clone(),
-                            item: it.clone(),
+                            vis: vis.clone(),
+                            attrs: attrs.clone(),
                         },
                     );
                 }

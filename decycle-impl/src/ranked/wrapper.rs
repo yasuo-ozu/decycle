@@ -39,8 +39,6 @@ macro_rules! pq {
     };
 }
 
-type Table = HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>;
-
 /// Walks deeper than this are given up on (the plan fails). The cyclic-bound graphs of the suite need
 /// a handful of entries; a non-regular bound never closes.
 const PLAN_CAP: usize = 256;

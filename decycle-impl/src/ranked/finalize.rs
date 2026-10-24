@@ -30,6 +30,10 @@ fn name(s: &str) -> Ident {
 #[path = "wrapper.rs"]
 pub(crate) mod wrapper;
 
+/// The `#[decycle]` traits of the module by ident: each trait, the position of its rank parameter,
+/// and the impls of it the module takes over.
+type Table = HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>;
+
 /// Rewrites single-segment trait paths that match the replacing table to their
 /// ranked equivalents. E.g., `Evaluate` → `ranked_traits::EvaluateRanked<Rank, ()>`.
 ///
@@ -208,7 +212,7 @@ impl syn::visit_mut::VisitMut for TraitReplacer {
 /// `Wrap<T>: CaRanked<InitialRank>` (an extra premise, and it is the user's own declared bound).
 fn remove_cyclic_bounds(
     generics: &Generics,
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+    replacing_table: &Table,
     keep_bareparam: bool,
 ) -> Generics {
     // Needed unconditionally now: a bare-param target counts as a cycle participant either way
@@ -272,9 +276,7 @@ fn remove_cyclic_bounds(
 /// The head idents of every type that IMPLEMENTS a cyclic trait in this module — the set of targets
 /// a rank-lowered bound can actually descend into. Derived from `replacing_table` (which already
 /// holds each cyclic trait's impls), so no extra plumbing from `process_module` is needed.
-fn cycle_self_heads(
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
-) -> std::collections::HashSet<Ident> {
+fn cycle_self_heads(replacing_table: &Table) -> std::collections::HashSet<Ident> {
     replacing_table
         .values()
         .flat_map(|(_, _, impls)| impls.iter())
@@ -315,10 +317,7 @@ fn cycle_self_heads(
 ///   bound are untouched, so no program that compiled before this change is affected.
 /// - Within a rewritten predicate, the requalification visits the whole predicate (target
 ///   included, e.g. a `dyn Tr` inside it), keeping the premise self-consistent across copies.
-fn requalify_foreign_premises(
-    generics: &mut Generics,
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
-) {
+fn requalify_foreign_premises(generics: &mut Generics, replacing_table: &Table) {
     let param_idents = crate::names::type_param_idents(generics);
     let self_heads = cycle_self_heads(replacing_table);
     let Some(wc) = &mut generics.where_clause else {
@@ -326,7 +325,7 @@ fn requalify_foreign_premises(
     };
 
     struct Requalify<'a> {
-        table: &'a HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+        table: &'a Table,
     }
     impl syn::visit_mut::VisitMut for Requalify<'_> {
         fn visit_path_mut(&mut self, path: &mut Path) {
@@ -764,14 +763,11 @@ fn replace_self_and_desugar_impl_trait(sig: &mut Signature, base_self_ty: &Type)
 /// The bound is left on the PUBLIC trait (never rank-lowered): an `impl Trait` argument is a
 /// value from outside the cycle, so its bound must hold at the public boundary — where the
 /// public→ranked delegation only knows `T: Trait`, not the (irreversible) `T: TraitRanked<Init>`.
-fn qualify_apit_cyclic_bounds_super(
-    sig: &mut Signature,
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
-) {
+fn qualify_apit_cyclic_bounds_super(sig: &mut Signature, replacing_table: &Table) {
     use syn::visit_mut::VisitMut;
 
     struct Qualifier<'a> {
-        table: &'a HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+        table: &'a Table,
     }
 
     impl VisitMut for Qualifier<'_> {
@@ -1115,10 +1111,7 @@ impl syn::visit_mut::VisitMut for RenameLifetimes<'_> {
 ///   `Mk<Self, ..>` / `Re::<Self, ..>` would have been E0411 ("cannot find type `Self` in this
 ///   scope"). Substituting here fixes the reachability walk and that latent emission bug at
 ///   once, since both read this one field.
-fn cyclic_where_bounds(
-    impl_: &ItemImpl,
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
-) -> Vec<CyclicBound> {
+fn cyclic_where_bounds(impl_: &ItemImpl, replacing_table: &Table) -> Vec<CyclicBound> {
     let param_idents = crate::names::type_param_idents(&impl_.generics);
     let mut out = Vec::new();
     let self_heads = cycle_self_heads(replacing_table);
@@ -1308,7 +1301,7 @@ fn bound_target_floor_is_unsized(
     target: &Type,
     trait_ident: &Ident,
     targs: &[GenericArgument],
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+    replacing_table: &Table,
 ) -> bool {
     let Some((_, _, impls)) = replacing_table.get(trait_ident) else {
         return is_syntactically_unsized(target);
@@ -1475,10 +1468,7 @@ pub fn fingerprint_expr(
 /// at concrete ranks — but the rank-rewritten frame only has `T: CbRanked<Rank>` in scope,
 /// so the registration would not compile (E0277). Rule 1 skips such impls; their floors
 /// fail closed via the actionable lookup panic.
-fn impl_has_bare_param_cyclic_bound(
-    impl_: &ItemImpl,
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
-) -> bool {
+fn impl_has_bare_param_cyclic_bound(impl_: &ItemImpl, replacing_table: &Table) -> bool {
     let is_cyclic = |bounds: &Punctuated<TypeParamBound, Token![+]>| {
         bounds.iter().any(|b| match b {
             TypeParamBound::Trait(tb) => {
@@ -1609,7 +1599,7 @@ fn format_side_bound(bt: &Type, tb: &TraitBound, subst: Option<&Subst>) -> Strin
 /// silently lost all of its registrations.
 fn side_predicate_strings(
     generics: &Generics,
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+    replacing_table: &Table,
     subst: Option<&Subst>,
 ) -> Vec<String> {
     let g = remove_cyclic_bounds(generics, replacing_table, false);
@@ -1691,7 +1681,7 @@ fn reachable_side_bounds_ok(
     target_ty: &Type,
     target_trait: &Ident,
     target_targs: &[GenericArgument],
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+    replacing_table: &Table,
 ) -> bool {
     let own_side: std::collections::HashSet<String> =
         side_predicate_strings(&registering_impl.generics, replacing_table, None)
@@ -2309,11 +2299,7 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize) -> TokenStream {
 /// undischargeable inside the rank-rewritten frame) and F-C1's side-bound reachability check
 /// passes (naming the re-entry fn's `Self: T` obligation must be provable from `impl_`'s own
 /// bounds alone).
-fn rule1_registration_ok(
-    trait_: &ItemTrait,
-    impl_: &ItemImpl,
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
-) -> bool {
+fn rule1_registration_ok(trait_: &ItemTrait, impl_: &ItemImpl, replacing_table: &Table) -> bool {
     // The impl's own trait own-args (`impl<T> Cast<T> for A` -> `[T]`) are part of the obligation
     // its rule-1 registration proves — the reachability walk must bind them (they may not appear
     // in the self type at all), so thread them in rather than starting the walk arg-blind.
@@ -2422,7 +2408,7 @@ fn build_self_registrations(
 /// wrapper, they are live for the whole descent below it.
 fn rule2_targets(
     impl_: &ItemImpl,
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+    replacing_table: &Table,
     settled: &wrapper::Settled,
 ) -> Vec<CyclicBound> {
     let heads = cycle_self_heads(replacing_table);
@@ -2507,7 +2493,7 @@ fn rule2_targets(
 /// so the byte-identical no-op case is preserved.
 fn build_shared_registrations(
     impl_: &ItemImpl,
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+    replacing_table: &Table,
     decycle: &Path,
     settled: &wrapper::Settled,
 ) -> (TokenStream, Vec<GenericParam>) {
@@ -2560,7 +2546,7 @@ fn build_shared_registrations(
 /// on the register-once fn's own generics (C1), which a method body has no equivalent of.
 fn build_cross_edge_generic_registrations(
     impl_: &ItemImpl,
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+    replacing_table: &Table,
     current_sig: &Signature,
     decycle: &Path,
     settled: &wrapper::Settled,
@@ -3080,7 +3066,7 @@ fn type_contains_self(ty: &Type) -> bool {
 /// made two expansions of the same module within one process differ too.
 fn in_declaration_order<'a>(
     traits: &[ItemTrait],
-    replacing_table: &'a HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+    replacing_table: &'a Table,
 ) -> Vec<&'a (ItemTrait, usize, Vec<ItemImpl>)> {
     let mut seen = std::collections::HashSet::new();
     traits
@@ -3270,7 +3256,7 @@ pub fn check_trait_structural(trait_: &ItemTrait) {
 /// of `Base` provides for the same self type.
 fn ranked_supertraits(
     trait_: &ItemTrait,
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+    replacing_table: &Table,
 ) -> Punctuated<TypeParamBound, Token![+]> {
     let replacer = TraitReplacer {
         table: replacing_table
@@ -3297,11 +3283,7 @@ fn ranked_supertraits(
 /// it: named bare (or `self::`), and implemented here for the self type of every impl of `trait_`
 /// — the ranked twin of the supertrait exists only for those. (A supertrait implemented elsewhere,
 /// outside the module or by an opt-out impl, stays the real trait, as written.)
-fn ranked_supertrait(
-    path: &Path,
-    trait_: &ItemTrait,
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
-) -> Option<Ident> {
+fn ranked_supertrait(path: &Path, trait_: &ItemTrait, replacing_table: &Table) -> Option<Ident> {
     let mut probe = path.clone();
     crate::names::strip_leading_self(&mut probe);
     if probe.leading_colon.is_some() || probe.segments.len() != 1 {
@@ -3336,7 +3318,7 @@ fn ranked_supertrait(
 fn build_supertrait_registrations(
     trait_: &ItemTrait,
     impl_: &ItemImpl,
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+    replacing_table: &Table,
     decycle: &Path,
 ) -> TokenStream {
     let mut out = TokenStream::new();
@@ -3453,7 +3435,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
         normalize_obligation_targets(impl_, &normalize_rules);
     }
 
-    let mut replacing_table: HashMap<Ident, (ItemTrait, usize, Vec<_>)> = traits
+    let mut replacing_table: Table = traits
         .iter()
         .map(|trait_| {
             let g = &trait_.generics;

@@ -905,15 +905,7 @@ mod tests {
             .iter()
             .map(|im| {
                 let mut out = Vec::new();
-                for pred in im
-                    .generics
-                    .where_clause
-                    .iter()
-                    .flat_map(|wc| &wc.predicates)
-                {
-                    let WherePredicate::Type(pt) = pred else {
-                        continue;
-                    };
+                for pt in crate::names::type_predicates(&im.generics) {
                     for b in &pt.bounds {
                         let TypeParamBound::Trait(tb) = b else {
                             continue;

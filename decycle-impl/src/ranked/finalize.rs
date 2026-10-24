@@ -1166,15 +1166,9 @@ fn cyclic_where_bounds(
 ) -> Vec<CyclicBound> {
     let param_idents = crate::names::type_param_idents(&impl_.generics);
     let mut out = Vec::new();
-    let Some(wc) = &impl_.generics.where_clause else {
-        return out;
-    };
     let self_heads = cycle_self_heads(replacing_table);
     let mut hr_counter = 0usize; // distinct fresh names across all HRTB bounds of this impl
-    for pred in &wc.predicates {
-        let WherePredicate::Type(pt) = pred else {
-            continue;
-        };
+    for pt in crate::names::type_predicates(&impl_.generics) {
         if let Type::Path(TypePath { qself: None, path }) = &pt.bounded_ty {
             if path.segments.len() == 1 && param_idents.contains(&path.segments[0].ident) {
                 continue;
@@ -2021,7 +2015,7 @@ fn original_trait_path(trait_: &ItemTrait) -> Path {
 /// fn whose body calls the *original* trait method. Emitted inside `ranked_traits`, where
 /// `super::super::T` resolves to the real trait (the dummy shadows live one module up and
 /// are not in child scope).
-fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize, _decycle: &Path) -> TokenStream {
+fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize) -> TokenStream {
     let mut out = TokenStream::new();
     let trait_ident = &trait_.ident;
     let s_ident = name!("DclSelf");
@@ -3881,7 +3875,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                     // Per trait × method: type_name key marker, explicit fn-pointer alias,
                     // and the full-height re-entry fn (unbounded mode only).
                     #(if args.support_infinite_cycle) {
-                        #{emit_reentry_items(trait_, *rank_loc, &decycle_path)}
+                        #{emit_reentry_items(trait_, *rank_loc)}
                     }
 
                     #(for (impl_ix, impl_) in impls.iter().enumerate()) {

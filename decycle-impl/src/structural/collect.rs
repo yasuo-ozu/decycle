@@ -83,17 +83,8 @@ impl Model {
             match it {
                 Item::Struct(ItemStruct {
                     ident, generics, ..
-                }) => {
-                    adts.insert(
-                        ident.to_string(),
-                        Adt {
-                            ident: ident.clone(),
-                            generics: generics.clone(),
-                            item: it.clone(),
-                        },
-                    );
-                }
-                Item::Enum(ItemEnum {
+                })
+                | Item::Enum(ItemEnum {
                     ident, generics, ..
                 }) => {
                     adts.insert(

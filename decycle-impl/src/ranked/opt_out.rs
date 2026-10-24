@@ -163,14 +163,8 @@ impl<'a> Graph<'a> {
         trait_name: &str,
         scope: &ModuleScope,
     ) -> Vec<(Edge, String, &'i Type, &'i Path)> {
-        let Some(where_clause) = &im.generics.where_clause else {
-            return Vec::new();
-        };
         let mut out = Vec::new();
-        for pred in &where_clause.predicates {
-            let WherePredicate::Type(pt) = pred else {
-                continue;
-            };
+        for pt in crate::names::type_predicates(&im.generics) {
             if pt.lifetimes.is_some() || !pt.bounds.iter().any(|b| names_trait(b, trait_name)) {
                 continue;
             }

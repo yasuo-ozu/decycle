@@ -10,8 +10,8 @@
 use std::collections::HashSet;
 use syn::visit::Visit;
 use syn::{
-    GenericParam, Generics, Ident, Path, PathArguments, TraitBound, Type, TypeParamBound, TypePath,
-    UseGlob, UseTree,
+    GenericParam, Generics, Ident, Path, PathArguments, PredicateType, TraitBound, Type,
+    TypeParamBound, TypePath, UseGlob, UseTree, WherePredicate,
 };
 
 /// Strips a leading, argument-less `self` segment (`self::Trait` -> `Trait`,
@@ -128,6 +128,18 @@ pub(crate) fn bare_named_in<'ast>(
 /// pair's impl taken over): it is an edge, like a bound on a member (`ranked::finalize::wrapper`).
 pub(crate) fn names_bare(ty: &Type, names: &HashSet<Ident>) -> bool {
     !bare_named_in(ty, &|i| names.contains(i)).is_empty()
+}
+
+/// The type predicates of `generics`' `where`-clause (`T: Bound`, `for<'a> X<'a>: Bound`), in order.
+pub(crate) fn type_predicates(generics: &Generics) -> impl Iterator<Item = &PredicateType> {
+    generics
+        .where_clause
+        .iter()
+        .flat_map(|wc| &wc.predicates)
+        .filter_map(|pred| match pred {
+            WherePredicate::Type(pt) => Some(pt),
+            _ => None,
+        })
 }
 
 /// The idents of `generics`' type parameters — a bound on one targets the parameter, never a

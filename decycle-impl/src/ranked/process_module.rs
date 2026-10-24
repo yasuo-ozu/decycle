@@ -444,13 +444,7 @@ fn sharing_sources(members: &[&ItemImpl], trait_ident: &Ident) -> Vec<Vec<usize>
     let mut seen: HashSet<(String, String)> = HashSet::new();
     for (i, im) in members.iter().enumerate() {
         let impl_type_params = crate::names::type_param_idents(&im.generics);
-        let Some(where_clause) = &im.generics.where_clause else {
-            continue;
-        };
-        for pred in &where_clause.predicates {
-            let WherePredicate::Type(pt) = pred else {
-                continue;
-            };
+        for pt in crate::names::type_predicates(&im.generics) {
             if is_local_impl_bound_target(&pt.bounded_ty, &impl_type_params) {
                 continue;
             }

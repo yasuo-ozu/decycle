@@ -360,15 +360,7 @@ fn cycle_edges(
     adt_names: &HashSet<String>,
 ) -> Vec<crate::premise_flow::CycleEdge> {
     let mut out = Vec::new();
-    for pred in im
-        .generics
-        .where_clause
-        .iter()
-        .flat_map(|wc| &wc.predicates)
-    {
-        let WherePredicate::Type(pt) = pred else {
-            continue;
-        };
+    for pt in crate::names::type_predicates(&im.generics) {
         let bounded = subst_self(&pt.bounded_ty, &im.self_ty);
         let members = local_ref_paths(&bounded, adt_names);
         for bound in &pt.bounds {

@@ -55,16 +55,7 @@ impl Model {
         let mut edges = Vec::new();
         for im in participating() {
             let src = position(&pair(im)).expect("every participating impl is a node");
-            for pred in im
-                .item
-                .generics
-                .where_clause
-                .iter()
-                .flat_map(|w| &w.predicates)
-            {
-                let WherePredicate::Type(pt) = pred else {
-                    continue;
-                };
+            for pt in crate::names::type_predicates(&im.item.generics) {
                 // Resolve `Self` to the impl's self type so `where Self: Tr` forms a real cycle
                 // edge — `Self` never matches a local ADT ident on its own.
                 let bounded = subst_self(&pt.bounded_ty, &im.item.self_ty);

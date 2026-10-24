@@ -23,7 +23,7 @@ use crate::names::{bare_ident, is_routed_bound};
 use proc_macro2::Ident;
 use safegraph::VecGraph;
 use std::collections::{HashMap, HashSet};
-use syn::{Attribute, Item, ItemImpl, ItemMod, Path, Type, WherePredicate};
+use syn::{Attribute, Item, ItemImpl, ItemMod, Path, Type};
 
 /// How a cyclic where-bound names the participant it reaches.
 ///
@@ -199,9 +199,6 @@ fn bound_edges(
     routed: &HashSet<Ident>,
     participants: &HashSet<Ident>,
 ) -> Vec<(Ident, EdgeKind)> {
-    let Some(where_clause) = im.generics.where_clause.as_ref() else {
-        return Vec::new();
-    };
     // The impl's own type parameters. A bound on one of them (`impl<Stmt> Tr for Expr where
     // Stmt: Tr`) targets the parameter, not a same-named participant it may shadow — the doc
     // above promises such bounds are not represented, and the engine's own matchers
@@ -209,10 +206,7 @@ fn bound_edges(
     // exactly this set.
     let param_idents = crate::names::type_param_idents(&im.generics);
     let mut out = Vec::new();
-    for pred in &where_clause.predicates {
-        let WherePredicate::Type(pt) = pred else {
-            continue;
-        };
+    for pt in crate::names::type_predicates(&im.generics) {
         if !pt.bounds.iter().any(|b| is_routed_bound(b, routed)) {
             continue;
         }

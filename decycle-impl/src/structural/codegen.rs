@@ -58,31 +58,41 @@ pub(crate) fn subst_self(ty: &Type, replacement: &Type) -> Type {
     ty
 }
 
-/// A `::<T, N>` turbofish for a method's own type/const generics (lifetimes inferred), or empty.
-fn method_turbofish(sig: &syn::Signature) -> TokenStream {
-    let args = crate::generics_fmt::type_const_idents(&sig.generics);
-    if args.is_empty() {
-        quote!()
-    } else {
-        quote!( ::< #(#args),* > )
-    }
+/// The call forwarding `sig`'s method into `target`-space through `callee` (`<T as Tr>::m`): the
+/// receiver and `Self`-typed arguments cast into it, the method's own type/const generics
+/// turbofished (lifetimes inferred) so a non-inferable one resolves, and a returned value cast back.
+fn forward_call(
+    callee: TokenStream,
+    sig: &syn::Signature,
+    target: &Type,
+    ctx: &ProjCtx,
+    nonce: u64,
+) -> syn::Result<TokenStream> {
+    let mut args: Vec<TokenStream> = sig
+        .receiver()
+        .map(|r| receiver_cast(r, target, nonce))
+        .into_iter()
+        .collect();
+    args.extend(forward_args(sig, target, ctx, nonce)?);
+    let margs = crate::generics_fmt::type_const_idents(&sig.generics);
+    let call = quote!(#callee #(if !margs.is_empty()) { ::< #(#margs),* > } ( #(#args),* ));
+    let cast = cast_ident(nonce);
+    Ok(match &sig.output {
+        ReturnType::Default => quote!(#call;),
+        ReturnType::Type(..) => quote!(unsafe { #cast(#call) }),
+    })
 }
 
 pub(crate) fn codegen_scc(model: &Model, scc: &Scc) -> syn::Result<TokenStream> {
-    let mut out = TokenStream::new();
-
     // Paired impls per (member, this-trait impl block): body on the terminator, natural delegates.
     // (The `__MTerm` structs themselves are emitted once, crate-side, by `emit_terminators` — a member
     // cyclic under several traits must not redefine its terminator per-trait.)
-    for im in &model.impls {
-        let m = im.self_ident.to_string();
-        if !scc.contains(&m, &im.trait_key) {
-            continue;
-        }
-        out.extend(make_impls(model, scc, im)?);
-    }
-
-    Ok(out)
+    model
+        .impls
+        .iter()
+        .filter(|im| scc.contains(&im.self_ident.to_string(), &im.trait_key))
+        .map(|im| make_impls(model, scc, im))
+        .collect()
 }
 
 /// `#[repr(transparent)] <vis> struct __MTerm<params>(<vis> M<params>) <where M's own clause>;` — the
@@ -663,20 +673,8 @@ fn rec_method(
 
     // dispatch: cast receiver + any Self-typed args into natural-space, forward the rest, call __run,
     // cast result up.
-    let mut call_args: Vec<TokenStream> = Vec::new();
-    if let Some(r) = outer_sig.receiver() {
-        call_args.push(receiver_cast(r, natural, nonce));
-    }
-    call_args.extend(forward_args(outer_sig, natural, &ctx, nonce)?);
-    let turbofish = method_turbofish(outer_sig);
-    let call = quote! {
-        < #natural as #body_tr #use_g >::#run #turbofish ( #(#call_args),* )
-    };
-    let cast = cast_ident(nonce);
-    let dispatch = match &outer_sig.output {
-        ReturnType::Default => quote! { #call; },
-        ReturnType::Type(..) => quote! { unsafe { #cast(#call) } },
-    };
+    let callee = quote!(< #natural as #body_tr #use_g >::#run);
+    let dispatch = forward_call(callee, outer_sig, natural, &ctx, nonce)?;
 
     let inline = inline_attr(attrs);
     // Replicate `#[track_caller]` / lint / hint attrs onto the body-bearing `__run` too — otherwise
@@ -733,23 +731,9 @@ fn body_trait_where(outer: &syn::Generics) -> TokenStream {
         .where_clause
         .iter()
         .flat_map(|w| &w.predicates)
-        .filter(|p| match p {
-            WherePredicate::Type(pt) => !pt.bounds.iter().any(|b| match b {
-                syn::TypeParamBound::Trait(tb) => tb
-                    .path
-                    .segments
-                    .iter()
-                    .any(|s| s.ident == "Self" || args_mention_self(&s.arguments)),
-                _ => false,
-            }),
-            _ => true,
-        })
+        .filter(|p| !matches!(p, WherePredicate::Type(pt) if bounds_mention_self(&pt.bounds)))
         .collect();
-    if preds.is_empty() {
-        quote!()
-    } else {
-        quote!(where #(#preds),*)
-    }
+    quote!(#(if !preds.is_empty()) { where #(#preds),* })
 }
 
 /// The trait-declaration form of an associated impl item: `type Out = i64;` → `type Out;`.
@@ -774,11 +758,7 @@ fn assoc_decl(item: &ImplItem) -> TokenStream {
 /// the natural→terminator→`__run` chain to a direct call even without LTO (the user body lives in the
 /// un-attributed `__run`, so this never force-duplicates user code).
 fn inline_attr(attrs: &[Attribute]) -> TokenStream {
-    if attrs.iter().any(|a| a.path().is_ident("inline")) {
-        quote!()
-    } else {
-        quote!(#[inline])
-    }
+    quote!(#(if !attrs.iter().any(|a| a.path().is_ident("inline"))) { #[inline] })
 }
 
 /// Delegating method on the natural type: cast the receiver (if any) into `Rec`-space, call the Rec
@@ -800,23 +780,10 @@ fn nat_method(f: &syn::ImplItemFn, cx: &ImplCx) -> syn::Result<TokenStream> {
     // `self`, and the binding mode of a by-value receiver is local to each fn.
     let (norm_sig, _, _) = normalize_sig(&f.sig, nonce);
     let sig = &norm_sig;
-    let name = &sig.ident;
-    let mut call_args: Vec<TokenStream> = Vec::new();
-    if let Some(r) = sig.receiver() {
-        call_args.push(receiver_cast(r, closed_rec, nonce));
-    }
-    call_args.extend(forward_args(sig, closed_rec, &ctx, nonce)?);
-    // forward the method's own type/const generics (lifetimes inferred) so non-inferable params resolve
-    let turbofish = method_turbofish(sig);
-    let call = quote! { < #closed_rec as #trait_path >::#name #turbofish ( #(#call_args),* ) };
-    let cast = cast_ident(nonce);
+    let callee = quote!(< #closed_rec as #trait_path >::#{&sig.ident});
+    let body = forward_call(callee, sig, closed_rec, &ctx, nonce)?;
     let inline = inline_attr(attrs);
-    match &sig.output {
-        ReturnType::Default => Ok(quote! { #inline #(#attrs)* #vis #sig { #call; } }),
-        ReturnType::Type(..) => Ok(quote! {
-            #inline #(#attrs)* #vis #sig { unsafe { #cast(#call) } }
-        }),
-    }
+    Ok(quote! { #inline #(#attrs)* #vis #sig { #body } })
 }
 
 /// Re-wrap a `&dyn Fn(..)`-shaped argument that mentions `Self` into `target`-space.

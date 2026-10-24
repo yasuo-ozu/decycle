@@ -267,163 +267,112 @@ fn canonicalize_method_sig(
         (out.sig.inputs.first_mut(), decl.inputs.first())
     {
         if r.colon_token.is_some() {
-            *r.ty = canon_self(&r.ty, &dr.ty, self_ty);
+            canon_self(&mut r.ty, &dr.ty, self_ty);
         }
     }
     // Typed parameters, matched by position against the declaration's own typed parameters.
-    let decl_typed: Vec<&syn::PatType> = decl
+    let typed = |a: &syn::FnArg| matches!(a, syn::FnArg::Typed(_));
+    for (input, d) in out
+        .sig
         .inputs
-        .iter()
-        .filter_map(|a| match a {
-            syn::FnArg::Typed(pt) => Some(pt),
-            _ => None,
-        })
-        .collect();
-    let mut ix = 0usize;
-    for input in out.sig.inputs.iter_mut() {
-        if let syn::FnArg::Typed(pt) = input {
-            if let Some(d) = decl_typed.get(ix) {
-                *pt.ty = canon_self(&pt.ty, &d.ty, self_ty);
-            }
-            ix += 1;
+        .iter_mut()
+        .filter(|a| typed(a))
+        .zip(decl.inputs.iter().filter(|a| typed(a)))
+    {
+        if let (syn::FnArg::Typed(pt), syn::FnArg::Typed(d)) = (input, d) {
+            canon_self(&mut pt.ty, &d.ty, self_ty);
         }
     }
-    if let (ReturnType::Type(_, t), ReturnType::Type(_, d)) = (&mut out.sig.output, &decl.output) {
-        **t = canon_self(t, d, self_ty);
-    }
+    canon_self_output(&mut out.sig.output, &decl.output, self_ty);
     out
 }
 
 /// Walk an impl type and its declared counterpart in parallel, replacing the impl's spelling with
 /// `Self` exactly where the declaration says `Self` **and** the impl spells this impl's self type.
-/// Any other shape is returned untouched.
-fn canon_self(impl_ty: &Type, decl_ty: &Type, self_ty: &Type) -> Type {
+/// Any other shape is left untouched.
+fn canon_self(ty: &mut Type, decl_ty: &Type, self_ty: &Type) {
     // Keep the impl side's parens/groups (a macro-expanded type arrives group-wrapped) and descend.
-    match impl_ty {
-        Type::Paren(p) => {
-            let mut p = p.clone();
-            p.elem = Box::new(canon_self(&p.elem, decl_ty, self_ty));
-            return Type::Paren(p);
-        }
-        Type::Group(g) => {
-            let mut g = g.clone();
-            g.elem = Box::new(canon_self(&g.elem, decl_ty, self_ty));
-            return Type::Group(g);
-        }
+    match ty {
+        Type::Paren(p) => return canon_self(&mut p.elem, decl_ty, self_ty),
+        Type::Group(g) => return canon_self(&mut g.elem, decl_ty, self_ty),
         _ => {}
     }
     let decl = strip_parens(decl_ty);
     if is_plain_self(decl) {
-        return if same_spelling(impl_ty, self_ty) {
-            parse_quote!(Self)
-        } else {
-            impl_ty.clone()
-        };
+        if same_spelling(ty, self_ty) {
+            *ty = parse_quote!(Self);
+        }
+        return;
     }
-    match (impl_ty, decl) {
-        (Type::Reference(i), Type::Reference(d)) => {
-            let mut i = i.clone();
-            i.elem = Box::new(canon_self(&i.elem, &d.elem, self_ty));
-            Type::Reference(i)
-        }
-        (Type::Ptr(i), Type::Ptr(d)) => {
-            let mut i = i.clone();
-            i.elem = Box::new(canon_self(&i.elem, &d.elem, self_ty));
-            Type::Ptr(i)
-        }
-        (Type::Slice(i), Type::Slice(d)) => {
-            let mut i = i.clone();
-            i.elem = Box::new(canon_self(&i.elem, &d.elem, self_ty));
-            Type::Slice(i)
-        }
-        (Type::Array(i), Type::Array(d)) => {
-            let mut i = i.clone();
-            i.elem = Box::new(canon_self(&i.elem, &d.elem, self_ty));
-            Type::Array(i)
-        }
+    match (ty, decl) {
+        (Type::Reference(i), Type::Reference(d)) => canon_self(&mut i.elem, &d.elem, self_ty),
+        (Type::Ptr(i), Type::Ptr(d)) => canon_self(&mut i.elem, &d.elem, self_ty),
+        (Type::Slice(i), Type::Slice(d)) => canon_self(&mut i.elem, &d.elem, self_ty),
+        (Type::Array(i), Type::Array(d)) => canon_self(&mut i.elem, &d.elem, self_ty),
         (Type::Tuple(i), Type::Tuple(d)) if i.elems.len() == d.elems.len() => {
-            let mut i = i.clone();
-            for (e, de) in i.elems.iter_mut().zip(d.elems.iter()) {
-                *e = canon_self(e, de, self_ty);
+            for (e, de) in i.elems.iter_mut().zip(&d.elems) {
+                canon_self(e, de, self_ty);
             }
-            Type::Tuple(i)
         }
         (Type::Path(i), Type::Path(d))
             if i.qself.is_none()
                 && d.qself.is_none()
                 && i.path.segments.len() == d.path.segments.len() =>
         {
-            let mut i = i.clone();
-            for (seg, dseg) in i.path.segments.iter_mut().zip(d.path.segments.iter()) {
-                seg.arguments = canon_self_args(&seg.arguments, &dseg.arguments, self_ty);
+            for (seg, dseg) in i.path.segments.iter_mut().zip(&d.path.segments) {
+                canon_self_args(&mut seg.arguments, &dseg.arguments, self_ty);
             }
-            Type::Path(i)
         }
         (Type::BareFn(i), Type::BareFn(d)) if i.inputs.len() == d.inputs.len() => {
-            let mut i = i.clone();
-            for (a, da) in i.inputs.iter_mut().zip(d.inputs.iter()) {
-                a.ty = canon_self(&a.ty, &da.ty, self_ty);
+            for (a, da) in i.inputs.iter_mut().zip(&d.inputs) {
+                canon_self(&mut a.ty, &da.ty, self_ty);
             }
-            if let (syn::ReturnType::Type(_, t), syn::ReturnType::Type(_, dt)) =
-                (&mut i.output, &d.output)
-            {
-                **t = canon_self(t, dt, self_ty);
-            }
-            Type::BareFn(i)
+            canon_self_output(&mut i.output, &d.output, self_ty);
         }
         (Type::TraitObject(i), Type::TraitObject(d)) => {
-            let mut i = i.clone();
-            canon_self_bounds(&mut i.bounds, &d.bounds, self_ty);
-            Type::TraitObject(i)
+            canon_self_bounds(&mut i.bounds, &d.bounds, self_ty)
         }
         (Type::ImplTrait(i), Type::ImplTrait(d)) => {
-            let mut i = i.clone();
-            canon_self_bounds(&mut i.bounds, &d.bounds, self_ty);
-            Type::ImplTrait(i)
+            canon_self_bounds(&mut i.bounds, &d.bounds, self_ty)
         }
-        _ => impl_ty.clone(),
+        _ => {}
+    }
+}
+
+/// [`canon_self`] through a return type, when both sides have one.
+fn canon_self_output(output: &mut ReturnType, decl: &ReturnType, self_ty: &Type) {
+    if let (ReturnType::Type(_, t), ReturnType::Type(_, d)) = (output, decl) {
+        canon_self(t, d, self_ty);
     }
 }
 
 /// [`canon_self`] through a path segment's arguments — both `<..>` and `Fn(..)`-sugar forms.
-fn canon_self_args(
-    impl_args: &PathArguments,
-    decl_args: &PathArguments,
-    self_ty: &Type,
-) -> PathArguments {
-    match (impl_args, decl_args) {
+fn canon_self_args(args: &mut PathArguments, decl_args: &PathArguments, self_ty: &Type) {
+    match (args, decl_args) {
         (PathArguments::AngleBracketed(i), PathArguments::AngleBracketed(d))
             if i.args.len() == d.args.len() =>
         {
-            let mut i = i.clone();
-            for (a, da) in i.args.iter_mut().zip(d.args.iter()) {
+            for (a, da) in i.args.iter_mut().zip(&d.args) {
                 match (a, da) {
                     (GenericArgument::Type(t), GenericArgument::Type(dt)) => {
-                        *t = canon_self(t, dt, self_ty);
+                        canon_self(t, dt, self_ty)
                     }
                     (GenericArgument::AssocType(at), GenericArgument::AssocType(dat)) => {
-                        at.ty = canon_self(&at.ty, &dat.ty, self_ty);
+                        canon_self(&mut at.ty, &dat.ty, self_ty)
                     }
                     _ => {}
                 }
             }
-            PathArguments::AngleBracketed(i)
         }
         (PathArguments::Parenthesized(i), PathArguments::Parenthesized(d))
             if i.inputs.len() == d.inputs.len() =>
         {
-            let mut i = i.clone();
-            for (t, dt) in i.inputs.iter_mut().zip(d.inputs.iter()) {
-                *t = canon_self(t, dt, self_ty);
+            for (t, dt) in i.inputs.iter_mut().zip(&d.inputs) {
+                canon_self(t, dt, self_ty);
             }
-            if let (syn::ReturnType::Type(_, t), syn::ReturnType::Type(_, dt)) =
-                (&mut i.output, &d.output)
-            {
-                **t = canon_self(t, dt, self_ty);
-            }
-            PathArguments::Parenthesized(i)
+            canon_self_output(&mut i.output, &d.output, self_ty);
         }
-        _ => impl_args.clone(),
+        _ => {}
     }
 }
 
@@ -442,7 +391,7 @@ fn canon_self_bounds(
                 continue;
             }
             for (seg, dseg) in tb.path.segments.iter_mut().zip(dtb.path.segments.iter()) {
-                seg.arguments = canon_self_args(&seg.arguments, &dseg.arguments, self_ty);
+                canon_self_args(&mut seg.arguments, &dseg.arguments, self_ty);
             }
         }
     }

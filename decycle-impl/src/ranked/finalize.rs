@@ -2385,10 +2385,14 @@ fn build_cross_edge_generic_registrations(
     out
 }
 
-fn parse_comma_separated<T: Parse>(input: ParseStream) -> Result<Vec<T>> {
+/// `item, item, ..` (a trailing comma allowed) up to the end of `input`.
+fn parse_comma_separated<T>(
+    input: ParseStream,
+    item: fn(ParseStream) -> Result<T>,
+) -> Result<Vec<T>> {
     let mut items = Vec::new();
     while !input.is_empty() {
-        items.push(input.parse()?);
+        items.push(item(input)?);
         if !input.is_empty() {
             input.parse::<Token![,]>()?;
         }
@@ -2396,31 +2400,13 @@ fn parse_comma_separated<T: Parse>(input: ParseStream) -> Result<Vec<T>> {
     Ok(items)
 }
 
-/// One `#[decycle] use original::path::T as R;` in the consuming module: `finalize`
-/// needs this to reconcile a trait definition arriving through the macro ping-pong
-/// (which always carries the trait's ORIGINAL ident) with local impls/bounds that only
-/// ever spell it as the local alias `R` (see `finalize`'s use of `renames`, and L-C1).
-struct TraitRename {
-    original: Ident,
-    local: Ident,
-}
-
-impl Parse for TraitRename {
-    fn parse(input: ParseStream) -> Result<Self> {
-        let content;
-        parenthesized!(content in input);
-        let original: Ident = content.parse()?;
-        content.parse::<Token![,]>()?;
-        let local: Ident = content.parse()?;
-        Ok(TraitRename { original, local })
-    }
-}
-
-impl template_quote::ToTokens for TraitRename {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-        let (original, local) = (&self.original, &self.local);
-        tokens.extend(quote!((#original, #local)));
-    }
+/// `(a, b)`.
+fn parse_pair<A: Parse, B: Parse>(input: ParseStream) -> Result<(A, B)> {
+    let content;
+    parenthesized!(content in input);
+    let a = content.parse()?;
+    content.parse::<Token![,]>()?;
+    Ok((a, content.parse()?))
 }
 
 /// The ident decycle mints for a `#[decycle]` trait's generated "ranked" counterpart
@@ -2522,23 +2508,12 @@ impl Parse for AlsoRank {
         // normalize: [ (From, To), (From, To), ... ]
         let norm_content;
         bracketed!(norm_content in content);
-        let mut normalize = Vec::new();
-        while !norm_content.is_empty() {
-            let pair;
-            parenthesized!(pair in norm_content);
-            let from: Type = pair.parse()?;
-            pair.parse::<Token![,]>()?;
-            let to: Type = pair.parse()?;
-            normalize.push((from, to));
-            if !norm_content.is_empty() {
-                norm_content.parse::<Token![,]>()?;
-            }
-        }
+        let normalize = parse_comma_separated(&norm_content, parse_pair)?;
 
         // foreign_impls: { impl ... for ... {}, impl ... }
         let impls_content;
         braced!(impls_content in content);
-        let foreign_impls = parse_comma_separated::<ItemImpl>(&impls_content)?;
+        let foreign_impls = parse_comma_separated(&impls_content, ItemImpl::parse)?;
 
         Ok(AlsoRank {
             normalize,
@@ -2628,11 +2603,11 @@ fn parse_rest(input: ParseStream) -> Result<FinalizeArgs> {
 
     let traits_content;
     braced!(traits_content in input);
-    let traits = parse_comma_separated(&traits_content)?;
+    let traits = parse_comma_separated(&traits_content, ItemTrait::parse)?;
 
     let contents_content;
     braced!(contents_content in input);
-    let contents = parse_comma_separated(&contents_content)?;
+    let contents = parse_comma_separated(&contents_content, ItemImpl::parse)?;
 
     let lit: LitInt = input.parse()?;
     let recurse_level = lit.base10_parse()?;
@@ -2644,15 +2619,16 @@ fn parse_rest(input: ParseStream) -> Result<FinalizeArgs> {
         lit.value
     };
 
+    // One `(original, local)` per `#[decycle] use original::path::T as R;` in the consuming module:
+    // `finalize` needs this to reconcile a trait definition arriving through the macro ping-pong
+    // (which always carries the trait's ORIGINAL ident) with local impls/bounds that only ever
+    // spell it as the local alias `R` (see `finalize`'s use of `renames`, and L-C1).
     let renames = if input.is_empty() {
         Vec::new()
     } else {
         let renames_content;
         bracketed!(renames_content in input);
-        parse_comma_separated::<TraitRename>(&renames_content)?
-            .into_iter()
-            .map(|r| (r.original, r.local))
-            .collect()
+        parse_comma_separated(&renames_content, parse_pair)?
     };
 
     // C2: the carrier's `also_rank` trailing group. Backward-compatible: an old carrier
@@ -2662,7 +2638,7 @@ fn parse_rest(input: ParseStream) -> Result<FinalizeArgs> {
     } else {
         let content;
         braced!(content in input);
-        parse_comma_separated::<AlsoRank>(&content)?
+        parse_comma_separated(&content, AlsoRank::parse)?
     };
 
     Ok(FinalizeArgs {
@@ -2699,14 +2675,6 @@ impl FinalizeArgs {
 
         let recurse_level = &self.recurse_level;
         let support_infinite_cycle = &self.support_infinite_cycle;
-        let renames: Vec<TraitRename> = self
-            .renames
-            .iter()
-            .map(|(original, local)| TraitRename {
-                original: original.clone(),
-                local: local.clone(),
-            })
-            .collect();
         let also_rank = &self.also_rank;
 
         quote! {
@@ -2716,7 +2684,7 @@ impl FinalizeArgs {
             { #(#contents),* }
             #recurse_level
             #support_infinite_cycle
-            [ #(#renames),* ]
+            [ #(for (original, local) in &self.renames), { (#original, #local) } ]
             #(if !also_rank.is_empty()) {
                 { #(#also_rank),* }
             }

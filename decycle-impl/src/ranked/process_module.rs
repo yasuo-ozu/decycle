@@ -44,7 +44,7 @@ fn check_no_deep_super_paths(contents: &[Item]) {
 }
 
 /// `(original_ident, local_alias)` for every `UseRename` (`use path::T as R;`) reachable
-/// from a `#[decycle] use` item — see `finalize::TraitRename`/L-C1. A plain `UseName`
+/// from a `#[decycle] use` item — see `FinalizeArgs::renames`/L-C1. A plain `UseName`
 /// (`use path::T;`) needs no entry: the local name already matches the original.
 fn collect_trait_renames(item: &ItemUse) -> Vec<(Ident, Ident)> {
     use_leaves(&item.tree)

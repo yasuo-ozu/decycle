@@ -10,8 +10,8 @@
 use std::collections::HashSet;
 use syn::visit::Visit;
 use syn::{
-    GenericParam, Generics, Ident, ItemTrait, Path, PathArguments, PredicateType, TraitBound,
-    TraitItem, TraitItemFn, Type, TypeParamBound, TypePath, UseGlob, UseTree, WherePredicate,
+    Generics, Ident, ItemTrait, Path, PathArguments, PredicateType, TraitBound, TraitItem,
+    TraitItemFn, Type, TypeParamBound, TypePath, UseGlob, UseTree, WherePredicate,
 };
 
 /// Strips a leading, argument-less `self` segment (`self::Trait` -> `Trait`,
@@ -153,14 +153,7 @@ pub(crate) fn trait_fns(trait_: &ItemTrait) -> impl Iterator<Item = &TraitItemFn
 /// The idents of `generics`' type parameters — a bound on one targets the parameter, never a
 /// participant it may shadow.
 pub(crate) fn type_param_idents(generics: &Generics) -> HashSet<Ident> {
-    generics
-        .params
-        .iter()
-        .filter_map(|p| match p {
-            GenericParam::Type(t) => Some(t.ident.clone()),
-            _ => None,
-        })
-        .collect()
+    generics.type_params().map(|t| t.ident.clone()).collect()
 }
 
 /// See through `(T)` and the invisible groups a macro-expanded type can be wrapped in.

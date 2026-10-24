@@ -309,14 +309,9 @@ impl Qualifier<'_> {
     /// Enter the scope of `generics` (left with `self.shadowed.pop()`).
     fn enter(&mut self, generics: &Generics) {
         self.shadowed.push(
-            generics
-                .params
+            crate::generics_fmt::type_const_idents(generics)
                 .iter()
-                .filter_map(|p| match p {
-                    GenericParam::Type(t) => Some(seg_name(&t.ident)),
-                    GenericParam::Const(c) => Some(seg_name(&c.ident)),
-                    GenericParam::Lifetime(_) => None,
-                })
+                .map(seg_name)
                 .collect(),
         );
     }

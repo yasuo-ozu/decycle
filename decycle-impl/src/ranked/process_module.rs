@@ -1,3 +1,4 @@
+use crate::generics_fmt::type_const_idents;
 use crate::helper::type_head_ident;
 use crate::names::{use_leaves, UseLeaf};
 use proc_macro2::Span;
@@ -86,9 +87,8 @@ fn bare_self_type(im: &mut ItemImpl) {
     let shadowed = bare.segments.len() == 1
         && im
             .generics
-            .params
-            .iter()
-            .any(|p| matches!(p, GenericParam::Type(t) if t.ident == bare.segments[0].ident));
+            .type_params()
+            .any(|t| t.ident == bare.segments[0].ident);
     if !shadowed {
         *path = bare;
     }
@@ -388,16 +388,7 @@ fn spell_renamed_relative(im: &mut ItemImpl, renamed: &HashSet<Ident>) {
             syn::visit_mut::visit_type_path_mut(self, tp);
         }
     }
-    let shadowed: HashSet<Ident> = im
-        .generics
-        .params
-        .iter()
-        .filter_map(|p| match p {
-            GenericParam::Type(t) => Some(t.ident.clone()),
-            GenericParam::Const(c) => Some(c.ident.clone()),
-            GenericParam::Lifetime(_) => None,
-        })
-        .collect();
+    let shadowed: HashSet<Ident> = type_const_idents(&im.generics).into_iter().collect();
     let renamed: HashSet<Ident> = renamed.difference(&shadowed).cloned().collect();
     if let Some(wc) = &mut im.generics.where_clause {
         for pred in wc.predicates.iter_mut() {

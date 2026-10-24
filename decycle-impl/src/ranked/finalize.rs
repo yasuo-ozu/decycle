@@ -1465,39 +1465,18 @@ pub fn fingerprint_expr(
 /// fail closed via the actionable lookup panic.
 fn impl_has_bare_param_cyclic_bound(impl_: &ItemImpl, replacing_table: &Table) -> bool {
     let is_cyclic = |bounds: &Punctuated<TypeParamBound, Token![+]>| {
-        bounds.iter().any(|b| match b {
-            TypeParamBound::Trait(tb) => {
-                tb.path.leading_colon.is_none()
-                    && tb.path.segments.len() == 1
-                    && replacing_table.contains_key(&tb.path.segments[0].ident)
-            }
-            _ => false,
+        bounds.iter().any(|b| {
+            matches!(b, TypeParamBound::Trait(tb) if tb.path.leading_colon.is_none()
+                && tb.path.segments.len() == 1
+                && replacing_table.contains_key(&tb.path.segments[0].ident))
         })
     };
-    let param_idents: std::collections::HashSet<&Ident> = impl_
-        .generics
-        .params
-        .iter()
-        .filter_map(|p| match p {
-            GenericParam::Type(t) => Some(&t.ident),
-            _ => None,
-        })
-        .collect();
-    impl_
-        .generics
-        .params
-        .iter()
-        .any(|p| matches!(p, GenericParam::Type(tp) if is_cyclic(&tp.bounds)))
-        || impl_.generics.where_clause.as_ref().is_some_and(|wc| {
-            wc.predicates.iter().any(|pred| match pred {
-                WherePredicate::Type(pt) => {
-                    matches!(&pt.bounded_ty, Type::Path(TypePath { qself: None, path })
-                        if path.segments.len() == 1
-                            && param_idents.contains(&path.segments[0].ident))
-                        && is_cyclic(&pt.bounds)
-                }
-                _ => false,
-            })
+    let param_idents = crate::names::type_param_idents(&impl_.generics);
+    impl_.generics.type_params().any(|tp| is_cyclic(&tp.bounds))
+        || crate::names::type_predicates(&impl_.generics).any(|pt| {
+            matches!(&pt.bounded_ty, Type::Path(TypePath { qself: None, path })
+                if path.segments.len() == 1 && param_idents.contains(&path.segments[0].ident))
+                && is_cyclic(&pt.bounds)
         })
 }
 
@@ -3320,15 +3299,9 @@ fn build_supertrait_registrations(
     let mut seen: std::collections::HashSet<Ident> = Default::default();
     let mut queue: Vec<&ItemTrait> = vec![trait_];
     while let Some(sub) = queue.pop() {
-        let sub_params: std::collections::HashSet<String> = sub
-            .generics
-            .params
+        let sub_params: std::collections::HashSet<String> = type_const_idents(&sub.generics)
             .iter()
-            .filter_map(|p| match p {
-                GenericParam::Type(t) => Some(t.ident.to_string()),
-                GenericParam::Const(c) => Some(c.ident.to_string()),
-                GenericParam::Lifetime(_) => None,
-            })
+            .map(Ident::to_string)
             .collect();
         for bound in &sub.supertraits {
             let TypeParamBound::Trait(TraitBound { path, .. }) = bound else {

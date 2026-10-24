@@ -23,8 +23,8 @@
 use proc_macro2::{Span, TokenStream};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use syn::{
-    parse_quote, spanned::Spanned, Attribute, GenericArgument, GenericParam, Ident, ImplItem, Item,
-    ItemEnum, ItemImpl, ItemMod, ItemStruct, Path, PathArguments, ReturnType, Type, WherePredicate,
+    parse_quote, spanned::Spanned, Attribute, GenericArgument, Ident, ImplItem, Item, ItemEnum,
+    ItemImpl, ItemMod, ItemStruct, Path, PathArguments, ReturnType, Type, WherePredicate,
 };
 use template_quote::{quote, ToTokens};
 

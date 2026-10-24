@@ -31,8 +31,8 @@ use std::collections::HashSet;
 use syn::spanned::Spanned;
 use syn::visit_mut::VisitMut;
 use syn::{
-    ExprPath, GenericParam, Generics, Item, ItemImpl, Macro, Path, PathArguments, PathSegment,
-    QSelf, TraitBound, TypePath,
+    ExprPath, Generics, Item, ItemImpl, Macro, Path, PathArguments, PathSegment, QSelf, TraitBound,
+    TypePath,
 };
 use template_quote::quote;
 
@@ -164,14 +164,9 @@ struct AliasHeads<'a> {
 
 impl AliasHeads<'_> {
     fn generic_idents(generics: &Generics) -> HashSet<String> {
-        generics
-            .params
+        crate::generics_fmt::type_const_idents(generics)
             .iter()
-            .filter_map(|p| match p {
-                GenericParam::Type(t) => Some(t.ident.to_string()),
-                GenericParam::Const(c) => Some(c.ident.to_string()),
-                GenericParam::Lifetime(_) => None,
-            })
+            .map(Ident::to_string)
             .collect()
     }
 

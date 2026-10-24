@@ -152,12 +152,10 @@ fn cyclic_requirements(
             ));
         }
     };
-    for p in &im.generics.params {
-        if let GenericParam::Type(tp) = p {
-            let target: Type = pq!(#{&tp.ident});
-            for b in &tp.bounds {
-                push(&target, b, false);
-            }
+    for tp in im.generics.type_params() {
+        let target: Type = pq!(#{&tp.ident});
+        for b in &tp.bounds {
+            push(&target, b, false);
         }
     }
     if let Some(wc) = &im.generics.where_clause {
@@ -222,8 +220,7 @@ pub(super) fn floor_generics(im: &ItemImpl, table: &Table, ranked: bool) -> Gene
     let replacer = TraitReplacer::new(table, &TokenStream::new(), pq!(()));
     let mut g = im.generics.clone();
     g.where_clause = remove_cyclic_bounds(&im.generics, table, false).where_clause;
-    for p in g.params.iter_mut() {
-        let GenericParam::Type(tp) = p else { continue };
+    for tp in g.type_params_mut() {
         if kept.contains(&tp.ident) {
             continue;
         }

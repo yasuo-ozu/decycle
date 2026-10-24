@@ -520,11 +520,9 @@ fn reject_self_mentioning_method_bounds(sig: &syn::Signature, ctx: &ProjCtx) -> 
                        both. Take a concrete form the layout cast can reinterpret instead: \
                        `fn(&Self)` or `&dyn Fn(&Self)` (or use the ranked engine, `#[decycle]`, \
                        which supports the generic form).";
-    for p in &sig.generics.params {
-        if let GenericParam::Type(tp) = p {
-            if bounds_mention_self_resolved(&tp.bounds, ctx) {
-                return Err(syn::Error::new_spanned(p, MSG));
-            }
+    for tp in sig.generics.type_params() {
+        if bounds_mention_self_resolved(&tp.bounds, ctx) {
+            return Err(syn::Error::new_spanned(tp, MSG));
         }
     }
     for pred in sig.generics.where_clause.iter().flat_map(|w| &w.predicates) {
@@ -1713,14 +1711,9 @@ fn emit_forwarding_assertion(
     let generalized = generalize_members(&sw.container, &member_set);
     let trait_path = &sw.trait_path;
 
-    let param_idents: HashSet<String> = reduced
-        .params
+    let param_idents: HashSet<String> = crate::generics_fmt::type_const_idents(reduced)
         .iter()
-        .filter_map(|p| match p {
-            GenericParam::Type(t) => Some(t.ident.to_string()),
-            GenericParam::Const(c) => Some(c.ident.to_string()),
-            _ => None,
-        })
+        .map(Ident::to_string)
         .collect();
     if path_mentions(trait_path, &param_idents) || type_mentions(&generalized, &param_idents) {
         return quote!();

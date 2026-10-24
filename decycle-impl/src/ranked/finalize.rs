@@ -442,17 +442,7 @@ fn emit_impl_items_leaf(
 ) -> TokenStream {
     let mut output = TokenStream::new();
     let trait_ident = &trait_.ident;
-    let self_targs = nonlifetime_path_args(
-        &impl_
-            .trait_
-            .as_ref()
-            .unwrap()
-            .1
-            .segments
-            .last()
-            .unwrap()
-            .arguments,
-    );
+    let self_targs = impl_trait_args(impl_);
 
     for item in impl_.items.iter() {
         match item {
@@ -950,6 +940,16 @@ fn distinct_lifetimes_in(tys: impl Iterator<Item = Type>) -> Vec<Lifetime> {
     c.0
 }
 
+/// The type/const generic args of `impl_`'s trait, as [`nonlifetime_path_args`] has them (none for
+/// an inherent impl): `impl Cast<i64> for A` gives `[i64]`.
+fn impl_trait_args(impl_: &ItemImpl) -> Vec<GenericArgument> {
+    impl_
+        .trait_
+        .as_ref()
+        .map(|(_, path, _)| nonlifetime_path_args(&path.segments.last().unwrap().arguments))
+        .unwrap_or_default()
+}
+
 /// The type/const generic args of a path's last segment (lifetimes and associated-type
 /// constraints dropped) — the marker/alias instantiation list for a trait path.
 fn nonlifetime_path_args(args: &PathArguments) -> Vec<GenericArgument> {
@@ -1361,11 +1361,7 @@ fn bound_target_floor_is_unsized(
     let mut decision: Option<bool> = None;
     for cand in impls {
         let pattern_vars = crate::names::type_param_idents(&cand.generics);
-        let cand_targs = cand
-            .trait_
-            .as_ref()
-            .map(|(_, path, _)| nonlifetime_path_args(&path.segments.last().unwrap().arguments))
-            .unwrap_or_default();
+        let cand_targs = impl_trait_args(cand);
         if crate::unify::unify_obligation(&pattern_vars, &cand.self_ty, &cand_targs, target, targs)
             .is_none()
         {
@@ -1795,11 +1791,7 @@ fn reachable_side_bounds_ok(
         let mut matched_any = false;
         for cand in impls {
             let pattern_vars = crate::names::type_param_idents(&cand.generics);
-            let cand_targs = cand
-                .trait_
-                .as_ref()
-                .map(|(_, path, _)| nonlifetime_path_args(&path.segments.last().unwrap().arguments))
-                .unwrap_or_default();
+            let cand_targs = impl_trait_args(cand);
             let Some(subst) = crate::unify::unify_obligation(
                 &pattern_vars,
                 &cand.self_ty,
@@ -2373,11 +2365,7 @@ fn rule1_registration_ok(
     // The impl's own trait own-args (`impl<T> Cast<T> for A` -> `[T]`) are part of the obligation
     // its rule-1 registration proves — the reachability walk must bind them (they may not appear
     // in the self type at all), so thread them in rather than starting the walk arg-blind.
-    let self_targs = impl_
-        .trait_
-        .as_ref()
-        .map(|(_, path, _)| nonlifetime_path_args(&path.segments.last().unwrap().arguments))
-        .unwrap_or_default();
+    let self_targs = impl_trait_args(impl_);
     !impl_has_bare_param_cyclic_bound(impl_, replacing_table)
         && reachable_side_bounds_ok(
             impl_,
@@ -2441,17 +2429,7 @@ fn build_self_registrations(
     rt: &TokenStream,
     decycle: &Path,
 ) -> TokenStream {
-    let self_targs = nonlifetime_path_args(
-        &impl_
-            .trait_
-            .as_ref()
-            .unwrap()
-            .1
-            .segments
-            .last()
-            .unwrap()
-            .arguments,
-    );
+    let self_targs = impl_trait_args(impl_);
     let self_unsized = impl_self_may_be_unsized(impl_);
     let mut out = TokenStream::new();
     let current_margs = type_const_idents(&current_sig.generics);

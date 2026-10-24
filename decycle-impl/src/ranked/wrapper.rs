@@ -566,11 +566,7 @@ impl<'a> Planner<'a> {
         let mut matched = Vec::new();
         for (ci, cand) in impls.iter().enumerate() {
             let vars = crate::names::type_param_idents(&cand.generics);
-            let cand_targs = cand
-                .trait_
-                .as_ref()
-                .map(|(_, path, _)| nonlifetime_path_args(&path.segments.last().unwrap().arguments))
-                .unwrap_or_default();
+            let cand_targs = impl_trait_args(cand);
             let Some(subst) =
                 crate::unify::unify_obligation(&vars, &cand.self_ty, &cand_targs, ty, targs)
             else {

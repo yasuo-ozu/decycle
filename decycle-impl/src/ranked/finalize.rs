@@ -474,71 +474,68 @@ fn emit_impl_items_leaf(
                     input.reduce_pat(param_ix);
                 }
 
-                if body == LeafBody::Reentry {
-                    // Call-argument position: `variable()` emits only the bare ident for a
-                    // `Pat::Ident` (dropping `mut`/`by_ref`/subpatterns, which aren't valid
-                    // expression syntax), matching the delegate path's `FnArgScheme::variable`
-                    // usage. A raw `quote!(#pat)` here would reproduce `mut`-qualified idents
-                    // as `f(mut n)` — invalid expression syntax.
-                    let fn_call_args: Vec<TokenStream> =
-                        sig.inputs.iter().map(|p| p.variable()).collect();
-                    let margs = type_const_idents(&sig.generics);
-                    let mk = name!("__Mk_{}_{}", trait_ident, &sig.ident);
-                    let fa = name!("__Fp_{}_{}", trait_ident, &sig.ident);
-
-                    // The alias declares only the params its fn-pointer type uses (E0091);
-                    // recompute the same mask here (positional, so impl-side renames of
-                    // trait/method generics don't matter). Marker keys stay unfiltered.
-                    let (s_used, tmask, mmask) = {
-                        let tf = trait_fns(trait_)
-                            .find(|tf| tf.sig.ident == sig.ident)
-                            .unwrap_or_else(|| {
-                                abort!(
-                                    &sig.ident,
-                                    "method `{}` not found on #[decycle] trait `{}`",
-                                    &sig.ident,
-                                    trait_ident
-                                )
-                            });
-                        let s_ident = name!("DclSelf");
-                        let s_ty: Type = parse_quote!(#s_ident);
-                        let trait_path_full = original_trait_path(trait_);
-                        let norm = normalize_reentry_sig(tf, &s_ty, &trait_path_full);
-                        reentry_used_mask(trait_, &norm, &s_ident)
-                    };
-                    let mut inst: Vec<TokenStream> = Vec::new();
-                    if s_used {
-                        inst.push(quote!(Self));
+                let tokens = match body {
+                    LeafBody::Limit => {
+                        quote!(::core::unimplemented!("decycle: cycle limit reached"))
                     }
-                    inst.extend(
-                        self_targs
-                            .iter()
-                            .zip(tmask.iter())
-                            .filter(|(_, k)| **k)
-                            .map(|(a, _)| quote!(#a)),
-                    );
-                    inst.extend(
-                        margs
-                            .iter()
-                            .zip(mmask.iter())
-                            .filter(|(_, k)| **k)
-                            .map(|(i, _)| quote!(#i)),
-                    );
+                    LeafBody::Decoy => {
+                        quote!(::core::unreachable!(
+                            "decycle: the decoy rank is never selected"
+                        ))
+                    }
+                    LeafBody::Reentry => {
+                        // Call-argument position: `variable()` emits only the bare ident for a
+                        // `Pat::Ident` (dropping `mut`/`by_ref`/subpatterns, which aren't valid
+                        // expression syntax), matching the delegate path's
+                        // `FnArgScheme::variable` usage. A raw `quote!(#pat)` here would reproduce
+                        // `mut`-qualified idents as `f(mut n)` — invalid expression syntax.
+                        let fn_call_args: Vec<TokenStream> =
+                            sig.inputs.iter().map(|p| p.variable()).collect();
+                        let margs = type_const_idents(&sig.generics);
+                        let mk = name!("__Mk_{}_{}", trait_ident, &sig.ident);
+                        let fa = name!("__Fp_{}_{}", trait_ident, &sig.ident);
 
-                    let fp = fingerprint_expr(
-                        decycle,
-                        &quote!(Self),
-                        impl_self_may_be_unsized(impl_),
-                        &trait_.generics,
-                        &self_targs,
-                        Some(&sig.generics),
-                    );
+                        // The alias declares only the params its fn-pointer type uses (E0091);
+                        // recompute the same mask here (positional, so impl-side renames of
+                        // trait/method generics don't matter). Marker keys stay unfiltered.
+                        let (s_used, tmask, mmask) = {
+                            let tf = trait_fns(trait_)
+                                .find(|tf| tf.sig.ident == sig.ident)
+                                .unwrap_or_else(|| {
+                                    abort!(
+                                        &sig.ident,
+                                        "method `{}` not found on #[decycle] trait `{}`",
+                                        &sig.ident,
+                                        trait_ident
+                                    )
+                                });
+                            let s_ident = name!("DclSelf");
+                            let s_ty: Type = parse_quote!(#s_ident);
+                            let trait_path_full = original_trait_path(trait_);
+                            let norm = normalize_reentry_sig(tf, &s_ty, &trait_path_full);
+                            reentry_used_mask(trait_, &norm, &s_ident)
+                        };
+                        let inst: Vec<TokenStream> = s_used
+                            .then(|| quote!(Self))
+                            .into_iter()
+                            .chain(masked(&self_targs, &tmask).map(|a| quote!(#a)))
+                            .chain(masked(&margs, &mmask).map(|i| quote!(#i)))
+                            .collect();
 
-                    // The transmute names BOTH types: the `*const ()` source (the registry hands
-                    // the fn pointer out by value, WITH its provenance — a `usize` here would
-                    // strip it and make this call UB) and the declared alias target — never `_`.
-                    output.extend(quote! {
-                        #defaultness #sig {
+                        let fp = fingerprint_expr(
+                            decycle,
+                            &quote!(Self),
+                            impl_self_may_be_unsized(impl_),
+                            &trait_.generics,
+                            &self_targs,
+                            Some(&sig.generics),
+                        );
+
+                        // The transmute names BOTH types: the `*const ()` source (the registry
+                        // hands the fn pointer out by value, WITH its provenance — a `usize` here
+                        // would strip it and make this call UB) and the declared alias target —
+                        // never `_`.
+                        quote! {
                             let __dcl_f = unsafe {
                                 ::core::mem::transmute::<
                                     *const (),
@@ -547,32 +544,17 @@ fn emit_impl_items_leaf(
                                     #mk<Self #(for a in &self_targs) {, #a} #(for i in &margs) {, #i}>
                                 >(#fp))
                             };
-                            // A bare `{ __dcl_f(...) }` nested directly as this fn body's
-                            // tail statement (no `unsafe` to scope) would just be a redundant
-                            // brace pair (`unused_braces` in a plain, non-macro-generated
-                            // shape); emit the call unwrapped in that case instead of
-                            // conditionally prefixing an otherwise-pointless block.
-                            #(if sig.unsafety.is_some()) {
-                                unsafe { __dcl_f(#(#fn_call_args),*) }
-                            }
-                            #(if sig.unsafety.is_none()) {
-                                __dcl_f(#(#fn_call_args),*)
-                            }
+                            // A bare `{ __dcl_f(...) }` nested directly as this fn body's tail
+                            // statement (no `unsafe` to scope) would just be a redundant brace
+                            // pair (`unused_braces` in a plain, non-macro-generated shape); emit
+                            // the call unwrapped in that case instead of conditionally prefixing
+                            // an otherwise-pointless block.
+                            #(if sig.unsafety.is_some()) { unsafe { __dcl_f(#(#fn_call_args),*) } }
+                            #(else) { __dcl_f(#(#fn_call_args),*) }
                         }
-                    });
-                } else if body == LeafBody::Limit {
-                    output.extend(quote! {
-                        #defaultness #sig {
-                            ::core::unimplemented!("decycle: cycle limit reached")
-                        }
-                    });
-                } else {
-                    output.extend(quote! {
-                        #defaultness #sig {
-                            ::core::unreachable!("decycle: the decoy rank is never selected")
-                        }
-                    });
-                }
+                    }
+                };
+                output.extend(quote!(#defaultness #sig { #tokens }));
             }
             o => output.extend(quote!(#o)),
         }

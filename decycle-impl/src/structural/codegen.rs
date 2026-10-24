@@ -1550,66 +1550,46 @@ fn is_member_path(ty: &Type, members: &HashSet<String>) -> bool {
 /// `Box<Stmt<T>>` becomes `Box<__DecycleX>` — the generic container for the forwarding assertion.
 /// A member is recognised as [`is_wrapped_member`] recognises one.
 fn generalize_members(ty: &Type, members: &HashSet<String>) -> Type {
-    let x = memberx_ident();
-    let repl: Type = parse_quote!(#x);
-    fn go(ty: &Type, members: &HashSet<String>, repl: &Type) -> Type {
-        let go = |ty: &Type| go(ty, members, repl);
+    fn go(ty: &mut Type, members: &HashSet<String>) {
+        if is_member_path(ty, members) {
+            let x = memberx_ident();
+            *ty = parse_quote!(#x);
+            return;
+        }
         match ty {
             Type::Path(tp) if tp.qself.is_none() => {
-                if is_member_path(ty, members) {
-                    return repl.clone();
-                }
-                let mut tp = tp.clone();
                 for seg in tp.path.segments.iter_mut() {
                     if let PathArguments::AngleBracketed(ab) = &mut seg.arguments {
                         for a in ab.args.iter_mut() {
                             if let GenericArgument::Type(t) = a {
-                                *t = go(t);
+                                go(t, members);
                             }
                         }
                     }
                 }
-                Type::Path(tp)
             }
-            Type::Reference(r) => {
-                let mut r = r.clone();
-                r.elem = Box::new(go(&r.elem));
-                Type::Reference(r)
-            }
-            Type::Ptr(p) => {
-                let mut p = p.clone();
-                p.elem = Box::new(go(&p.elem));
-                Type::Ptr(p)
-            }
+            // Collected anew, which drops a trailing comma (`(A, B,)`) as it always has.
             Type::Tuple(t) => {
-                let mut t = t.clone();
-                t.elems = t.elems.iter().map(&go).collect();
-                Type::Tuple(t)
+                t.elems = std::mem::take(&mut t.elems)
+                    .into_iter()
+                    .map(|mut e| {
+                        go(&mut e, members);
+                        e
+                    })
+                    .collect();
             }
-            Type::Array(a) => {
-                let mut a = a.clone();
-                a.elem = Box::new(go(&a.elem));
-                Type::Array(a)
-            }
-            Type::Slice(s) => {
-                let mut s = s.clone();
-                s.elem = Box::new(go(&s.elem));
-                Type::Slice(s)
-            }
-            Type::Paren(p) => {
-                let mut p = p.clone();
-                p.elem = Box::new(go(&p.elem));
-                Type::Paren(p)
-            }
-            Type::Group(g) => {
-                let mut g = g.clone();
-                g.elem = Box::new(go(&g.elem));
-                Type::Group(g)
-            }
-            other => other.clone(),
+            Type::Reference(r) => go(&mut r.elem, members),
+            Type::Ptr(p) => go(&mut p.elem, members),
+            Type::Array(a) => go(&mut a.elem, members),
+            Type::Slice(s) => go(&mut s.elem, members),
+            Type::Paren(p) => go(&mut p.elem, members),
+            Type::Group(g) => go(&mut g.elem, members),
+            _ => {}
         }
     }
-    go(ty, members, &repl)
+    let mut ty = ty.clone();
+    go(&mut ty, members);
+    ty
 }
 
 /// The forwarding assertion for a stripped wrapped predicate `Container<Member>: Trait`: a private

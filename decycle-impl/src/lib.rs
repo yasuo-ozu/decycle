@@ -68,31 +68,28 @@ impl VisitMut for GenericRenamer {
     }
 
     fn visit_type_mut(&mut self, ty: &mut Type) {
-        if let Type::Path(type_path) = ty {
-            if type_path.qself.is_none() && type_path.path.segments.len() == 1 {
-                let segment = &mut type_path.path.segments[0];
-                if matches!(segment.arguments, PathArguments::None) {
-                    if let Some(new) = self.ident_renames.get(&segment.ident.to_string()) {
-                        segment.ident = new.clone();
-                    }
-                }
-            }
+        if let Type::Path(tp) = ty {
+            self.rename_path(&tp.qself, &mut tp.path);
         }
         syn::visit_mut::visit_type_mut(self, ty);
     }
 
     fn visit_expr_mut(&mut self, expr: &mut Expr) {
-        if let Expr::Path(expr_path) = expr {
-            if expr_path.qself.is_none() && expr_path.path.segments.len() == 1 {
-                let segment = &mut expr_path.path.segments[0];
-                if matches!(segment.arguments, PathArguments::None) {
-                    if let Some(new) = self.ident_renames.get(&segment.ident.to_string()) {
-                        segment.ident = new.clone();
-                    }
-                }
-            }
+        if let Expr::Path(ep) = expr {
+            self.rename_path(&ep.qself, &mut ep.path);
         }
         syn::visit_mut::visit_expr_mut(self, expr);
+    }
+}
+
+impl GenericRenamer {
+    /// Rename `path` when it is a single argument-less segment naming a renamed parameter.
+    fn rename_path(&self, qself: &Option<QSelf>, path: &mut Path) {
+        if qself.is_none() && path.segments.len() == 1 && path.segments[0].arguments.is_none() {
+            if let Some(new) = self.ident_renames.get(&path.segments[0].ident.to_string()) {
+                path.segments[0].ident = new.clone();
+            }
+        }
     }
 }
 
@@ -112,17 +109,11 @@ pub(crate) fn randomize_impl_generics(
                 lt.lifetime = new.clone();
                 lifetime_renames.insert(old.ident.to_string(), new);
             }
-            GenericParam::Type(tp) => {
-                let old = tp.ident.clone();
-                let new = Ident::new(&format!("{}{}", old, random_suffix), old.span());
-                tp.ident = new.clone();
-                ident_renames.insert(old.to_string(), new);
-            }
-            GenericParam::Const(cp) => {
-                let old = cp.ident.clone();
-                let new = Ident::new(&format!("{}{}", old, random_suffix), old.span());
-                cp.ident = new.clone();
-                ident_renames.insert(old.to_string(), new);
+            GenericParam::Type(TypeParam { ident, .. })
+            | GenericParam::Const(ConstParam { ident, .. }) => {
+                let new = Ident::new(&format!("{}{}", ident, random_suffix), ident.span());
+                ident_renames.insert(ident.to_string(), new.clone());
+                *ident = new;
             }
         }
     }

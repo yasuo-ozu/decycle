@@ -549,29 +549,27 @@ fn freshen_binder_lifetimes(mut pred: WherePredicate, taken: &HashSet<String>) -
         return pred;
     };
     let mut rename: HashMap<String, syn::Lifetime> = HashMap::new();
-    if let Some(bl) = &mut pt.lifetimes {
-        for p in bl.lifetimes.iter_mut() {
-            if let syn::GenericParam::Lifetime(l) = p {
-                let old = l.lifetime.ident.to_string();
-                if taken.contains(&old) {
-                    let fresh = syn::Lifetime::new(
-                        &format!("'{}__decycle_hr", old),
-                        l.lifetime.ident.span(),
-                    );
-                    rename.insert(l.lifetime.to_string(), fresh.clone());
-                    l.lifetime = fresh;
-                }
+    for p in pt
+        .lifetimes
+        .iter_mut()
+        .flat_map(|bl| bl.lifetimes.iter_mut())
+    {
+        if let syn::GenericParam::Lifetime(l) = p {
+            let old = l.lifetime.ident.to_string();
+            if taken.contains(&old) {
+                let fresh =
+                    syn::Lifetime::new(&format!("'{}__decycle_hr", old), l.lifetime.ident.span());
+                rename.insert(l.lifetime.to_string(), fresh.clone());
+                l.lifetime = fresh;
             }
         }
     }
     // The binder itself is renamed above; only the predicate's type and bounds are rewritten.
     if !rename.is_empty() {
         let mut r = RenameLifetimes(&rename);
-        if let WherePredicate::Type(pt) = &mut pred {
-            r.visit_type_mut(&mut pt.bounded_ty);
-            for b in pt.bounds.iter_mut() {
-                r.visit_type_param_bound_mut(b);
-            }
+        r.visit_type_mut(&mut pt.bounded_ty);
+        for b in pt.bounds.iter_mut() {
+            r.visit_type_param_bound_mut(b);
         }
     }
     pred

@@ -271,6 +271,13 @@ as **0.8.0**, not as a 0.7 patch.
   call through the wrapper stays `E0283` (`tests/ui/ranked_floor_by_elimination_tuple.rs`, which
   pinned the call above and now pins a renamed part). A wrapper whose impl is outside the module is
   still reached by path only (`tests/ui/wrapper_outside_method.rs`).
+- **Ranked engine: a doc comment or a string literal naming a wrapper's parameter no longer stops
+  the call through the wrapper.** The wrapper's floor keeps an inline bound on the original trait
+  for a parameter one of its associated items mentions (`type Out = X::Out;` resolves through
+  `X: Loop`), and a wrapper whose floor keeps one is not planned, so the call through it is
+  `E0283`. The mentions were read off the item's text, so `/// The pair of an X and a Y` or
+  `const NAME: &str = "X";` counted one; they are now the idents of its syntax. An associated item
+  holding a macro, whose tokens are not read, keeps every parameter (`tests/wrapper_bridge.rs`).
 - **The ranked engine's expansion is deterministic.** It emitted its per-trait items (the ranked
   twins and re-entry items, the dummy shadows, the inductive and the Final impls) in the iteration
   order of a `HashMap`, which `std` seeds per process: a module with several `#[decycle]` traits

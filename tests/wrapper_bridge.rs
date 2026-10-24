@@ -738,6 +738,76 @@ fn associated_items_and_a_generic_method() {
     }
 }
 
+// ---- a parameter named only in a doc comment or a string literal of an associated item ----
+
+// The floor of the pair keeps an inline bound on the real trait for a parameter one of its
+// associated items mentions (`type Out = X::Out;` resolves through `X: Loop`), and a wrapper whose
+// floor keeps one is not planned. A doc comment or a string literal naming `X` is no mention: the
+// pair is planned and bridged as in `pair`.
+#[decycle::decycle]
+pub mod named_in_literal {
+    #[decycle]
+    pub trait Loop {
+        const NAME: &'static str;
+        fn step(&self, n: u32) -> u32;
+    }
+
+    pub struct A;
+    pub struct B;
+
+    impl<X: Loop, Y: Loop> Loop for (X, Y) {
+        /// The pair of an `X` and a `Y`.
+        const NAME: &'static str = "(X, Y)";
+        fn step(&self, n: u32) -> u32 {
+            self.0.step(n) + self.1.step(n)
+        }
+    }
+
+    impl Loop for A
+    where
+        (B, crate::other::Leaf): Loop,
+    {
+        const NAME: &'static str = "A";
+        fn step(&self, n: u32) -> u32 {
+            if n == 0 {
+                0
+            } else {
+                (B, crate::other::Leaf).step(n - 1)
+            }
+        }
+    }
+
+    impl Loop for B
+    where
+        A: Loop,
+    {
+        const NAME: &'static str = "B";
+        fn step(&self, n: u32) -> u32 {
+            if n == 0 {
+                0
+            } else {
+                A.step(n - 1) + 1
+            }
+        }
+    }
+}
+
+impl named_in_literal::Loop for other::Leaf {
+    const NAME: &'static str = "Leaf";
+    fn step(&self, _n: u32) -> u32 {
+        100
+    }
+}
+
+#[test]
+fn a_parameter_named_in_a_literal_is_no_mention() {
+    use named_in_literal::Loop;
+    for n in DEEP {
+        assert_eq!(named_in_literal::A.step(n), ra(n), "A({n})");
+    }
+    assert_eq!(<(named_in_literal::B, other::Leaf) as Loop>::NAME, "(X, Y)");
+}
+
 // ---- no bridge where one could overlap an impl (E0119) ----
 
 // `crate::m::C` names the member `C`, and `Leaf` and `crate::other::Leaf` may name one type: none of

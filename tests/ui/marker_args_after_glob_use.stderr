@@ -1,0 +1,43 @@
+error: glob is not supported in #[decycle] use
+  --> tests/ui/marker_args_after_glob_use.rs:16:21
+   |
+16 |     use crate::ext::*;
+   |                     ^
+
+warning: unused import: `crate::ext::*`
+  --> tests/ui/marker_args_after_glob_use.rs:16:9
+   |
+16 |     use crate::ext::*;
+   |         ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0275]: overflow evaluating the requirement `A: Tr`
+  --> tests/ui/marker_args_after_glob_use.rs:28:9
+   |
+28 |         B: Tr,
+   |         ^^^^^
+   |
+note: required for `B` to implement `Tr`
+  --> tests/ui/marker_args_after_glob_use.rs:35:10
+   |
+35 |     impl Tr for B
+   |          ^^     ^
+36 |     where
+37 |         A: Tr,
+   |            -- unsatisfied trait bound introduced here
+
+error[E0275]: overflow evaluating the requirement `B: Tr`
+  --> tests/ui/marker_args_after_glob_use.rs:37:9
+   |
+37 |         A: Tr,
+   |         ^^^^^
+   |
+note: required for `A` to implement `Tr`
+  --> tests/ui/marker_args_after_glob_use.rs:26:10
+   |
+26 |     impl Tr for A
+   |          ^^     ^
+27 |     where
+28 |         B: Tr,
+   |            -- unsatisfied trait bound introduced here

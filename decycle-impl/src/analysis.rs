@@ -58,16 +58,21 @@ use syn::{Attribute, Item, ItemImpl, ItemMod, Path, Type};
 /// only marker is a glob therefore yields the empty graph — the ranked engine rejects that module
 /// outright ("glob is not supported in #[decycle] use"), so there is no expansion to describe.
 pub(crate) fn analyze_module(module: &ItemMod, decycle: &Path) -> VecGraph<Ident, ()> {
-    let Some((_, items)) = module.content.as_ref() else {
-        return VecGraph::default();
-    };
-    // An empty path can only be hand-built: fail soft, not via `expect`.
-    let Some(first_segment) = decycle.segments.first() else {
-        return VecGraph::default();
-    };
-    let decycle_crate = &first_segment.ident;
+    module_routes(module, decycle)
+        .map_or_else(VecGraph::default, |(items, routed)| build(items, &routed))
+}
+
+/// The items of `module` and the traits they route ([`routed_traits`], by the path-only marker test
+/// [`has_decycle_attr`]); `None` for a module with no body, or for a `decycle` path with no
+/// segments, which names no crate (only a hand-built one: failing soft, not via `expect`).
+pub(crate) fn module_routes<'m>(
+    module: &'m ItemMod,
+    decycle: &Path,
+) -> Option<(&'m [Item], HashSet<Ident>)> {
+    let (_, items) = module.content.as_ref()?;
+    let decycle_crate = &decycle.segments.first()?.ident;
     let routed = routed_traits(items, &|attrs| has_decycle_attr(attrs, decycle_crate));
-    build(items, &routed)
+    Some((items, routed))
 }
 
 fn build(items: &[Item], routed: &HashSet<Ident>) -> VecGraph<Ident, ()> {
@@ -114,10 +119,7 @@ fn build(items: &[Item], routed: &HashSet<Ident>) -> VecGraph<Ident, ()> {
 /// A glob names no trait, so it routes none — see the caveat on `analyze_module`. The ranked engine
 /// rejects `#[decycle] use path::*;` outright, so a module relying on one has no expansion for this
 /// graph to describe.
-pub(crate) fn routed_traits(
-    items: &[Item],
-    marked: &dyn Fn(&[Attribute]) -> bool,
-) -> HashSet<Ident> {
+fn routed_traits(items: &[Item], marked: &dyn Fn(&[Attribute]) -> bool) -> HashSet<Ident> {
     let mut out = HashSet::new();
     for item in items {
         match item {

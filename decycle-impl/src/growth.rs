@@ -96,8 +96,10 @@ use syn::{
 
 /// What a call site has to name for its callee to be the cycle's own trait method — condition 3.
 struct Callees {
-    /// Idents of the traits `#[decycle]` routes through this module. A path segment naming one
-    /// (`Eval::eval(..)`, `<B as Eval>::eval(..)`) names the trait method itself.
+    /// Idents of the traits `#[decycle]` routes through this module, as the obligation graph reads
+    /// them (`analysis::module_routes`). A path segment naming one (`Eval::eval(..)`,
+    /// `<B as Eval>::eval(..)`) names the trait method itself. A marker's argument list is not
+    /// diagnosed here: the engine rejects it where it takes the markers (`markers::take_marked`).
     routed_traits: HashSet<String>,
     /// The cycle members' type names, so a receiver spelled as one (`B.eval(..)`) is recognised.
     members: HashSet<String>,
@@ -114,7 +116,9 @@ pub(crate) fn check_value_generic_growth(module: &ItemMod, decycle: &Path) -> sy
         return Ok(());
     }
     let callees = Callees {
-        routed_traits: routed_trait_names(items, decycle),
+        routed_traits: analysis::module_routes(module, decycle)
+            .map(|(_, routed)| routed.iter().map(Ident::to_string).collect())
+            .unwrap_or_default(),
         members: cyclic.clone(),
     };
     for item in items {
@@ -132,27 +136,6 @@ pub(crate) fn check_value_generic_growth(module: &ItemMod, decycle: &Path) -> sy
         }
     }
     Ok(())
-}
-
-/// The idents of the traits routed through this module — `#[decycle] trait Tr` and
-/// `#[decycle] use path::Tr` (under its local name), as [`analysis::routed_traits`] reads them.
-///
-/// Through the engines' own marker predicate (`crate::is_decycle_attribute`), which rejects an
-/// argument list on the marker: this pass runs inside an engine's entry point.
-fn routed_trait_names(items: &[Item], decycle: &Path) -> HashSet<String> {
-    let Some(first) = decycle.segments.first() else {
-        return HashSet::new();
-    };
-    let decycle_crate = &first.ident;
-    let marked = |attrs: &[syn::Attribute]| {
-        attrs
-            .iter()
-            .any(|a| crate::is_decycle_attribute(a, decycle_crate))
-    };
-    analysis::routed_traits(items, &marked)
-        .iter()
-        .map(|ident| ident.to_string())
-        .collect()
 }
 
 /// The cycle members' type names. An empty set (no cycle at all) short-circuits the whole pass.

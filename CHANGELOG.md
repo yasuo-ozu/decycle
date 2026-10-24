@@ -170,6 +170,14 @@ as **0.8.0**, not as a 0.7 patch.
     `#[decycle]` module);
   - `#[decycle]` on a trait alias (`#[decycle] is not supported on a trait alias`). The marker used
     to be left on the alias, where it failed as an unknown attribute.
+- **In a module with a cycle, the markers are checked only where the engine takes them**, item by
+  item in source order, so the first faulty item is the one reported. The value-generic growth
+  pre-pass, which runs first, used to check the markers of the module's traits and `use`s on its
+  way, and reported a marker with arguments (`#[decycle] takes no arguments on an item inside a
+  #[decycle] module`) ahead of everything: ahead of a glob `#[decycle] use` or a marked trait alias
+  earlier in the module (`tests/ui/marker_args_after_glob_use.rs`), ahead of a second marker with
+  arguments on an earlier item, and ahead of the growth itself, which the structural engine now
+  reports first (`tests/ui/value_generic_growth_before_marker_args_structural.rs`).
 
 ### Removed
 

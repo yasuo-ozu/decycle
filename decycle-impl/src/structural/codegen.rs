@@ -135,16 +135,10 @@ fn make_impls(model: &Model, scc: &Scc, im: &ImplBlock) -> syn::Result<TokenStre
     let trait_path = im.item.trait_.as_ref().map(|(_, p, _)| p.clone()).unwrap();
 
     // natural self type `M<self_args>` and its terminator `__MTerm<self_args>` (same layout).
-    let (natural, term_ty): (Type, Type) = if self_args.is_empty() {
-        let term = term_ident(&m, model.nonce);
-        (parse_quote!(#m_ident), parse_quote!(#term))
-    } else {
-        let term = term_ident(&m, model.nonce);
-        (
-            parse_quote!(#m_ident< #(#self_args),* >),
-            parse_quote!(#term< #(#self_args),* >),
-        )
-    };
+    let term = term_ident(&m, model.nonce);
+    let args = (!self_args.is_empty()).then(|| quote!(< #(#self_args),* >));
+    let natural: Type = parse_quote!(#m_ident #args);
+    let term_ty: Type = parse_quote!(#term #args);
 
     // `reduced` (all cyclic preds dropped) drives the terminator + natural impls; `local` (only wrapped
     // cyclic preds dropped) drives each method's local `__DecycleBody` impl so bare cyclic bounds still
@@ -158,10 +152,10 @@ fn make_impls(model: &Model, scc: &Scc, im: &ImplBlock) -> syn::Result<TokenStre
     // `__DecycleBody` trait is safe, so its impl is unaffected.
     let unsafety = &im.item.unsafety;
 
-    let mut assertions = TokenStream::new();
-    for sw in &stripped_wrapped {
-        assertions.extend(emit_forwarding_assertion(sw, scc, &reduced));
-    }
+    let assertions: TokenStream = stripped_wrapped
+        .iter()
+        .map(|sw| emit_forwarding_assertion(sw, scc, &reduced))
+        .collect();
 
     // Pass 1: associated items (types/consts). They go on BOTH the natural and terminator impls, and
     // (as decls) into each method's local `__DecycleBody` so a `Self::Assoc` in a body resolves.
@@ -186,12 +180,16 @@ fn make_impls(model: &Model, scc: &Scc, im: &ImplBlock) -> syn::Result<TokenStre
     // the generated impls are of the same trait for a DIFFERENT self type, so such a position has to
     // read `Self` again or the terminator impl mismatches the trait it implements (E0053, whose
     // "help" names the generated `__ATerm`).
+    // Both emitters classify `Self::Out` through this one context — if they disagreed, one side
+    // would cast an argument the other forwards verbatim.
+    let proj = ProjCtx::new(&assoc_items, &trait_path);
     let cx = ImplCx {
         natural: &natural,
         term_ty: &term_ty,
         local: &local,
         reduced: &reduced,
         assoc_items: &assoc_items,
+        proj: &proj,
         trait_path: &trait_path,
         nonce: model.nonce,
     };
@@ -247,6 +245,8 @@ struct ImplCx<'a> {
     reduced: &'a syn::Generics,
     /// The impl's associated items (types and consts).
     assoc_items: &'a [&'a ImplItem],
+    /// The context resolving the impl's `Self` projections.
+    proj: &'a ProjCtx,
     /// The trait being implemented, as written.
     trait_path: &'a syn::Path,
     nonce: u64,
@@ -550,13 +550,12 @@ fn rec_method(
         local: reduced,
         reduced: outer,
         assoc_items,
-        trait_path,
+        proj: ctx,
         nonce,
         ..
     } = *cx;
     let attrs = &f.attrs;
     let vis = &f.vis;
-    let ctx = ProjCtx::new(assoc_items, trait_path);
     // `async fn` returns an OPAQUE future (`impl Future`). The dispatch would `transmute_copy` the
     // terminator's future into the natural type's future — two distinct anonymous types — which is
     // unsound (the layout cast reinterprets an un-polled future). The size guard catches it only when
@@ -590,7 +589,7 @@ fn rec_method(
             // Resolve `Self::Out`-style projections first, so the check sees what the type MEANS
             // (`impl Fn(&Self::Out)` with `type Out = Self` is the unnameable shape; with
             // `type Out = i64` it is harmless). Unresolvable projections error here, up-front.
-            let nty = normalized(&pt.ty, &ctx, 0)?;
+            let nty = normalized(&pt.ty, ctx, 0)?;
             if has_self_mentioning_impl_trait(&nty) {
                 return Err(syn::Error::new_spanned(
                     &pt.ty,
@@ -607,9 +606,9 @@ fn rec_method(
     // both. Reject it here, on the user's own bound, instead of emitting three E0277s that name
     // `__DecycleBody`/`__ATerm`. The trait's own declaration is checked too, so an impl that spells
     // the bound concretely (`F: Fn(&A)` for a declared `F: Fn(&Self)`) is caught just the same.
-    reject_self_mentioning_method_bounds(&f.sig, &ctx)?;
+    reject_self_mentioning_method_bounds(&f.sig, ctx)?;
     if let Some(d) = decl_sig {
-        reject_self_mentioning_method_bounds(d, &ctx)?;
+        reject_self_mentioning_method_bounds(d, ctx)?;
     }
     // Rewrite destructured / `mut` / `ref` params to fresh idents so the dispatch can forward them;
     // the original patterns are rebound at the top of the body. A `mut self` receiver's `mut` is
@@ -634,10 +633,10 @@ fn rec_method(
     run_sig.ident = run.clone();
     for input in run_sig.inputs.iter_mut() {
         if let syn::FnArg::Typed(pt) = input {
-            normalize_projections(&mut pt.ty, &ctx, 0)?;
+            normalize_projections(&mut pt.ty, ctx, 0)?;
         }
     }
-    normalize_in_output(&mut run_sig.output, &ctx, 0)?;
+    normalize_in_output(&mut run_sig.output, ctx, 0)?;
     // The body-holding impl fn carries the user's `mut self` back (stripped from the decl above) so
     // the body's mutation of `self` still compiles; a by-value receiver's binding mode is free to
     // differ between a trait decl and its impl.
@@ -664,17 +663,18 @@ fn rec_method(
     // real trait's, which is the one the user meant. The TYPE namespace has no such problem —
     // `Self::Out` resolves with both traits in scope — so the type decls stay (and they are what
     // `normalize_projections` reads).
-    let assoc_types: Vec<&&ImplItem> = assoc_items
+    let assoc_types: Vec<&syn::ImplItemType> = assoc_items
         .iter()
-        .filter(|it| matches!(it, ImplItem::Type(_)))
+        .filter_map(|it| match it {
+            ImplItem::Type(t) => Some(t),
+            _ => None,
+        })
         .collect();
-    let assoc_decls: Vec<TokenStream> = assoc_types.iter().map(|it| assoc_decl(it)).collect();
-    let assoc_defs: Vec<TokenStream> = assoc_types.iter().map(|it| it.to_token_stream()).collect();
 
     // dispatch: cast receiver + any Self-typed args into natural-space, forward the rest, call __run,
     // cast result up.
     let callee = quote!(< #natural as #body_tr #use_g >::#run);
-    let dispatch = forward_call(callee, outer_sig, natural, &ctx, nonce)?;
+    let dispatch = forward_call(callee, outer_sig, natural, ctx, nonce)?;
 
     let inline = inline_attr(attrs);
     // Replicate `#[track_caller]` / lint / hint attrs onto the body-bearing `__run` too — otherwise
@@ -694,11 +694,11 @@ fn rec_method(
     Ok(quote! {
         #inline #(#prop)* #vis #outer_sig {
             trait #body_tr #trait_g : Sized #trait_where {
-                #(#assoc_decls)*
+                #(for t in &assoc_types) { #{assoc_decl(t)} }
                 #run_sig ;
             }
             impl #impl_g #body_tr #use_g for #natural #where_g {
-                #(#assoc_defs)*
+                #(#assoc_types)*
                 // `run_sig_impl`, not `run_sig`: this copy carries the user's `mut self` back.
                 // The trait decl above must not have it (a receiver pattern is illegal in a
                 // bodiless fn), but the body below may well assign through `self`.
@@ -736,20 +736,14 @@ fn body_trait_where(outer: &syn::Generics) -> TokenStream {
     quote!(#(if !preds.is_empty()) { where #(#preds),* })
 }
 
-/// The trait-declaration form of an associated impl item: `type Out = i64;` → `type Out;`.
+/// The trait-declaration form of an associated type: `type Out = i64;` → `type Out;`.
 ///
 /// Associated CONSTS have no declaration form here on purpose — declaring one on the local
 /// `__DecycleBody` trait makes every `Self::K` in a body ambiguous against the real trait's own
-/// const (E0034). The caller filters to associated types before calling this.
-fn assoc_decl(item: &ImplItem) -> TokenStream {
-    match item {
-        ImplItem::Type(t) => {
-            let id = &t.ident;
-            let (ig, _, wg) = t.generics.split_for_impl();
-            quote! { type #id #ig #wg ; }
-        }
-        _ => quote!(),
-    }
+/// const (E0034).
+fn assoc_decl(t: &syn::ImplItemType) -> TokenStream {
+    let (ig, _, wg) = t.generics.split_for_impl();
+    quote! { type #{&t.ident} #ig #wg ; }
 }
 
 /// `#[inline]` for a generated dispatch shim, unless the user's own method already carries an
@@ -767,21 +761,18 @@ fn nat_method(f: &syn::ImplItemFn, cx: &ImplCx) -> syn::Result<TokenStream> {
     let ImplCx {
         term_ty: closed_rec,
         trait_path,
-        assoc_items,
+        proj: ctx,
         nonce,
         ..
     } = *cx;
     let attrs = &f.attrs;
     let vis = &f.vis;
-    // Same projection context as the terminator side, so both classify `Self::Out` identically —
-    // if they disagreed, one side would cast an argument the other forwards verbatim.
-    let ctx = ProjCtx::new(assoc_items, trait_path);
     // The receiver's `mut` is dropped: this natural method only forwards, it never mutates
     // `self`, and the binding mode of a by-value receiver is local to each fn.
     let (norm_sig, _, _) = normalize_sig(&f.sig, nonce);
     let sig = &norm_sig;
     let callee = quote!(< #closed_rec as #trait_path >::#{&sig.ident});
-    let body = forward_call(callee, sig, closed_rec, &ctx, nonce)?;
+    let body = forward_call(callee, sig, closed_rec, ctx, nonce)?;
     let inline = inline_attr(attrs);
     Ok(quote! { #inline #(#attrs)* #vis #sig { #body } })
 }

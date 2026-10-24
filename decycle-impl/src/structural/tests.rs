@@ -104,3 +104,49 @@ fn cross_trait_cycle_members_share_their_mapped_premises() {
         );
     }
 }
+
+/// `Self` is found wherever a signature can spell it — the expression of an array length or of a
+/// const argument, and an attribute of a fn pointer's parameter, included — so a parameter that
+/// mentions it there is cast into the terminator's space like any other `Self`-mentioning one
+/// (`unsafe { cast::<..>(xa) }`). Those positions used to be skipped, and the parameter forwarded
+/// as written.
+#[test]
+fn self_in_an_array_length_a_const_argument_or_an_attribute_is_cast() {
+    let out = expand(parse_quote! {
+        mod m {
+            pub struct Wrap<const K: usize>;
+            #[decycle] pub trait Tr {
+                const N: usize;
+                fn arr(&self, xa: [u8; 3]) -> u8;
+                fn cst(&self, xc: Wrap<3>) -> u8;
+                fn attr(&self, xf: fn(u8) -> u8) -> u8;
+            }
+            pub struct A; pub struct B;
+            impl Tr for A where B: Tr {
+                const N: usize = 3;
+                fn arr(&self, xa: [u8; Self::N]) -> u8 { 0 }
+                fn cst(&self, xc: Wrap<{ Self::N }>) -> u8 { 0 }
+                fn attr(&self, xf: fn(#[doc = Self::DOC] u8) -> u8) -> u8 { 0 }
+            }
+            impl Tr for B where A: Tr {
+                const N: usize = 3;
+                fn arr(&self, xb: [u8; 3]) -> u8 { 0 }
+                fn cst(&self, xd: Wrap<3>) -> u8 { 0 }
+                fn attr(&self, xg: fn(u8) -> u8) -> u8 { 0 }
+            }
+        }
+    });
+    let squished: String = out.split_whitespace().collect();
+    for arg in ["xa", "xc", "xf"] {
+        assert!(
+            squished.contains(&format!(">({arg})")),
+            "`{arg}` is cast:\n{out}"
+        );
+    }
+    for arg in ["xb", "xd", "xg"] {
+        assert!(
+            !squished.contains(&format!(">({arg})")),
+            "`{arg}` is forwarded:\n{out}"
+        );
+    }
+}

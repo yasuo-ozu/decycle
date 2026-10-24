@@ -188,6 +188,27 @@ as **0.8.0**, not as a 0.7 patch.
   type (`impl Eval for <Q as P>::Out`) is no cycle member, whatever its last segment spells, so the
   check no longer rejects such an impl's methods when that segment happens to be a member's name
   (`tests/growth_qself_target.rs`).
+- **Structural engine: `Self` is found wherever a signature spells it**, by one visitor over the
+  whole signature: also in the expression of an array length or a const argument
+  (`[u8; Self::N]`, `Wrap<{ Self::N }>`), in the generics of an associated-type binding
+  (`Fam<Assoc<Self> = u8>`) and in an attribute of a fn pointer's parameter, and an `impl Trait` or
+  a `dyn` mentioning `Self` anywhere in a type. A parameter or return type mentioning `Self` only
+  there is now cast to the terminator's type (`decycle-impl/src/structural/tests.rs`), and these signatures,
+  which used to fail on generated code, are rejected up front with the engine's own errors:
+  - a method-level bound mentioning `Self` in one of those positions (`F: Fam<Assoc<Self> = u8>`,
+    `tests/ui/structural_method_gat_binding_self_bound.rs`; it was a wall of `E0271` naming
+    `__ATerm_..`);
+  - an argument-position `impl Trait` mentioning `Self` inside a generic argument
+    (`Option<impl Fn(&Self)>`, `tests/ui/structural_nested_impl_trait_self_arg.rs`; it was
+    `E0562` on the generated cast);
+  - a parameter whose type holds a `dyn` mentioning `Self` only in such an expression, and a
+    qualified projection whose base mentions `Self` only there (`<[u8; Self::N] as Tr>::Out`).
+
+  With a `#[decycle] use`d trait, whose declaration the engine cannot read, a signature naming the
+  concrete self type by the last segment of a path in one of those positions (`Box<dyn
+  Iterator<Item = A>>`, `[u8; size_of::<A>()]`) is rejected as a concrete `Self` spelling, like
+  `&A`; and a wrapped bound's forwarding assertion is no longer emitted when its container names an
+  impl parameter there (`Box<dyn Iterator<Item = T>>`), where it named a parameter out of scope.
 
 ### Removed
 

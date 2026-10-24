@@ -6,6 +6,7 @@ use crate::generics_fmt::{params_decl, params_use, wrap_angle, DeclBounds};
 // See through `(T)` and invisible groups, so the shape checks below match on the real type.
 use crate::names::strip_parens;
 use syn::punctuated::Punctuated;
+use syn::visit::Visit;
 
 /// An expression that reinterprets the receiver `self` into `target`-space (a same-layout type).
 /// `&self`/`&mut self` use a pointer cast; any other receiver — owned `self`, or a custom type such as
@@ -518,17 +519,7 @@ fn bounds_mention_self_resolved(
 /// `&impl Fn(&Self)`). Such an argument can't be cast into terminator-space — its target type
 /// `impl Fn(&__Term)` is unnameable (E0562) — unlike `fn(&Self)` / `dyn Fn(&Self)`, which are.
 fn has_self_mentioning_impl_trait(ty: &Type) -> bool {
-    match ty {
-        Type::ImplTrait(_) => mentions_self(ty),
-        Type::Reference(r) => has_self_mentioning_impl_trait(&r.elem),
-        Type::Ptr(p) => has_self_mentioning_impl_trait(&p.elem),
-        Type::Array(a) => has_self_mentioning_impl_trait(&a.elem),
-        Type::Slice(s) => has_self_mentioning_impl_trait(&s.elem),
-        Type::Paren(p) => has_self_mentioning_impl_trait(&p.elem),
-        Type::Group(g) => has_self_mentioning_impl_trait(&g.elem),
-        Type::Tuple(t) => t.elems.iter().any(has_self_mentioning_impl_trait),
-        _ => false,
-    }
+    Seek::SelfImplTrait.finds(|f| f.visit_type(ty))
 }
 
 /// Body-holding method on the terminator `__MTerm`. Uses the **trait-def-inside-body** pattern: a
@@ -994,70 +985,82 @@ fn normalize_sig(
     (renamed, rebinds, receiver_mut)
 }
 
-/// Whether `ty` mentions the `Self` type anywhere. Unlike [`walk_type`] (which visits only a path's
-/// LAST segment, the right granularity for ADT-name matching), this checks EVERY path segment plus
-/// the `qself` position and associated-type bindings — so `Self::Out`, `<Self as Tr>::Out` and
-/// `dyn Tr<Item = Self>` are all detected. Detection must err on the side of "mentions", because a
-/// missed `Self` is forwarded un-cast (E0308 at best).
+/// What a search of a type, a bound or a path looks for. One visitor ([`Finder`]) answers each
+/// question over the whole syntax it is given — array lengths, const arguments, the generics of an
+/// associated-type binding and attributes included, never the tokens of a macro — and the modes
+/// keep the questions apart, as `unify::Reading` keeps the readings of a match apart.
+#[derive(Clone, Copy)]
+enum Seek<'a> {
+    /// `Self`, as any segment of any path: `Self`, `Self::Out`, `<Self as Tr>::Out`,
+    /// `dyn Tr<Item = Self>`, `[u8; Self::N]`. Detection must err on the side of "mentions",
+    /// because a missed `Self` is forwarded un-cast (E0308 at best).
+    SelfMention,
+    /// A trait object whose bounds mention `Self` ([`contains_self_dyn`]).
+    SelfDyn,
+    /// An `impl Trait` whose bounds mention `Self` ([`has_self_mentioning_impl_trait`]).
+    SelfImplTrait,
+    /// One of these idents as the LAST segment of a path, the granularity of ADT-name matching:
+    /// `crate::m::A` names `A`, `A::Out` names `Out`.
+    LastSegment(&'a HashSet<String>),
+}
+
+impl Seek<'_> {
+    /// Does `visit`, run on a [`Finder`] for `self`, find it?
+    fn finds(self, visit: impl FnOnce(&mut Finder)) -> bool {
+        let mut finder = Finder {
+            seek: self,
+            found: false,
+        };
+        visit(&mut finder);
+        finder.found
+    }
+}
+
+/// The visitor behind [`Seek`].
+struct Finder<'a> {
+    seek: Seek<'a>,
+    found: bool,
+}
+
+impl<'ast> Visit<'ast> for Finder<'_> {
+    fn visit_type(&mut self, ty: &'ast Type) {
+        if self.found {
+            return;
+        }
+        match (self.seek, ty) {
+            (Seek::SelfDyn, Type::TraitObject(_)) | (Seek::SelfImplTrait, Type::ImplTrait(_))
+                if mentions_self(ty) =>
+            {
+                self.found = true
+            }
+            _ => syn::visit::visit_type(self, ty),
+        }
+    }
+
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        if self.found {
+            return;
+        }
+        self.found = match self.seek {
+            Seek::SelfMention => path.segments.iter().any(|seg| seg.ident == "Self"),
+            Seek::LastSegment(idents) => path
+                .segments
+                .last()
+                .is_some_and(|seg| idents.contains(&seg.ident.to_string())),
+            Seek::SelfDyn | Seek::SelfImplTrait => false,
+        };
+        syn::visit::visit_path(self, path);
+    }
+}
+
+/// Whether `ty` mentions the `Self` type anywhere ([`Seek::SelfMention`]).
 fn mentions_self(ty: &Type) -> bool {
-    match ty {
-        Type::Path(tp) => {
-            tp.qself.as_ref().is_some_and(|q| mentions_self(&q.ty))
-                || tp
-                    .path
-                    .segments
-                    .iter()
-                    .any(|seg| seg.ident == "Self" || args_mention_self(&seg.arguments))
-        }
-        Type::Reference(r) => mentions_self(&r.elem),
-        Type::Ptr(p) => mentions_self(&p.elem),
-        Type::Array(a) => mentions_self(&a.elem),
-        Type::Slice(s) => mentions_self(&s.elem),
-        Type::Paren(p) => mentions_self(&p.elem),
-        Type::Group(g) => mentions_self(&g.elem),
-        Type::Tuple(t) => t.elems.iter().any(mentions_self),
-        Type::BareFn(bf) => {
-            bf.inputs.iter().any(|i| mentions_self(&i.ty))
-                || matches!(&bf.output, syn::ReturnType::Type(_, t) if mentions_self(t))
-        }
-        Type::TraitObject(to) => bounds_mention_self(&to.bounds),
-        Type::ImplTrait(it) => bounds_mention_self(&it.bounds),
-        _ => false,
-    }
+    Seek::SelfMention.finds(|f| f.visit_type(ty))
 }
 
-fn args_mention_self(args: &PathArguments) -> bool {
-    match args {
-        PathArguments::AngleBracketed(ab) => ab.args.iter().any(|a| match a {
-            GenericArgument::Type(t) => mentions_self(t),
-            GenericArgument::AssocType(at) => mentions_self(&at.ty),
-            GenericArgument::Constraint(c) => c.bounds.iter().any(|b| match b {
-                syn::TypeParamBound::Trait(tb) => tb
-                    .path
-                    .segments
-                    .iter()
-                    .any(|s| args_mention_self(&s.arguments)),
-                _ => false,
-            }),
-            _ => false,
-        }),
-        PathArguments::Parenthesized(p) => {
-            p.inputs.iter().any(mentions_self)
-                || matches!(&p.output, syn::ReturnType::Type(_, t) if mentions_self(t))
-        }
-        PathArguments::None => false,
-    }
-}
-
+/// Whether any of `bounds` mentions `Self` ([`Seek::SelfMention`]).
 fn bounds_mention_self(bounds: &Punctuated<syn::TypeParamBound, syn::Token![+]>) -> bool {
-    bounds.iter().any(|b| match b {
-        syn::TypeParamBound::Trait(tb) => tb
-            .path
-            .segments
-            .iter()
-            .any(|s| s.ident == "Self" || args_mention_self(&s.arguments)),
-        _ => false,
-    })
+    Seek::SelfMention.finds(|f| bounds.iter().for_each(|b| f.visit_type_param_bound(b)))
 }
 
 /// Does `ty` contain a trait object whose bounds mention `Self` — in ANY position (`Box<dyn ..>`,
@@ -1067,37 +1070,7 @@ fn bounds_mention_self(bounds: &Punctuated<syn::TypeParamBound, syn::Token![+]>)
 /// cannot see it. The one supported shape (a direct `&dyn Fn(..)` argument) is rebuilt by coercion
 /// in [`dyn_fn_adapter`] before this check runs; everything else is rejected.
 fn contains_self_dyn(ty: &Type) -> bool {
-    match ty {
-        Type::TraitObject(_) => mentions_self(ty),
-        Type::Reference(r) => contains_self_dyn(&r.elem),
-        Type::Ptr(p) => contains_self_dyn(&p.elem),
-        Type::Array(a) => contains_self_dyn(&a.elem),
-        Type::Slice(s) => contains_self_dyn(&s.elem),
-        Type::Paren(p) => contains_self_dyn(&p.elem),
-        Type::Group(g) => contains_self_dyn(&g.elem),
-        Type::Tuple(t) => t.elems.iter().any(contains_self_dyn),
-        Type::BareFn(bf) => {
-            bf.inputs.iter().any(|i| contains_self_dyn(&i.ty))
-                || matches!(&bf.output, syn::ReturnType::Type(_, t) if contains_self_dyn(t))
-        }
-        Type::Path(tp) => {
-            tp.qself.as_ref().is_some_and(|q| contains_self_dyn(&q.ty))
-                || tp.path.segments.iter().any(|seg| match &seg.arguments {
-                    PathArguments::AngleBracketed(ab) => ab.args.iter().any(|a| match a {
-                        GenericArgument::Type(t) => contains_self_dyn(t),
-                        GenericArgument::AssocType(at) => contains_self_dyn(&at.ty),
-                        _ => false,
-                    }),
-                    PathArguments::Parenthesized(p) => {
-                        p.inputs.iter().any(contains_self_dyn)
-                            || matches!(&p.output,
-                                syn::ReturnType::Type(_, t) if contains_self_dyn(t))
-                    }
-                    PathArguments::None => false,
-                })
-        }
-        _ => false,
-    }
+    Seek::SelfDyn.finds(|f| f.visit_type(ty))
 }
 
 /// Recursion cap for [`normalize_projections`] — guards against a self-referential associated-type
@@ -1589,14 +1562,9 @@ fn emit_forwarding_assertion(
     }
 }
 
+/// Does `ty` name one of `idents` as the last segment of a path ([`Seek::LastSegment`])?
 fn type_mentions(ty: &Type, idents: &HashSet<String>) -> bool {
-    let mut found = false;
-    walk_type(ty, &mut |id| {
-        if idents.contains(&id.to_string()) {
-            found = true;
-        }
-    });
-    found
+    Seek::LastSegment(idents).finds(|f| f.visit_type(ty))
 }
 
 /// Does `path` mention any of `idents` — as a segment, a type argument, **or inside an
@@ -1608,31 +1576,18 @@ fn type_mentions(ty: &Type, idents: &HashSet<String>) -> bool {
 /// fail to fire, and the assertion was then emitted referring to a parameter that is not in scope
 /// inside its `const _` block — `E0412: cannot find type __Syan_Span`, pointing at the macro rather
 /// than at anything the caller wrote.
+///
+/// Any segment of `path` itself counts; inside its arguments (a `Tr<Assoc: Bound>` constraint's bound
+/// too) a path counts by its last segment ([`Seek::LastSegment`]).
 fn path_mentions(path: &syn::Path, idents: &HashSet<String>) -> bool {
-    let mut found = false;
-    for seg in &path.segments {
-        if idents.contains(&seg.ident.to_string()) {
-            found = true;
-        }
-        if let PathArguments::AngleBracketed(ab) = &seg.arguments {
-            for a in &ab.args {
-                let mentions = match a {
-                    GenericArgument::Type(t) => type_mentions(t, idents),
-                    GenericArgument::AssocType(at) => type_mentions(&at.ty, idents),
-                    // A `Tr<Assoc: Bound>` constraint can name a param in the bound itself.
-                    GenericArgument::Constraint(c) => c.bounds.iter().any(|b| match b {
-                        syn::TypeParamBound::Trait(tb) => path_mentions(&tb.path, idents),
-                        _ => false,
-                    }),
-                    _ => false,
-                };
-                if mentions {
-                    found = true;
-                }
+    path.segments
+        .iter()
+        .any(|seg| idents.contains(&seg.ident.to_string()))
+        || Seek::LastSegment(idents).finds(|f| {
+            for seg in &path.segments {
+                f.visit_path_arguments(&seg.arguments);
             }
-        }
-    }
-    found
+        })
 }
 
 // Generics rendering (`params_decl`/`params_use`/`wrap_angle`) lives in `crate::generics_fmt`,

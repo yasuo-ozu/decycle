@@ -49,6 +49,28 @@ struct TraitReplacer {
 }
 
 impl TraitReplacer {
+    /// The replacer to each trait of `table`'s ranked twin, spelled `#prefix TraitRanked`.
+    fn new(table: &Table, prefix: &TokenStream, rank_type: Type) -> Self {
+        let table = table
+            .iter()
+            .map(|(ident, (_, rank_loc, _))| {
+                let ranked = parse_quote!(#prefix #{name!("{}Ranked", ident)});
+                (ident.clone(), (*rank_loc, ranked))
+            })
+            .collect();
+        Self { table, rank_type }
+    }
+
+    /// The ranked path for the written trait segment `seg` (`Trait<A>` →
+    /// `ranked_traits::TraitRanked<Rank, A>`), when its trait is in the table.
+    fn ranked(&self, seg: &PathSegment) -> Option<Path> {
+        let (rank_loc, replacement) = self.table.get(&seg.ident)?;
+        let mut new_path = replacement.clone();
+        new_path.segments.last_mut().unwrap().arguments = seg.arguments.clone();
+        path_insert_type_arg(&mut new_path, *rank_loc, self.rank_type.clone());
+        Some(new_path)
+    }
+
     /// Try to rewrite a single-segment path, or a two-segment `Trait::method` value/type
     /// path, that names a trait ident in the table — either form optionally prefixed with
     /// a no-op leading `self::` (`self::Trait`, `self::Trait::method`). Returns true if a
@@ -64,18 +86,13 @@ impl TraitReplacer {
         if rest_len != 1 && rest_len != 2 {
             return false;
         }
-        let Some((rank_loc, replacement)) = self.table.get(&path.segments[offset].ident) else {
+        let Some(mut new_path) = self.ranked(&path.segments[offset]) else {
             return false;
         };
-        let orig_args =
-            std::mem::replace(&mut path.segments[offset].arguments, PathArguments::None);
-        let mut new_path = replacement.clone();
-        new_path.segments.last_mut().unwrap().arguments = orig_args;
-        path_insert_type_arg(&mut new_path, *rank_loc, self.rank_type.clone());
-        if rest_len == 2 {
-            // `Trait::method` -> `ranked_traits::TraitRanked<Rank, ...>::method`
-            new_path.segments.push(path.segments[offset + 1].clone());
-        }
+        // `Trait::method` -> `ranked_traits::TraitRanked<Rank, ...>::method`
+        new_path
+            .segments
+            .extend(path.segments.iter().skip(offset + 1).cloned());
         *path = new_path;
         true
     }
@@ -84,56 +101,34 @@ impl TraitReplacer {
     /// (also `<_ as self::Trait>::method`). The trait name appears as the first segment
     /// before the QSelf position (optionally preceded by a no-op leading `self`).
     fn try_replace_qself_path(&self, qself: &mut Option<QSelf>, path: &mut Path) -> bool {
-        if let Some(ref mut qs) = qself {
-            // `<_ as ::Trait>::method` names the item itself, the opt-out: left as written.
-            if path.leading_colon.is_some() {
-                return false;
-            }
-            // A leading `self` can only be part of the "as Trait" portion when there's a
-            // segment after it still within that portion (qs.position > 1).
-            let offset = if qs.position > 1 {
-                self_offset(path)
-            } else {
-                0
-            };
-            // In `<_ as Trait>::method`, qself.position is 1 and path is `Trait::method`.
-            // Check if the first (post-`self::`) segment is a trait in our table.
-            if qs.position > offset && qs.position <= path.segments.len() {
-                let first_ident = &path.segments[offset].ident;
-                if let Some((rank_loc, replacement)) = self.table.get(first_ident) {
-                    let orig_args = std::mem::replace(
-                        &mut path.segments[offset].arguments,
-                        PathArguments::None,
-                    );
-                    // Build the replacement: replace segments[offset] with the ranked path segments
-                    let mut new_segments: Punctuated<PathSegment, Token![::]> = Punctuated::new();
-                    for seg in &replacement.segments {
-                        new_segments.push(seg.clone());
-                    }
-                    // Apply original type args + insert rank on the last replacement segment
-                    new_segments.last_mut().unwrap().arguments = orig_args;
-                    {
-                        let last_seg = new_segments.last_mut().unwrap();
-                        let mut temp_path: Path = Path {
-                            leading_colon: None,
-                            segments: std::iter::once(last_seg.clone()).collect(),
-                        };
-                        path_insert_type_arg(&mut temp_path, *rank_loc, self.rank_type.clone());
-                        *last_seg = temp_path.segments.into_iter().next().unwrap();
-                    }
-                    // Append remaining segments after the trait (e.g., `::method`)
-                    for seg in path.segments.iter().skip(offset + 1) {
-                        new_segments.push(seg.clone());
-                    }
-                    // Update QSelf position to account for the stripped `self::` (if any)
-                    // and the replacement having more segments.
-                    qs.position = qs.position - offset - 1 + replacement.segments.len();
-                    path.segments = new_segments;
-                    return true;
-                }
-            }
+        // `<_ as ::Trait>::method` names the item itself, the opt-out: left as written.
+        let Some(qs) = qself.as_mut().filter(|_| path.leading_colon.is_none()) else {
+            return false;
+        };
+        // A leading `self` can only be part of the "as Trait" portion when there's a
+        // segment after it still within that portion (qs.position > 1).
+        let offset = if qs.position > 1 {
+            self_offset(path)
+        } else {
+            0
+        };
+        // In `<_ as Trait>::method`, qself.position is 1 and path is `Trait::method`.
+        // Check if the first (post-`self::`) segment is a trait in our table.
+        if qs.position <= offset || qs.position > path.segments.len() {
+            return false;
         }
-        false
+        let Some(mut new_path) = self.ranked(&path.segments[offset]) else {
+            return false;
+        };
+        // Update QSelf position to account for the stripped `self::` (if any) and the
+        // replacement having more segments, then append the segments after the trait
+        // (e.g., `::method`).
+        qs.position = qs.position - offset - 1 + new_path.segments.len();
+        new_path
+            .segments
+            .extend(path.segments.iter().skip(offset + 1).cloned());
+        path.segments = new_path.segments;
+        true
     }
 }
 
@@ -3258,16 +3253,11 @@ fn ranked_supertraits(
     trait_: &ItemTrait,
     replacing_table: &Table,
 ) -> Punctuated<TypeParamBound, Token![+]> {
-    let replacer = TraitReplacer {
-        table: replacing_table
-            .iter()
-            .map(|(ident, (_, rank_loc, _))| {
-                let ranked: Path = parse_quote!(#{name!("{}Ranked", ident)});
-                (ident.clone(), (*rank_loc, ranked))
-            })
-            .collect(),
-        rank_type: parse_quote!(#{name!("Rank")}),
-    };
+    let replacer = TraitReplacer::new(
+        replacing_table,
+        &TokenStream::new(),
+        parse_quote!(#{name!("Rank")}),
+    );
     let mut supertraits = trait_.supertraits.clone();
     for bound in supertraits.iter_mut() {
         if let TypeParamBound::Trait(TraitBound { path, .. }) = bound {
@@ -3559,15 +3549,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
     // Every iteration below that emits tokens goes through `in_order`, never the `HashMap`.
     let in_order = in_declaration_order(&traits, &replacing_table);
 
-    let trait_replacer_table: HashMap<Ident, (usize, Path)> = replacing_table
-        .iter()
-        .map(|(ident, (_, rank_loc, _))| {
-            let ranked_path: Path = parse_quote!(
-                #{name!("ranked_traits")}::#{name!("{}Ranked", ident)}
-            );
-            (ident.clone(), (*rank_loc, ranked_path))
-        })
-        .collect();
+    let rt_prefix = quote!(#{name!("ranked_traits")}::);
 
     quote! {
         // this module is to prevent confliction of trait method call between ranked and non-ranked
@@ -3711,16 +3693,13 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                         requalify_foreign_premises(&mut modified_impl.generics, &replacing_table);
 
                         // Step 1: Rewrite the impl's trait path with rank=(Rank,)
-                        TraitReplacer {
-                            table: trait_replacer_table.clone(),
-                            rank_type: parse_quote!((#{name!("Rank")},)),
-                        }.visit_path_mut(&mut modified_impl.trait_.as_mut().unwrap().1);
+                        let rank: Type = parse_quote!(#{name!("Rank")});
+                        TraitReplacer::new(&replacing_table, &rt_prefix, parse_quote!((#rank,)))
+                            .visit_path_mut(&mut modified_impl.trait_.as_mut().unwrap().1);
 
                         // Step 2: Rewrite all trait paths in body + where clause with rank=Rank
-                        TraitReplacer {
-                            table: trait_replacer_table.clone(),
-                            rank_type: parse_quote!(#{name!("Rank")}),
-                        }.visit_item_impl_mut(&mut modified_impl);
+                        TraitReplacer::new(&replacing_table, &rt_prefix, rank)
+                            .visit_item_impl_mut(&mut modified_impl);
 
                         // Desugar input-position `impl Trait` into method generics AFTER the
                         // ranking passes: TraitReplacer skips `impl Trait` bounds

@@ -219,15 +219,7 @@ pub(super) fn floor_generics(im: &ItemImpl, table: &Table, ranked: bool) -> Gene
         return g;
     }
     let kept = floor_kept_params(im);
-    let replacer = TraitReplacer {
-        table: table
-            .iter()
-            .map(|(ident, (_, rank_loc, _))| {
-                (ident.clone(), (*rank_loc, pq!(#{name!("{}Ranked", ident)})))
-            })
-            .collect(),
-        rank_type: pq!(()),
-    };
+    let replacer = TraitReplacer::new(table, &TokenStream::new(), pq!(()));
     let mut g = im.generics.clone();
     g.where_clause = remove_cyclic_bounds(&im.generics, table, false).where_clause;
     for p in g.params.iter_mut() {

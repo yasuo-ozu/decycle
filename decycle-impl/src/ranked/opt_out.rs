@@ -52,12 +52,12 @@
 //! unconditionally, the bodies still type-check, and the new errors stand alone.
 
 use crate::module_path::ModuleScope;
-use crate::names::strip_leading_self;
+use crate::names::bare_ident;
+use crate::unify::{Names, Params};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use syn::visit::Visit;
 use syn::{
-    Attribute, GenericParam, Ident, Item, ItemImpl, Path, TraitBound, TraitBoundModifier, Type,
-    TypeParamBound, TypePath, WherePredicate,
+    Attribute, Ident, Item, ItemImpl, Path, TraitBound, TraitBoundModifier, Type, TypeParamBound,
+    TypePath, WherePredicate,
 };
 
 /// An opt-out bound on a cycle, as [`opt_out_cycles`] reports it.
@@ -269,17 +269,8 @@ impl<'a> Graph<'a> {
 /// path of one segment without arguments, not negative.
 fn adopted_trait(im: &ItemImpl, routed: &HashSet<Ident>) -> Option<String> {
     let (bang, path, _) = im.trait_.as_ref()?;
-    if bang.is_some() {
-        return None;
-    }
-    let mut path = path.clone();
-    strip_leading_self(&mut path);
-    let seg = match (path.leading_colon, path.segments.len()) {
-        (None, 1) => &path.segments[0],
-        _ => return None,
-    };
-    (seg.arguments.is_none() && routed.contains(&seg.ident))
-        .then(|| crate::helper::unraw(&seg.ident))
+    let ident = bare_plain_ident(path).filter(|i| bang.is_none() && routed.contains(*i))?;
+    Some(crate::helper::unraw(ident))
 }
 
 /// Is `im` (an impl of a routed trait for the bare `head`) a concrete node? See the module docs.
@@ -317,16 +308,16 @@ fn names_trait(bound: &TypeParamBound, trait_name: &str) -> bool {
     bare_name(path).is_some_and(|name| name == trait_name)
 }
 
+/// The ident a bare (or `self::`) path of one segment without arguments spells
+/// ([`bare_ident`], whose named segment is the last).
+fn bare_plain_ident(path: &Path) -> Option<&Ident> {
+    let ident = bare_ident(path)?;
+    path.segments.last()?.arguments.is_none().then_some(ident)
+}
+
 /// The name a bare (or `self::`) path of one segment without arguments spells.
 fn bare_name(path: &Path) -> Option<String> {
-    let mut path = path.clone();
-    strip_leading_self(&mut path);
-    match (path.leading_colon, path.segments.len()) {
-        (None, 1) if path.segments[0].arguments.is_none() => {
-            Some(crate::helper::unraw(&path.segments[0].ident))
-        }
-        _ => None,
-    }
+    bare_plain_ident(path).map(crate::helper::unraw)
 }
 
 /// `path` as the user wrote it, without the token spacing (`crate::m::C`).
@@ -376,31 +367,17 @@ pub(crate) fn quiet(mut item: Item, routed: &HashSet<Ident>) -> Item {
     let Item::Impl(im) = &mut item else {
         return item;
     };
-    let mut params: HashSet<String> = HashSet::new();
-    let mut lifetimes: HashSet<String> = HashSet::new();
-    for param in &im.generics.params {
-        match param {
-            GenericParam::Type(t) => params.insert(t.ident.to_string()),
-            GenericParam::Const(c) => params.insert(c.ident.to_string()),
-            GenericParam::Lifetime(l) => lifetimes.insert(l.lifetime.ident.to_string()),
-        };
-    }
+    let params = Params::of(im);
     let Some(where_clause) = &mut im.generics.where_clause else {
         return item;
     };
     let predicates = std::mem::take(&mut where_clause.predicates);
     for mut pred in predicates {
+        // Global: no `for<..>` binder, and no mention of one of the impl's parameters or `Self`.
+        let names = Names::of_predicate(&pred);
+        let global = !names.idents.contains("Self") && !params.mentioned_by(&names);
         if let WherePredicate::Type(pt) = &mut pred {
-            let global = pt.lifetimes.is_none() && {
-                let mut v = MentionsParam {
-                    params: &params,
-                    lifetimes: &lifetimes,
-                    found: false,
-                };
-                v.visit_predicate_type(pt);
-                !v.found
-            };
-            if global {
+            if global && pt.lifetimes.is_none() {
                 let bounds = std::mem::take(&mut pt.bounds);
                 pt.bounds = bounds
                     .into_iter()
@@ -424,27 +401,6 @@ pub(crate) fn quiet(mut item: Item, routed: &HashSet<Ident>) -> Item {
 fn names_routed(bound: &TypeParamBound, routed: &HashSet<Ident>) -> bool {
     matches!(bound, TypeParamBound::Trait(TraitBound { path, .. })
         if path.segments.last().is_some_and(|seg| routed.contains(&seg.ident)))
-}
-
-/// Does a predicate mention one of the impl's generic parameters, or `Self`?
-struct MentionsParam<'a> {
-    params: &'a HashSet<String>,
-    lifetimes: &'a HashSet<String>,
-    found: bool,
-}
-
-impl Visit<'_> for MentionsParam<'_> {
-    fn visit_ident(&mut self, ident: &Ident) {
-        if ident == "Self" || self.params.contains(&ident.to_string()) {
-            self.found = true;
-        }
-    }
-
-    fn visit_lifetime(&mut self, lifetime: &syn::Lifetime) {
-        if self.lifetimes.contains(&lifetime.ident.to_string()) {
-            self.found = true;
-        }
-    }
 }
 
 #[cfg(test)]

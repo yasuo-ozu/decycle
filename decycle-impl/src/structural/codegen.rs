@@ -580,7 +580,7 @@ fn rec_method(
             // Resolve `Self::Out`-style projections first, so the check sees what the type MEANS
             // (`impl Fn(&Self::Out)` with `type Out = Self` is the unnameable shape; with
             // `type Out = i64` it is harmless). Unresolvable projections error here, up-front.
-            let nty = normalize_projections(&pt.ty, &ctx, 0)?;
+            let nty = normalized(&pt.ty, &ctx, 0)?;
             if has_self_mentioning_impl_trait(&nty) {
                 return Err(syn::Error::new_spanned(
                     &pt.ty,
@@ -624,12 +624,10 @@ fn rec_method(
     run_sig.ident = run.clone();
     for input in run_sig.inputs.iter_mut() {
         if let syn::FnArg::Typed(pt) = input {
-            *pt.ty = normalize_projections(&pt.ty, &ctx, 0)?;
+            normalize_projections(&mut pt.ty, &ctx, 0)?;
         }
     }
-    if let ReturnType::Type(_, t) = &mut run_sig.output {
-        **t = normalize_projections(t, &ctx, 0)?;
-    }
+    normalize_in_output(&mut run_sig.output, &ctx, 0)?;
     // The body-holding impl fn carries the user's `mut self` back (stripped from the decl above) so
     // the body's mutation of `self` still compiles; a by-value receiver's binding mode is free to
     // differ between a trait decl and its impl.
@@ -960,7 +958,7 @@ fn forward_args(
                         "#[decycle(structural)]: only simple identifier parameters are supported",
                     )),
                 };
-            let ty = normalize_projections(&pt.ty, ctx, 0)?;
+            let ty = normalized(&pt.ty, ctx, 0)?;
             if mentions_self(&ty) {
                 // A trait object may NOT be punned: `dyn Fn(&A)` and `dyn Fn(&ATerm)` are
                 // different traits, so transmuting the wide pointer keeps a vtable naming the
@@ -1198,7 +1196,7 @@ fn is_plain_self(ty: &Type) -> bool {
 /// broken: `Self::X` where `X` is not defined in this impl (a supertrait's or another trait's assoc
 /// type), `<Self as OtherTrait>::X`, a projection whose base mentions `Self` without being `Self`
 /// (`<Box<Self> as Tr>::X`), and generic associated types.
-fn normalize_projections(ty: &Type, ctx: &ProjCtx, depth: u8) -> syn::Result<Type> {
+fn normalize_projections(ty: &mut Type, ctx: &ProjCtx, depth: u8) -> syn::Result<()> {
     if depth > MAX_PROJ_DEPTH {
         return Err(syn::Error::new(
             ty.span(),
@@ -1216,17 +1214,20 @@ fn normalize_projections(ty: &Type, ctx: &ProjCtx, depth: u8) -> syn::Result<Typ
             {
                 let segs: Vec<syn::PathSegment> =
                     tp.path.segments.iter().skip(1).cloned().collect();
-                return resolve_self_projection(&segs, ty.span(), ctx, depth);
+                let span = tp.span();
+                *ty = resolve_self_projection(&segs, span, ctx, depth)?;
+                return Ok(());
             }
-            if let Some(q) = &tp.qself {
-                let base = normalize_projections(&q.ty, ctx, depth + 1)?;
-                if is_plain_self(&base) {
+            let span = tp.qself.is_some().then(|| tp.span());
+            if let (Some(q), Some(span)) = (&mut tp.qself, span) {
+                normalize_projections(&mut q.ty, ctx, depth + 1)?;
+                if is_plain_self(&q.ty) {
                     // `<Self as Tr>::Out[..]` (position ≥ 1) or `<Self>::Out[..]` (position 0).
                     if q.position >= 1 {
                         let tr_seg = &tp.path.segments[q.position - 1];
                         if tr_seg.ident != ctx.trait_ident {
                             return Err(syn::Error::new(
-                                ty.span(),
+                                span,
                                 format!(
                                     "#[decycle(structural)]: a `Self` projection through a \
                                      different trait (`<Self as {}>::..`) is not supported — the \
@@ -1240,92 +1241,66 @@ fn normalize_projections(ty: &Type, ctx: &ProjCtx, depth: u8) -> syn::Result<Typ
                     }
                     let segs: Vec<syn::PathSegment> =
                         tp.path.segments.iter().skip(q.position).cloned().collect();
-                    if segs.is_empty() {
-                        return Ok(base);
-                    }
-                    return resolve_self_projection(&segs, ty.span(), ctx, depth);
+                    *ty = if segs.is_empty() {
+                        (*q.ty).clone()
+                    } else {
+                        resolve_self_projection(&segs, span, ctx, depth)?
+                    };
+                    return Ok(());
                 }
-                if mentions_self(&base) {
+                if mentions_self(&q.ty) {
                     return Err(syn::Error::new(
-                        ty.span(),
+                        span,
                         "#[decycle(structural)]: cannot resolve a qualified projection whose base \
                          mentions `Self` without being `Self` (e.g. `<Box<Self> as Tr>::Out`). \
                          Spell the concrete type instead.",
                     ));
                 }
                 // Self-free base: keep the projection, normalizing base + segment arguments.
-                let mut tp2 = tp.clone();
-                *tp2.qself.as_mut().unwrap().ty = base;
-                for seg in tp2.path.segments.iter_mut() {
-                    normalize_in_args(&mut seg.arguments, ctx, depth)?;
-                }
-                return Ok(Type::Path(tp2));
             }
-            let mut tp2 = tp.clone();
-            for seg in tp2.path.segments.iter_mut() {
+            for seg in tp.path.segments.iter_mut() {
                 normalize_in_args(&mut seg.arguments, ctx, depth)?;
             }
-            Ok(Type::Path(tp2))
+            Ok(())
         }
-        Type::Reference(r) => {
-            let mut r = r.clone();
-            r.elem = Box::new(normalize_projections(&r.elem, ctx, depth)?);
-            Ok(Type::Reference(r))
-        }
-        Type::Ptr(p) => {
-            let mut p = p.clone();
-            p.elem = Box::new(normalize_projections(&p.elem, ctx, depth)?);
-            Ok(Type::Ptr(p))
-        }
-        Type::Array(a) => {
-            let mut a = a.clone();
-            a.elem = Box::new(normalize_projections(&a.elem, ctx, depth)?);
-            Ok(Type::Array(a))
-        }
-        Type::Slice(s) => {
-            let mut s = s.clone();
-            s.elem = Box::new(normalize_projections(&s.elem, ctx, depth)?);
-            Ok(Type::Slice(s))
-        }
-        Type::Paren(p) => {
-            let mut p = p.clone();
-            p.elem = Box::new(normalize_projections(&p.elem, ctx, depth)?);
-            Ok(Type::Paren(p))
-        }
-        Type::Group(g) => {
-            let mut g = g.clone();
-            g.elem = Box::new(normalize_projections(&g.elem, ctx, depth)?);
-            Ok(Type::Group(g))
-        }
+        Type::Reference(r) => normalize_projections(&mut r.elem, ctx, depth),
+        Type::Ptr(p) => normalize_projections(&mut p.elem, ctx, depth),
+        Type::Array(a) => normalize_projections(&mut a.elem, ctx, depth),
+        Type::Slice(s) => normalize_projections(&mut s.elem, ctx, depth),
+        Type::Paren(p) => normalize_projections(&mut p.elem, ctx, depth),
+        Type::Group(g) => normalize_projections(&mut g.elem, ctx, depth),
+        // Rebuilt rather than walked in place, which drops a trailing comma (`(A, B,)`) as it always
+        // has.
         Type::Tuple(t) => {
-            let mut t2 = t.clone();
-            t2.elems.clear();
-            for e in &t.elems {
-                t2.elems.push(normalize_projections(e, ctx, depth)?);
-            }
-            Ok(Type::Tuple(t2))
+            t.elems = std::mem::take(&mut t.elems)
+                .into_iter()
+                .map(|mut e| normalize_projections(&mut e, ctx, depth).map(|()| e))
+                .collect::<syn::Result<_>>()?;
+            Ok(())
         }
         Type::BareFn(bf) => {
-            let mut bf = bf.clone();
             for input in bf.inputs.iter_mut() {
-                input.ty = normalize_projections(&input.ty, ctx, depth)?;
+                normalize_projections(&mut input.ty, ctx, depth)?;
             }
-            if let syn::ReturnType::Type(_, t) = &mut bf.output {
-                **t = normalize_projections(t, ctx, depth)?;
-            }
-            Ok(Type::BareFn(bf))
+            normalize_in_output(&mut bf.output, ctx, depth)
         }
-        Type::TraitObject(to) => {
-            let mut to = to.clone();
-            normalize_in_bounds(&mut to.bounds, ctx, depth)?;
-            Ok(Type::TraitObject(to))
-        }
-        Type::ImplTrait(it) => {
-            let mut it = it.clone();
-            normalize_in_bounds(&mut it.bounds, ctx, depth)?;
-            Ok(Type::ImplTrait(it))
-        }
-        other => Ok(other.clone()),
+        Type::TraitObject(to) => normalize_in_bounds(&mut to.bounds, ctx, depth),
+        Type::ImplTrait(it) => normalize_in_bounds(&mut it.bounds, ctx, depth),
+        _ => Ok(()),
+    }
+}
+
+/// [`normalize_projections`] of a copy of `ty`.
+fn normalized(ty: &Type, ctx: &ProjCtx, depth: u8) -> syn::Result<Type> {
+    let mut ty = ty.clone();
+    normalize_projections(&mut ty, ctx, depth)?;
+    Ok(ty)
+}
+
+fn normalize_in_output(output: &mut ReturnType, ctx: &ProjCtx, depth: u8) -> syn::Result<()> {
+    match output {
+        ReturnType::Type(_, t) => normalize_projections(t, ctx, depth),
+        ReturnType::Default => Ok(()),
     }
 }
 
@@ -1334,9 +1309,9 @@ fn normalize_in_args(args: &mut PathArguments, ctx: &ProjCtx, depth: u8) -> syn:
         PathArguments::AngleBracketed(ab) => {
             for a in ab.args.iter_mut() {
                 match a {
-                    GenericArgument::Type(t) => *t = normalize_projections(t, ctx, depth)?,
+                    GenericArgument::Type(t) => normalize_projections(t, ctx, depth)?,
                     GenericArgument::AssocType(at) => {
-                        at.ty = normalize_projections(&at.ty, ctx, depth)?;
+                        normalize_projections(&mut at.ty, ctx, depth)?
                     }
                     _ => {}
                 }
@@ -1344,11 +1319,9 @@ fn normalize_in_args(args: &mut PathArguments, ctx: &ProjCtx, depth: u8) -> syn:
         }
         PathArguments::Parenthesized(p) => {
             for t in p.inputs.iter_mut() {
-                *t = normalize_projections(t, ctx, depth)?;
+                normalize_projections(t, ctx, depth)?;
             }
-            if let syn::ReturnType::Type(_, t) = &mut p.output {
-                **t = normalize_projections(t, ctx, depth)?;
-            }
+            normalize_in_output(&mut p.output, ctx, depth)?;
         }
         PathArguments::None => {}
     }
@@ -1401,7 +1374,7 @@ fn resolve_self_projection(
             ),
         ));
     }
-    let base = normalize_projections(def, ctx, depth + 1)?;
+    let base = normalized(def, ctx, depth + 1)?;
     if segs.len() == 1 {
         return Ok(base);
     }

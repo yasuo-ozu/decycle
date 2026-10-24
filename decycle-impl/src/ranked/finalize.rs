@@ -668,34 +668,22 @@ fn replace_self(sig: &mut Signature, base_self_ty: &Type) {
 /// passes have run — see the call site.
 fn desugar_impl_trait_inputs(sig: &mut Signature) {
     let mut param_counter = 0usize;
-
-    // Replace input-position impl Trait with type parameters
     for input in &mut sig.inputs {
-        if let FnArg::Typed(PatType { ty, .. }) = input {
-            if let Type::ImplTrait(impl_trait) = &**ty {
-                let param_name = name!("ImplTrait{}", param_counter);
-                param_counter += 1;
-
-                let bounds = impl_trait.bounds.clone();
-                sig.generics.params.push(GenericParam::Type(TypeParam {
-                    attrs: Vec::new(),
-                    ident: param_name.clone(),
-                    colon_token: if bounds.is_empty() {
-                        None
-                    } else {
-                        Some(Default::default())
-                    },
-                    bounds,
-                    eq_token: None,
-                    default: None,
-                }));
-
-                **ty = Type::Path(TypePath {
-                    qself: None,
-                    path: param_name.into(),
-                });
-            }
-        }
+        let FnArg::Typed(PatType { ty, .. }) = input else {
+            continue;
+        };
+        let Type::ImplTrait(impl_trait) = &**ty else {
+            continue;
+        };
+        let param_name = name!("ImplTrait{}", param_counter);
+        param_counter += 1;
+        let bounds = impl_trait.bounds.clone();
+        sig.generics.params.push(GenericParam::Type(TypeParam {
+            colon_token: (!bounds.is_empty()).then(Default::default),
+            bounds,
+            ..TypeParam::from(param_name.clone())
+        }));
+        **ty = parse_quote!(#param_name);
     }
 }
 
@@ -996,37 +984,20 @@ struct CyclicBound {
 fn fresh_binder_lifetimes<'a>(
     binders: impl IntoIterator<Item = &'a BoundLifetimes>,
     counter: &mut usize,
-) -> (Vec<GenericParam>, HashMap<Ident, Lifetime>) {
+) -> (Vec<GenericParam>, HashMap<String, Lifetime>) {
     let mut params = Vec::new();
-    let mut rename: HashMap<Ident, Lifetime> = HashMap::new();
+    let mut rename = HashMap::new();
     for bl in binders {
         for gp in &bl.lifetimes {
             if let GenericParam::Lifetime(l) = gp {
                 let fresh = Lifetime::new(&format!("'__dcl_hr_{}", *counter), l.lifetime.span());
                 *counter += 1;
-                rename.insert(l.lifetime.ident.clone(), fresh.clone());
-                params.push(GenericParam::Lifetime(LifetimeParam {
-                    attrs: Vec::new(),
-                    lifetime: fresh,
-                    colon_token: None,
-                    bounds: Punctuated::new(),
-                }));
+                rename.insert(l.lifetime.to_string(), fresh.clone());
+                params.push(GenericParam::Lifetime(LifetimeParam::new(fresh)));
             }
         }
     }
     (params, rename)
-}
-
-/// Apply an HRTB binder rename to every `Lifetime` occurrence inside a target type.
-struct RenameLifetimes<'a> {
-    rename: &'a HashMap<Ident, Lifetime>,
-}
-impl syn::visit_mut::VisitMut for RenameLifetimes<'_> {
-    fn visit_lifetime_mut(&mut self, lt: &mut Lifetime) {
-        if let Some(fresh) = self.rename.get(&lt.ident) {
-            *lt = fresh.clone();
-        }
-    }
 }
 
 /// The impl's cyclic `where`-predicates for every single-segment decycle-trait bound whose
@@ -1071,41 +1042,39 @@ fn cyclic_where_bounds(impl_: &ItemImpl, replacing_table: &Table) -> Vec<CyclicB
             let TypeParamBound::Trait(tb) = b else {
                 continue;
             };
-            if tb.path.leading_colon.is_none() && tb.path.segments.len() == 1 {
-                let seg = &tb.path.segments[0];
-                if replacing_table.contains_key(&seg.ident) {
-                    // C1: fresh-rename the union of the predicate binder (`for<'a> B<'a>: Cb`)
-                    // and the bound binder (`B: for<'a> Cb<'a>`), then rewrite the target so its
-                    // lifetimes match the fresh names the register-once fn will declare.
-                    let (binder, rename) = fresh_binder_lifetimes(
-                        pt.lifetimes.iter().chain(tb.lifetimes.iter()),
-                        &mut hr_counter,
-                    );
-                    // `Self` means "this impl's self type" only INSIDE the impl; every consumer
-                    // of the returned target reads it from outside (see the doc comment).
-                    let mut target = subst_bare_self_in_type(&pt.bounded_ty, &impl_.self_ty);
-                    // A premise, not an edge: see the doc comment. (A wrapper `peel` kept whole is an
-                    // edge: see `wrapper`.)
-                    if !crate::helper::type_head_ident(&target)
-                        .is_some_and(|h| self_heads.contains(&h))
-                        && !crate::names::names_bare(&target, &self_heads)
-                    {
-                        continue;
-                    }
-                    if !rename.is_empty() {
-                        syn::visit_mut::VisitMut::visit_type_mut(
-                            &mut RenameLifetimes { rename: &rename },
-                            &mut target,
-                        );
-                    }
-                    out.push(CyclicBound {
-                        binder,
-                        target,
-                        trait_ident: seg.ident.clone(),
-                        targs: nonlifetime_path_args(&seg.arguments),
-                    });
-                }
+            if !names_table_trait(&tb.path, replacing_table) {
+                continue;
             }
+            let seg = &tb.path.segments[0];
+            // C1: fresh-rename the union of the predicate binder (`for<'a> B<'a>: Cb`)
+            // and the bound binder (`B: for<'a> Cb<'a>`), then rewrite the target so its
+            // lifetimes match the fresh names the register-once fn will declare.
+            let (binder, rename) = fresh_binder_lifetimes(
+                pt.lifetimes.iter().chain(tb.lifetimes.iter()),
+                &mut hr_counter,
+            );
+            // `Self` means "this impl's self type" only INSIDE the impl; every consumer
+            // of the returned target reads it from outside (see the doc comment).
+            let mut target = subst_bare_self_in_type(&pt.bounded_ty, &impl_.self_ty);
+            // A premise, not an edge: see the doc comment. (A wrapper `peel` kept whole is an
+            // edge: see `wrapper`.)
+            if !crate::helper::type_head_ident(&target).is_some_and(|h| self_heads.contains(&h))
+                && !crate::names::names_bare(&target, &self_heads)
+            {
+                continue;
+            }
+            if !rename.is_empty() {
+                syn::visit_mut::VisitMut::visit_type_mut(
+                    &mut crate::premise_flow::RenameLifetimes(&rename),
+                    &mut target,
+                );
+            }
+            out.push(CyclicBound {
+                binder,
+                target,
+                trait_ident: seg.ident.clone(),
+                targs: nonlifetime_path_args(&seg.arguments),
+            });
         }
     }
     out
@@ -1124,16 +1093,14 @@ fn type_param_is_maybe_unsized(tp: &TypeParam, where_clause: Option<&WhereClause
         })
     };
     is_maybe(&tp.bounds)
-        || where_clause.is_some_and(|wc| {
-            wc.predicates.iter().any(|pred| match pred {
-                WherePredicate::Type(pt) => {
-                    matches!(&pt.bounded_ty, Type::Path(TypePath { qself: None, path })
-                        if path.is_ident(&tp.ident))
-                        && is_maybe(&pt.bounds)
-                }
-                _ => false,
+        || where_clause
+            .into_iter()
+            .flat_map(|wc| &wc.predicates)
+            .any(|pred| {
+                matches!(pred, WherePredicate::Type(pt) if is_maybe(&pt.bounds)
+                    && matches!(&pt.bounded_ty, Type::Path(TypePath { qself: None, path })
+                        if path.is_ident(&tp.ident)))
             })
-        })
 }
 
 /// A const-generic value is folded into the fingerprint only when its declared type is a

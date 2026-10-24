@@ -863,7 +863,8 @@ fn fresh_lifetime(base: &str, avoid: &HashSet<String>) -> Lifetime {
     Lifetime::new(&name, proc_macro2::Span::call_site())
 }
 
-struct RenameLifetimes<'a>(&'a HashMap<String, Lifetime>);
+/// Renames every lifetime the map has a key for (keyed by its spelling, `'a`).
+pub(crate) struct RenameLifetimes<'a>(pub(crate) &'a HashMap<String, Lifetime>);
 
 impl VisitMut for RenameLifetimes<'_> {
     fn visit_lifetime_mut(&mut self, lt: &mut Lifetime) {

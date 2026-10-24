@@ -236,8 +236,7 @@ fn remove_cyclic_bounds(
             .is_some_and(|ident| replacing_table.contains_key(ident));
         let is_bareparam_target = matches!(ty, Type::Path(TypePath { qself: None, path })
             if path.segments.len() == 1 && param_idents.contains(&path.segments[0].ident));
-        let is_self_target = matches!(ty, Type::Path(TypePath { qself: None, path })
-            if path.is_ident("Self"));
+        let is_self_target = is_self_type(ty);
         // Targets the ranked chain can descend: a cycle self type, `Self`, or a bare impl param.
         //
         // A bare param must stay here even though it is often just a leaf premise
@@ -2394,9 +2393,7 @@ fn ranked_trait_path(trait_ident: &Ident) -> Path {
 
 /// Where decycle inserts the synthesized rank parameter in a `#[decycle]` trait's own generics: the
 /// index of the first non-lifetime generic, or the end if the trait declares none (so a trait with
-/// no generics gets `XxxRanked<Rank>`). Exposed so a caller whose trait carries its own generics
-/// need not reverse-engineer the insertion rule. Semver-committed.
-#[cfg(test)]
+/// no generics gets `XxxRanked<Rank>`).
 fn ranked_trait_rank_loc(trait_: &ItemTrait) -> usize {
     trait_
         .generics
@@ -3107,12 +3104,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
     let mut replacing_table: Table = traits
         .iter()
         .map(|trait_| {
-            let g = &trait_.generics;
-            let loc = g
-                .params
-                .iter()
-                .position(|param| !matches!(param, GenericParam::Lifetime(_)))
-                .unwrap_or(g.params.len());
+            let loc = ranked_trait_rank_loc(trait_);
             let impls = contents
                 .iter()
                 .filter(|item_impl| {

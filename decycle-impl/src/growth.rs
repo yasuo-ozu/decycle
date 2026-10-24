@@ -90,8 +90,7 @@ use crate::analysis;
 use std::collections::HashSet;
 use syn::visit::Visit;
 use syn::{
-    Expr, ExprPath, FnArg, Ident, ImplItem, Item, ItemImpl, ItemMod, Pat, Path, Signature, Stmt,
-    Type,
+    Expr, ExprPath, FnArg, Ident, ImplItem, Item, ItemMod, Pat, Path, Signature, Stmt, Type,
 };
 
 /// What a call site has to name for its callee to be the cycle's own trait method — condition 3.
@@ -126,7 +125,11 @@ pub(crate) fn check_value_generic_growth(module: &ItemMod, decycle: &Path) -> sy
         if im.trait_.is_none() {
             continue;
         }
-        if !self_ident(im).is_some_and(|id| cyclic.contains(&id.to_string())) {
+        // The self type's head, as the engines read it: a qualified-self type
+        // (`<Q as P>::Out`) is no member, whatever its last segment spells.
+        if !crate::helper::type_head_ident(&im.self_ty)
+            .is_some_and(|id| cyclic.contains(&id.to_string()))
+        {
             continue;
         }
         for ii in &im.items {
@@ -143,13 +146,6 @@ fn cycle_member_names(module: &ItemMod, decycle: &Path) -> HashSet<String> {
     use safegraph::graph::Graph;
     let graph = analysis::cyclic_subgraph(&analysis::analyze_module(module, decycle));
     graph.nodes().map(|n| n.to_string()).collect()
-}
-
-fn self_ident(im: &ItemImpl) -> Option<&Ident> {
-    match &*im.self_ty {
-        Type::Path(tp) => tp.path.segments.last().map(|s| &s.ident),
-        _ => None,
-    }
 }
 
 /// The positions of `sig`'s arguments that are a **by-value** occurrence of one of the method's own

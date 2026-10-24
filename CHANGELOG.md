@@ -184,6 +184,10 @@ as **0.8.0**, not as a 0.7 patch.
   `other: Self`) pointed at `#[decycle]`, with rustc suggesting `&#[decycle]`; it now points at the
   user's `Self`, where it merges with the same error on the user's impl
   (`tests/ui/ranked_self_span_unsized.rs`).
+- **The value-generic growth check reads an impl's self type as the engines do**: a qualified-self
+  type (`impl Eval for <Q as P>::Out`) is no cycle member, whatever its last segment spells, so the
+  check no longer rejects such an impl's methods when that segment happens to be a member's name
+  (`tests/growth_qself_target.rs`).
 
 ### Removed
 

@@ -443,8 +443,8 @@ fn emit_impl_items_leaf(
                 let mut sig = sig.clone();
                 // Don't replace Self — the leaf impl is for Wrapper<SelfTy>,
                 // so Self should resolve to Wrapper<SelfTy> to match the ranked trait.
-                // Only desugar impl Trait (pass Self as replacement = no-op for Self).
-                replace_self_and_desugar_impl_trait(&mut sig, &parse_quote!(Self));
+                // Only desugar impl Trait; the user's `Self` keeps its span.
+                desugar_impl_trait_inputs(&mut sig);
 
                 for (param_ix, input) in sig.inputs.iter_mut().enumerate() {
                     input.reduce_pat(param_ix);
@@ -686,11 +686,6 @@ fn desugar_impl_trait_inputs(sig: &mut Signature) {
     }
 }
 
-fn replace_self_and_desugar_impl_trait(sig: &mut Signature, base_self_ty: &Type) {
-    replace_self(sig, base_self_ty);
-    desugar_impl_trait_inputs(sig);
-}
-
 /// Within input-position `impl Trait` bounds only, qualify a bare bound naming a `#[decycle]`
 /// trait with `super::` so it resolves to the PUBLIC trait (defined in the user module — the
 /// parent of `shadowing_module`) instead of the empty dummy trait that `shadowing_module`
@@ -738,7 +733,7 @@ fn process_trait_item_for_ranked(item: &TraitItem) -> TraitItem {
         // like an impl of the original trait would — stripping it here made every
         // defaulted method abstract on the ranked trait, so an impl omitting it hit
         // E0046 even though the original trait supplies a default.
-        replace_self_and_desugar_impl_trait(sig, &parse_quote!(Self));
+        desugar_impl_trait_inputs(sig);
     }
     item
 }
@@ -1643,7 +1638,8 @@ struct NormSig {
 fn normalize_reentry_sig(tf: &TraitItemFn, s_ty: &Type, trait_path_full: &Path) -> NormSig {
     let orig_sig = &tf.sig;
     let mut sig = orig_sig.clone();
-    replace_self_and_desugar_impl_trait(&mut sig, s_ty);
+    replace_self(&mut sig, s_ty);
+    desugar_impl_trait_inputs(&mut sig);
     for (ix, input) in sig.inputs.iter_mut().enumerate() {
         input.reduce_pat(ix);
     }

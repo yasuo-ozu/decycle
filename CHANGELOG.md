@@ -178,6 +178,12 @@ as **0.8.0**, not as a 0.7 patch.
   earlier in the module (`tests/ui/marker_args_after_glob_use.rs`), ahead of a second marker with
   arguments on an earlier item, and ahead of the growth itself, which the structural engine now
   reports first (`tests/ui/value_generic_growth_before_marker_args_structural.rs`).
+- **A diagnostic on a `Self` that the ranked engine copies from a signature points at that `Self`.**
+  The ranked trait's methods, the floor's copies and the bridges of a wrapper respelled every bare
+  `Self` of the signature at the macro's call site, so an error on one (an impl for `str` taking
+  `other: Self`) pointed at `#[decycle]`, with rustc suggesting `&#[decycle]`; it now points at the
+  user's `Self`, where it merges with the same error on the user's impl
+  (`tests/ui/ranked_self_span_unsized.rs`).
 
 ### Removed
 

@@ -872,7 +872,7 @@ pub(super) fn emit_bridge(trait_: &ItemTrait, rank_loc: usize, b: &BridgeReq) ->
         match item {
             TraitItem::Fn(tf) => {
                 let mut sig = tf.sig.clone();
-                replace_self_and_desugar_impl_trait(&mut sig, &pq!(Self));
+                desugar_impl_trait_inputs(&mut sig);
                 for (ix, input) in sig.inputs.iter_mut().enumerate() {
                     input.reduce_pat(ix);
                 }

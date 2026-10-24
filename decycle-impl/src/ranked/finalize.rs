@@ -1,5 +1,6 @@
 use crate::generics_fmt::{param_decl, type_const_idents, DeclBounds};
 use crate::helper::*;
+use crate::names::trait_fns;
 use crate::unify::Subst;
 use proc_macro2::{Span, TokenStream};
 use proc_macro_error::*;
@@ -597,7 +598,7 @@ fn emit_impl_items_delegate(
     impl_: &ItemImpl,
     path: TokenStream,
     // C4: `Some((trait_, decycle))` for a bare-param impl's Final delegating impl ⇒ prepend
-    // `build_bareparam_registrations`'s prologue to each delegated method body. `None` for
+    // its own `Self: T` registrations (below) to each delegated method body. `None` for
     // every other Final impl ⇒ empty prologue, byte-identical to before C4.
     bareparam: Option<(&ItemTrait, &Path)>,
 ) -> TokenStream {
@@ -627,13 +628,29 @@ fn emit_impl_items_delegate(
                 let do_turbofish = !margs.is_empty() && !sig_has_impl_trait_input(&sig);
                 // This delegating body is what calls into the rank chain, so its registrations
                 // must stay live for the whole descent — hence a scope opened here rather than
-                // inside `build_bareparam_registrations`. The scope also bounds the undo log:
+                // inside `build_self_registrations`. The scope also bounds the undo log:
                 // a `register` made outside any scope would log a record nothing ever reclaims.
                 // Priming still survives, because a registration that CREATES its key is left in
                 // place when the scope closes (only displacement is rolled back).
                 let prologue = match bareparam {
                     Some((trait_, decycle)) => {
-                        let regs = build_bareparam_registrations(trait_, impl_, &sig, decycle);
+                        // C4: the bare-param impl's own `Self: T` re-entry registrations,
+                        // emitted from the FINAL delegating impl (a sibling of
+                        // `shadowing_module`), where `Self: Ca` is an assumed environment bound
+                        // and the user's real, un-ranked `T: Cb` is in scope — the registrations
+                        // rule 1 SKIPS for a bare-param impl (`impl_has_bare_param_cyclic_bound`,
+                        // because the rank-rewritten inductive frame cannot prove `Wrap<T>: Ca`).
+                        // At monomorphization `T = Concrete` the key `Mk_Ca<Wrap<Concrete>>`
+                        // equals the wrapper floor's `lookup::<Mk_Ca<Wrap<Concrete>>>`, so the
+                        // wrapper's own floor — and every subsequent runtime re-entry, which
+                        // re-calls THIS Final impl — is covered. Same `Self`/`self_targs`/method-
+                        // generics fingerprint as the floor and rule 1, so keys agree by
+                        // construction. Shares `build_self_registrations` with rule 1, but with
+                        // NO `rule1_ok` gate (the caller gates on the bare-param predicate
+                        // instead) and the `shadowing_module::ranked_traits::` prefix (this runs
+                        // OUTSIDE `shadowing_module`).
+                        let rt = quote!(#{name!("shadowing_module")}::#{name!("ranked_traits")});
+                        let regs = build_self_registrations(trait_, impl_, &sig, &rt, decycle);
                         let scope_guard = name!("__dcl_reentry_scope");
                         quote! {
                             let #scope_guard = #decycle::__reentry::scope();
@@ -1101,7 +1118,7 @@ impl syn::visit_mut::VisitMut for RenameLifetimes<'_> {
 ///   `build_shared_registrations` silently dropped its cross-edge registration, leaving the
 ///   callee's floor to hit the fail-closed "re-entry fn not registered" panic. The very same
 ///   cycle spelled with the concrete type worked.
-/// * `emit_registration` splices the target into the FREE `__dcl_register_once_*` fn, which has
+/// * `emit_registrations` splices the target into the FREE `__dcl_register_once_*` fn, which has
 ///   no `Self` at all — so had the walk ever matched a `Self`-rooted target, the emitted
 ///   `Mk<Self, ..>` / `Re::<Self, ..>` would have been E0411 ("cannot find type `Self` in this
 ///   scope"). Substituting here fixes the reachability walk and that latent emission bug at
@@ -2320,37 +2337,48 @@ fn rule1_registration_ok(
         )
 }
 
-/// Emit one re-entry registration statement (`register::<Mk<...>>(fp, Re::<...> as usize);`).
+/// Emit the re-entry registration statements (`register::<Mk<...>>(fp, Re::<...> as *const ());`)
+/// of `target: trait_<targs>`, one per method in `methods`, each keyed by [`fingerprint_expr`]
+/// with the method's own generics, as the floor looks it up. (The generics of a non-generic method
+/// fold nothing, so they key it as `None` would.)
 ///
 /// `rt_path` is the path prefix to the generated `ranked_traits` module as seen from wherever the
-/// statement is emitted. A programmatic caller splicing registrations alongside [`finalize`]'s
-/// output passes the full path to that module. Semver-committed.
-// The parameter list is the committed bridge signature; bundling it into a struct would be a
-// breaking change, so the arity is intentional.
-#[allow(clippy::too_many_arguments)]
-fn emit_registration(
+/// statements are emitted.
+fn emit_registrations<'a>(
     decycle: &Path,
     rt_path: &TokenStream,
-    trait_ident: &Ident,
-    m_ident: &Ident,
+    trait_: &ItemTrait,
     target: &TokenStream,
+    target_unsized: bool,
     targs: &[GenericArgument],
-    margs: &[Ident],
-    fp: TokenStream,
+    methods: impl IntoIterator<Item = &'a Signature>,
 ) -> TokenStream {
-    let mk = reentry_marker_name(trait_ident, m_ident);
-    let re = reentry_fn_name(trait_ident, m_ident);
-    // `as *const ()` (never `as usize`): laundering a fn pointer through an integer strips its
-    // provenance, and calling the transmuted result is UB.
-    //
-    // Rollback is handled by the enclosing `__reentry::scope()` guard the prologue opens, not
-    // per registration — see `Registration` in the runtime facade.
-    quote! {
-        #decycle::__reentry::register::<#rt_path::#mk<#target #(for a in targs) {, #a} #(for i in margs) {, #i}>>(
-            #fp,
-            #rt_path::#re::<#target #(for a in targs) {, #a} #(for i in margs) {, #i}> as *const ()
+    let mut out = TokenStream::new();
+    for sig in methods {
+        let margs = type_const_idents(&sig.generics);
+        let fp = fingerprint_expr(
+            decycle,
+            target,
+            target_unsized,
+            &trait_.generics,
+            targs,
+            Some(&sig.generics),
         );
+        let mk = reentry_marker_name(&trait_.ident, &sig.ident);
+        let re = reentry_fn_name(&trait_.ident, &sig.ident);
+        // `as *const ()` (never `as usize`): laundering a fn pointer through an integer strips its
+        // provenance, and calling the transmuted result is UB.
+        //
+        // Rollback is handled by the enclosing `__reentry::scope()` guard the prologue opens, not
+        // per registration — see `Registration` in the runtime facade.
+        out.extend(quote! {
+            #decycle::__reentry::register::<#rt_path::#mk<#target #(for a in targs) {, #a} #(for i in &margs) {, #i}>>(
+                #fp,
+                #rt_path::#re::<#target #(for a in targs) {, #a} #(for i in &margs) {, #i}> as *const ()
+            );
+        });
     }
+    out
 }
 
 /// Rule 1's registrations for THIS method's prologue: its own instantiation plus every
@@ -2361,8 +2389,9 @@ fn emit_registration(
 /// the same method hits a real, if obscure, rustc region-inference pitfall around late-bound
 /// lifetimes in an under-determined fn-item-to-integer cast, `bug2.rs`'s spurious `'b: 'a`
 /// demand — emitting it exactly once, inline, sidesteps it entirely).
-/// Shared body of the `Self: T` re-entry registrations (rule 1 and the bare-param C4 case):
-/// registers the current method (keyed with its own method-generics fingerprint) plus every
+///
+/// Also the bare-param C4 case's registrations (see its call site in `emit_impl_items_leaf`'s
+/// caller): the current method (keyed with its own method-generics fingerprint) plus every
 /// non-generic sibling method of `trait_`, all on target `Self`. The two callers differ ONLY in
 /// `rt` — the path prefix to the `ranked_traits` module — because rule 1 runs INSIDE
 /// `shadowing_module` while the bare-param case runs outside it.
@@ -2373,101 +2402,22 @@ fn build_self_registrations(
     rt: &TokenStream,
     decycle: &Path,
 ) -> TokenStream {
-    let self_targs = impl_trait_args(impl_);
-    let self_unsized = impl_self_may_be_unsized(impl_);
-    let mut out = TokenStream::new();
-    let current_margs = type_const_idents(&current_sig.generics);
-    let fp = fingerprint_expr(
-        decycle,
-        &quote!(Self),
-        self_unsized,
-        &trait_.generics,
-        &self_targs,
-        Some(&current_sig.generics),
-    );
-    out.extend(emit_registration(
+    // A generic sibling is registered when — and only when — this method's own generics name its
+    // (`sibling_method_generics_nameable`); otherwise there is nothing in scope to instantiate
+    // `Mk`/`Re` at and the sibling keeps the fail-closed lookup panic.
+    let siblings = trait_fns(trait_).map(|tf| &tf.sig).filter(|sig| {
+        sig.ident != current_sig.ident
+            && (!method_is_generic(sig) || sibling_method_generics_nameable(current_sig, sig))
+    });
+    emit_registrations(
         decycle,
         rt,
-        &trait_.ident,
-        &current_sig.ident,
+        trait_,
         &quote!(Self),
-        &self_targs,
-        &current_margs,
-        fp,
-    ));
-    for item in &trait_.items {
-        let TraitItem::Fn(tf) = item else { continue };
-        if tf.sig.ident == current_sig.ident {
-            continue;
-        }
-        // A generic sibling is registered when — and only when — this method's own generics
-        // name its (`sibling_method_generics_nameable`); otherwise there is nothing in scope to
-        // instantiate `Mk`/`Re` at and the sibling keeps the fail-closed lookup panic.
-        let sibling_generics = if method_is_generic(&tf.sig) {
-            if !sibling_method_generics_nameable(current_sig, &tf.sig) {
-                continue;
-            }
-            Some(&tf.sig.generics)
-        } else {
-            None
-        };
-        let margs = sibling_generics.map(type_const_idents).unwrap_or_default();
-        let fp = fingerprint_expr(
-            decycle,
-            &quote!(Self),
-            self_unsized,
-            &trait_.generics,
-            &self_targs,
-            sibling_generics,
-        );
-        out.extend(emit_registration(
-            decycle,
-            rt,
-            &trait_.ident,
-            &tf.sig.ident,
-            &quote!(Self),
-            &self_targs,
-            &margs,
-            fp,
-        ));
-    }
-    out
-}
-
-fn build_rule1_registrations(
-    trait_: &ItemTrait,
-    impl_: &ItemImpl,
-    current_sig: &Signature,
-    rule1_ok: bool,
-    decycle: &Path,
-) -> TokenStream {
-    if !rule1_ok {
-        return TokenStream::new();
-    }
-    let rt = quote!(#{name!("ranked_traits")});
-    build_self_registrations(trait_, impl_, current_sig, &rt, decycle)
-}
-
-/// C4: the bare-param impl's own `Self: T` re-entry registrations, emitted from the FINAL
-/// delegating impl (a sibling of `shadowing_module`), where `Self: Ca` is an assumed
-/// environment bound and the user's real, un-ranked `T: Cb` is in scope — the registrations
-/// `build_rule1_registrations` SKIPS for a bare-param impl (`impl_has_bare_param_cyclic_bound`,
-/// because the rank-rewritten inductive frame cannot prove `Wrap<T>: Ca`). At monomorphization
-/// `T = Concrete` the key `Mk_Ca<Wrap<Concrete>>` equals the wrapper floor's
-/// `lookup::<Mk_Ca<Wrap<Concrete>>>`, so the wrapper's own floor — and every subsequent runtime
-/// re-entry, which re-calls THIS Final impl — is covered. Same `Self`/`self_targs`/method-
-/// generics fingerprint as the floor and rule 1, so keys agree by construction. Shares
-/// `build_self_registrations` with rule 1, but with NO `rule1_ok` early return (the caller gates
-/// on the bare-param predicate instead) and the `shadowing_module::ranked_traits::` prefix (this
-/// runs OUTSIDE `shadowing_module`).
-fn build_bareparam_registrations(
-    trait_: &ItemTrait,
-    impl_: &ItemImpl,
-    current_sig: &Signature,
-    decycle: &Path,
-) -> TokenStream {
-    let rt = quote!(#{name!("shadowing_module")}::#{name!("ranked_traits")});
-    build_self_registrations(trait_, impl_, current_sig, &rt, decycle)
+        impl_self_may_be_unsized(impl_),
+        &impl_trait_args(impl_),
+        std::iter::once(current_sig).chain(siblings),
+    )
 }
 
 /// The targets rule 2 registers for `impl_`, each already past its gate: every cyclic bound whose
@@ -2556,7 +2506,7 @@ fn rule2_targets(
 /// be independently provable). Identical regardless of which method is currently descending,
 /// so emitted ONCE per impl (F-M3: the released version duplicated this into every method
 /// body) into a shared `#[doc(hidden)]` fn, called from every method's prologue. Unlike rule 1
-/// (`build_rule1_registrations`, kept inline — see its doc comment), rule 2 targets a type
+/// (`build_self_registrations`, kept inline — see its doc comment), rule 2 targets a type
 /// OTHER than `Self`, so hoisting it doesn't hit the same-method-twice cast pitfall.
 ///
 /// C1: also returns the union of fresh HRTB binder lifetimes (`for<'a> B<'a>: Cb`) needed by
@@ -2582,35 +2532,21 @@ fn build_shared_registrations(
         binders.extend(cb.binder.iter().cloned());
         let target_unsized =
             bound_target_floor_is_unsized(&cb.target, &cb.trait_ident, &cb.targs, replacing_table);
-        let target_tokens = quote!(#{&cb.target});
-        for item in &sibling_trait.items {
-            let TraitItem::Fn(tf) = item else { continue };
-            // A GENERIC sibling cannot be instantiated here: this fn is shared by every method
-            // of the impl and declares only the impl's own generics, so it has no way to spell
-            // the callee's method type arguments. It is registered instead from the prologue of
-            // whichever method DOES name them — `build_cross_edge_generic_registrations`.
-            if method_is_generic(&tf.sig) {
-                continue;
-            }
-            let fp = fingerprint_expr(
-                decycle,
-                &target_tokens,
-                target_unsized,
-                &sibling_trait.generics,
-                &cb.targs,
-                None,
-            );
-            out.extend(emit_registration(
-                decycle,
-                &rt,
-                &cb.trait_ident,
-                &tf.sig.ident,
-                &target_tokens,
-                &cb.targs,
-                &[],
-                fp,
-            ));
-        }
+        // A GENERIC sibling cannot be instantiated here: this fn is shared by every method of the
+        // impl and declares only the impl's own generics, so it has no way to spell the callee's
+        // method type arguments. It is registered instead from the prologue of whichever method
+        // DOES name them — `build_cross_edge_generic_registrations`.
+        out.extend(emit_registrations(
+            decycle,
+            &rt,
+            sibling_trait,
+            &quote!(#{&cb.target}),
+            target_unsized,
+            &cb.targs,
+            trait_fns(sibling_trait)
+                .map(|tf| &tf.sig)
+                .filter(|sig| !method_is_generic(sig)),
+        ));
     }
     (out, binders)
 }
@@ -2651,46 +2587,19 @@ fn build_cross_edge_generic_registrations(
         if !cb.binder.is_empty() {
             continue;
         }
-        let generic_siblings: Vec<&TraitItemFn> = sibling_trait
-            .items
-            .iter()
-            .filter_map(|it| match it {
-                TraitItem::Fn(tf)
-                    if method_is_generic(&tf.sig)
-                        && sibling_method_generics_nameable(current_sig, &tf.sig) =>
-                {
-                    Some(tf)
-                }
-                _ => None,
-            })
-            .collect();
-        if generic_siblings.is_empty() {
-            continue;
-        }
         let target_unsized =
             bound_target_floor_is_unsized(&cb.target, &cb.trait_ident, &cb.targs, replacing_table);
-        let target_tokens = quote!(#{&cb.target});
-        for tf in generic_siblings {
-            let margs = type_const_idents(&tf.sig.generics);
-            let fp = fingerprint_expr(
-                decycle,
-                &target_tokens,
-                target_unsized,
-                &sibling_trait.generics,
-                &cb.targs,
-                Some(&tf.sig.generics),
-            );
-            out.extend(emit_registration(
-                decycle,
-                &rt,
-                &cb.trait_ident,
-                &tf.sig.ident,
-                &target_tokens,
-                &cb.targs,
-                &margs,
-                fp,
-            ));
-        }
+        out.extend(emit_registrations(
+            decycle,
+            &rt,
+            sibling_trait,
+            &quote!(#{&cb.target}),
+            target_unsized,
+            &cb.targs,
+            trait_fns(sibling_trait).map(|tf| &tf.sig).filter(|sig| {
+                method_is_generic(sig) && sibling_method_generics_nameable(current_sig, sig)
+            }),
+        ));
     }
     out
 }
@@ -2791,13 +2700,13 @@ fn ranked_trait_rank_loc(trait_: &ItemTrait) -> usize {
 }
 
 /// The marker-type ident decycle mints per (trait, method) — `__Mk_<Trait>_<method><suffix>` — used
-/// as the registry key. [`emit_registration`] names it for you; exposed for diagnostics/tests.
+/// as the registry key. [`emit_registrations`] names it for you; exposed for diagnostics/tests.
 fn reentry_marker_name(trait_ident: &Ident, method_ident: &Ident) -> Ident {
     name!("__Mk_{}_{}", trait_ident, method_ident)
 }
 
 /// The re-entry fn ident (`__Re_<Trait>_<method><suffix>`) whose address a registration stores.
-/// [`emit_registration`] names it for you.
+/// [`emit_registrations`] names it for you.
 fn reentry_fn_name(trait_ident: &Ident, method_ident: &Ident) -> Ident {
     name!("__Re_{}_{}", trait_ident, method_ident)
 }
@@ -3484,30 +3393,17 @@ fn build_supertrait_registrations(
             {
                 continue;
             }
-            for item in &sup_trait.items {
-                let TraitItem::Fn(tf) = item else { continue };
-                if method_is_generic(&tf.sig) {
-                    continue;
-                }
-                let fp = fingerprint_expr(
-                    decycle,
-                    &quote!(Self),
-                    self_unsized,
-                    &sup_trait.generics,
-                    &targs,
-                    None,
-                );
-                out.extend(emit_registration(
-                    decycle,
-                    &rt,
-                    &sup,
-                    &tf.sig.ident,
-                    &quote!(Self),
-                    &targs,
-                    &[],
-                    fp,
-                ));
-            }
+            out.extend(emit_registrations(
+                decycle,
+                &rt,
+                sup_trait,
+                &quote!(Self),
+                self_unsized,
+                &targs,
+                trait_fns(sup_trait)
+                    .map(|tf| &tf.sig)
+                    .filter(|sig| !method_is_generic(sig)),
+            ));
         }
     }
     out
@@ -3900,7 +3796,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                         // If support_infinite_cycle, prepend the re-entry registration
                         // prologue to each method body: rule 1 (this method's own
                         // instantiation + every non-generic sibling — see
-                        // `build_rule1_registrations`'s doc comment for why this stays
+                        // `build_self_registrations`'s doc comment for why this stays
                         // INLINE, unlike rule 2) plus a call into a shared per-impl fn
                         // holding rule 2 (F-M3: identical across every method of this impl,
                         // so hoisted into ONE fn — emitted once — instead of duplicated into
@@ -3991,13 +3887,18 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                                     // statements, so flattening changes nothing observable
                                     // (same order, same scope end).
                                     let old_stmts = block.stmts.clone();
-                                    let rule1_regs = build_rule1_registrations(
-                                        trait_,
-                                        impl_,
-                                        sig,
-                                        rule1_ok,
-                                        &decycle_path,
-                                    );
+                                    let rule1_regs = if rule1_ok {
+                                        let rt = quote!(#{name!("ranked_traits")});
+                                        build_self_registrations(
+                                            trait_,
+                                            impl_,
+                                            sig,
+                                            &rt,
+                                            &decycle_path,
+                                        )
+                                    } else {
+                                        TokenStream::new()
+                                    };
                                     let super_regs = build_supertrait_registrations(
                                         trait_,
                                         impl_,
@@ -4358,7 +4259,7 @@ mod tests {
         }
     }
 
-    /// A hand-emitted registration (via `fingerprint_expr` + `emit_registration`/`reentry_*_name`)
+    /// A hand-emitted registration (via `fingerprint_expr` + `emit_registrations`/`reentry_*_name`)
     /// must byte-agree with `finalize`'s own registration prologue and the floor's `lookup` key for
     /// the same (trait, method, target). Agreement is by construction; this locks it at the token
     /// level, including the sibling-scope spelling a wrapper macro's registration prelude emits.
@@ -4370,32 +4271,31 @@ mod tests {
 
         let decycle_path: Path = parse_quote!(::decycle);
         let ca_ident = &ca_trait.ident;
-        let m_ident: syn::Ident = parse_quote!(ca);
-        let m_generics = syn::Generics::default(); // `fn ca(&self, n: usize)` is non-generic
+        let m_sig: syn::Signature = parse_quote!(fn ca(&self, n: usize) -> usize);
+        let (m_ident, m_generics) = (&m_sig.ident, &m_sig.generics); // non-generic
 
         // The ONE fp recipe (target = Self, sized; no trait targs; empty method generics —
-        // the same argument shape `build_rule1_registrations` and the floor use):
+        // the same argument shape rule 1 (`build_self_registrations`) and the floor use):
         let fp = super::fingerprint_expr(
             &decycle_path,
             &quote!(Self),
             false,
             &ca_trait.generics,
             &[],
-            Some(&m_generics),
+            Some(m_generics),
         );
 
         // (1) finalize's rule-1 registration (emitted INSIDE shadowing_module ⇒ bare
         // `ranked_traits` prefix) appears verbatim in the output:
         let rm = super::ranked_traits_module_name();
-        let rule1 = super::emit_registration(
+        let rule1 = super::emit_registrations(
             &decycle_path,
             &quote!(#rm),
-            ca_ident,
-            &m_ident,
+            &ca_trait,
             &quote!(Self),
+            false,
             &[],
-            &[],
-            fp.clone(),
+            [&m_sig],
         );
         assert!(
             hay.contains(&squish(&rule1.to_string())),
@@ -4407,18 +4307,17 @@ mod tests {
         // `shadowing_module::` prefix; the KEY (marker type_name + fp) is the same type either
         // way. Pin the exact emitted shape:
         let sm = super::shadowing_module_name();
-        let hand = super::emit_registration(
+        let hand = super::emit_registrations(
             &decycle_path,
             &quote!(#sm::#rm),
-            ca_ident,
-            &m_ident,
+            &ca_trait,
             &quote!(Self),
+            false,
             &[],
-            &[],
-            fp.clone(),
+            [&m_sig],
         );
-        let mk = super::reentry_marker_name(ca_ident, &m_ident);
-        let re = super::reentry_fn_name(ca_ident, &m_ident);
+        let mk = super::reentry_marker_name(ca_ident, m_ident);
+        let re = super::reentry_fn_name(ca_ident, m_ident);
         let expected_hand = quote! {
             #decycle_path::__reentry::register::<#sm::#rm::#mk<Self>>(
                 #fp,

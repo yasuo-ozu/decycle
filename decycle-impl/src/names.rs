@@ -10,8 +10,8 @@
 use std::collections::HashSet;
 use syn::visit::Visit;
 use syn::{
-    GenericParam, Generics, Ident, Path, PathArguments, PredicateType, TraitBound, Type,
-    TypeParamBound, TypePath, UseGlob, UseTree, WherePredicate,
+    GenericParam, Generics, Ident, ItemTrait, Path, PathArguments, PredicateType, TraitBound,
+    TraitItem, TraitItemFn, Type, TypeParamBound, TypePath, UseGlob, UseTree, WherePredicate,
 };
 
 /// Strips a leading, argument-less `self` segment (`self::Trait` -> `Trait`,
@@ -140,6 +140,14 @@ pub(crate) fn type_predicates(generics: &Generics) -> impl Iterator<Item = &Pred
             WherePredicate::Type(pt) => Some(pt),
             _ => None,
         })
+}
+
+/// The methods of `trait_`, in order.
+pub(crate) fn trait_fns(trait_: &ItemTrait) -> impl Iterator<Item = &TraitItemFn> {
+    trait_.items.iter().filter_map(|item| match item {
+        TraitItem::Fn(tf) => Some(tf),
+        _ => None,
+    })
 }
 
 /// The idents of `generics`' type parameters — a bound on one targets the parameter, never a

@@ -2543,10 +2543,7 @@ impl Parse for FinalizeArgs {
         let announce_input: announce::helper::Input = input.parse()?;
         let working_list: Vec<Path> = announce_input.list.0.iter().map(|c| c.path()).collect();
         let rest = announce_input.rest;
-        let mut args = syn::parse::Parser::parse2(
-            |input: ParseStream| -> Result<FinalizeArgs> { parse_rest(input) },
-            rest,
-        )?;
+        let mut args = syn::parse::Parser::parse2(parse_rest, rest)?;
         // Newest first, ahead of the module's own traits — the order the old carrier chain,
         // which prepended each definition, produced. (Read after the REST, whose `renames` name a
         // stand-in's local alias.)
@@ -2720,11 +2717,7 @@ fn rank_succ(rank: &Type) -> Type {
 /// `initial_rank(2) = (((),),)`, … This is exactly what decycle splices into `Self: …Ranked<..>` on
 /// each Final impl. Semver-committed.
 fn initial_rank(recurse_level: usize) -> Type {
-    let mut rank = floor_rank();
-    for _ in 0..recurse_level {
-        rank = rank_succ(&rank);
-    }
-    rank
+    (0..recurse_level).fold(floor_rank(), |rank, _| rank_succ(&rank))
 }
 
 /// Drop the plain trait bounds (`T: Tr`, not `?Sized`) of `generics` that `keep` rejects, given the
@@ -2741,29 +2734,28 @@ fn retain_trait_bounds(generics: &mut Generics, mut keep: impl FnMut(&Type, &Pat
         }) => keep(ty, path),
         _ => true,
     };
-    for param in &mut generics.params {
-        if let GenericParam::Type(tp) = param {
-            let ty = Type::Path(TypePath {
-                qself: None,
-                path: tp.ident.clone().into(),
-            });
-            tp.bounds = std::mem::take(&mut tp.bounds)
-                .into_iter()
-                .filter(|b| keep_bound(&ty, b))
-                .collect();
-            if tp.bounds.is_empty() {
-                tp.colon_token = None;
-            }
+    for tp in generics.type_params_mut() {
+        let ty = Type::Path(TypePath {
+            qself: None,
+            path: tp.ident.clone().into(),
+        });
+        tp.bounds = std::mem::take(&mut tp.bounds)
+            .into_iter()
+            .filter(|b| keep_bound(&ty, b))
+            .collect();
+        if tp.bounds.is_empty() {
+            tp.colon_token = None;
         }
     }
     let mut where_clause = WhereClause {
         where_token: Default::default(),
         predicates: Punctuated::new(),
     };
-    for pred in std::mem::take(&mut generics.where_clause)
-        .map(|wc| wc.predicates)
+    for pred in generics
+        .where_clause
+        .take()
         .into_iter()
-        .flatten()
+        .flat_map(|wc| wc.predicates)
     {
         match pred {
             WherePredicate::Type(mut pt) => {
@@ -2891,14 +2883,7 @@ fn check_assoc_type_self(in_order: &[&(ItemTrait, usize, Vec<ItemImpl>)]) {
 /// (impl headers, where-predicates, `impl Trait` bounds, supertraits, and paths inside user
 /// bodies) — the last of which decycle deliberately never reads. Rejecting the declaration is the
 /// honest boundary; the workaround is one line (drop the default, spell the argument).
-fn check_no_defaulted_trait_generics(in_order: &[&(ItemTrait, usize, Vec<ItemImpl>)]) {
-    for (trait_, _, _) in in_order.iter().copied() {
-        check_no_defaulted_generics_of(trait_);
-    }
-}
-
-/// [`check_no_defaulted_trait_generics`] for one trait.
-fn check_no_defaulted_generics_of(trait_: &ItemTrait) {
+fn check_no_defaulted_trait_generics(trait_: &ItemTrait) {
     for param in &trait_.generics.params {
         let (ident, default) = match param {
             GenericParam::Type(tp) => (&tp.ident, tp.default.as_ref().map(|d| quote!(#d))),
@@ -2955,7 +2940,7 @@ pub(crate) fn check_no_impl_trait_output_in(trait_: &ItemTrait) {
 ///
 /// Behind `decycle::check`, which an announced trait lists among the options of `#[announce]`.
 pub fn check_trait(trait_: &ItemTrait) {
-    check_no_defaulted_generics_of(trait_);
+    check_no_defaulted_trait_generics(trait_);
     check_no_impl_trait_output_in(trait_);
 }
 
@@ -3185,7 +3170,9 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
         .collect();
 
     check_assoc_type_self(&in_declaration_order(&traits, &replacing_table));
-    check_no_defaulted_trait_generics(&in_declaration_order(&traits, &replacing_table));
+    for (trait_, _, _) in in_declaration_order(&traits, &replacing_table) {
+        check_no_defaulted_trait_generics(trait_);
+    }
 
     // C2: enroll each foreign-typed but in-module-impl'd concrete impl (e.g.
     // `impl __UnparseDyn for Group<Substruct,O,C>`) into its trait's ranked set. The
@@ -3229,16 +3216,13 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
     // Shadow every renamed trait's ORIGINAL name too, deduplicated and skipping any name
     // already covered (a no-op rename, or a collision with another listed trait's own name —
     // either would otherwise double-define the same dummy ident).
-    let renamed_original_dummies: Vec<Ident> = {
-        let mut seen: HashSet<String> = replacing_table.keys().map(|i| i.to_string()).collect();
-        let mut out = Vec::new();
-        for (original, local) in &args.renames {
-            if original != local && seen.insert(original.to_string()) {
-                out.push(original.clone());
-            }
-        }
-        out
-    };
+    let mut dummied: HashSet<String> = replacing_table.keys().map(|i| i.to_string()).collect();
+    let renamed_original_dummies: Vec<Ident> = args
+        .renames
+        .iter()
+        .filter(|(original, local)| original != local && dummied.insert(original.to_string()))
+        .map(|(original, _)| original.clone())
+        .collect();
 
     // The decycle crate path. D1: an explicit programmatic override (`args.decycle_path`)
     // wins; otherwise recover it from the working list exactly as before: `process_module`
@@ -3263,7 +3247,6 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
         }
     });
 
-    let _output = TokenStream::new();
     let initial_rank = initial_rank(args.recurse_level);
     // What the floor's methods do; its decoy twin's are `LeafBody::Decoy` either way.
     let floor_body = if args.support_infinite_cycle {
@@ -3462,11 +3445,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                                 .insert(*rank_loc, parse_quote!(#{name!("Rank")}))}
                         );
                         modified_impl.generics
-                            .where_clause
-                            .get_or_insert(WhereClause {
-                                where_token: Default::default(),
-                                predicates: Default::default(),
-                            })
+                            .make_where_clause()
                             .predicates
                             .push(self_ranked_bound);
 

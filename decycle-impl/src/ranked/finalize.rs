@@ -460,10 +460,7 @@ fn emit_impl_items_leaf(
                 // method just rides along, still cfg-gated, in the inductive impl copy, so skip it
                 // here (validating it against the trait would wrongly reject a to-be-stripped item).
                 if !crate::extract_cfg_attrs(attrs).is_empty() {
-                    let is_member = trait_
-                        .items
-                        .iter()
-                        .any(|it| matches!(it, TraitItem::Fn(tf) if tf.sig.ident == sig.ident));
+                    let is_member = trait_fns(trait_).any(|tf| tf.sig.ident == sig.ident);
                     if is_member {
                         abort!(
                             &sig.ident,
@@ -499,13 +496,8 @@ fn emit_impl_items_leaf(
                     // recompute the same mask here (positional, so impl-side renames of
                     // trait/method generics don't matter). Marker keys stay unfiltered.
                     let (s_used, tmask, mmask) = {
-                        let tf = trait_
-                            .items
-                            .iter()
-                            .find_map(|it| match it {
-                                TraitItem::Fn(tf) if tf.sig.ident == sig.ident => Some(tf),
-                                _ => None,
-                            })
+                        let tf = trait_fns(trait_)
+                            .find(|tf| tf.sig.ident == sig.ident)
                             .unwrap_or_else(|| {
                                 abort!(
                                     &sig.ident,
@@ -2020,8 +2012,7 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize) -> TokenStream {
         .map(|w| w.predicates.iter().cloned().collect())
         .unwrap_or_default();
 
-    for item in &trait_.items {
-        let TraitItem::Fn(tf) = item else { continue };
+    for tf in trait_fns(trait_) {
         let orig_sig = &tf.sig;
         // D4: unbounded re-entry needs a nameable fn-pointer type for this method. A
         // return-position `impl Trait` makes `fn(...) -> impl Trait` (E0562); abort with an
@@ -3221,22 +3212,20 @@ fn check_no_defaulted_generics_of(trait_: &ItemTrait) {
 /// returns exactly such an opaque `impl Future`. An associated type (or a boxed future) is the
 /// portable escape hatch — it names the return type, so both engines can carry it.
 pub(crate) fn check_no_impl_trait_output_in(trait_: &ItemTrait) {
-    for item in &trait_.items {
-        if let TraitItem::Fn(tf) = item {
-            if let Some(a) = &tf.sig.asyncness {
-                abort!(
-                    a,
-                    "decycle: `async fn` in method `{}` of #[decycle] trait `{}` is not supported — its `impl Future` return is an opaque type, like a return-position `impl Trait`", tf.sig.ident, trait_.ident;
-                    help = "return a boxed future (`-> Pin<Box<dyn Future<Output = ..>>>`), or declare an associated type on the trait and return it"
-                );
-            }
-            if sig_has_impl_trait_output(&tf.sig) {
-                abort!(
-                    &tf.sig.output,
-                    "decycle: return-position `impl Trait` in method `{}` of #[decycle] trait `{}` is not supported", tf.sig.ident, trait_.ident;
-                    help = "declare an associated type on the trait and return it instead (e.g. `type Output; fn m(&self) -> Self::Output`)"
-                );
-            }
+    for tf in trait_fns(trait_) {
+        if let Some(a) = &tf.sig.asyncness {
+            abort!(
+                a,
+                "decycle: `async fn` in method `{}` of #[decycle] trait `{}` is not supported — its `impl Future` return is an opaque type, like a return-position `impl Trait`", tf.sig.ident, trait_.ident;
+                help = "return a boxed future (`-> Pin<Box<dyn Future<Output = ..>>>`), or declare an associated type on the trait and return it"
+            );
+        }
+        if sig_has_impl_trait_output(&tf.sig) {
+            abort!(
+                &tf.sig.output,
+                "decycle: return-position `impl Trait` in method `{}` of #[decycle] trait `{}` is not supported", tf.sig.ident, trait_.ident;
+                help = "declare an associated type on the trait and return it instead (e.g. `type Output; fn m(&self) -> Self::Output`)"
+            );
         }
     }
 }

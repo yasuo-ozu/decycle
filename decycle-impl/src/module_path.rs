@@ -297,6 +297,18 @@ fn is_self_segment(seg: &PathSegment) -> bool {
     seg.ident == "self" && seg.arguments.is_none()
 }
 
+/// `VisitMut` methods for the nodes whose `generics` scope everything inside them: each enters that
+/// scope ([`Qualifier::enter`]), walks the node, and leaves it.
+macro_rules! scoped {
+    ($($visit:ident($ty:ty)),* $(,)?) => {$(
+        fn $visit(&mut self, it: &mut $ty) {
+            self.enter(&it.generics);
+            syn::visit_mut::$visit(self, it);
+            self.shadowed.pop();
+        }
+    )*};
+}
+
 /// The rewrite of one item, `X` → `<module>::X`; see the module docs for what it touches.
 struct Qualifier<'a> {
     scope: &'a ModuleScope,
@@ -404,66 +416,19 @@ impl VisitMut for Qualifier<'_> {
 
     // ----- generic scopes -----
 
-    fn visit_item_struct_mut(&mut self, it: &mut ItemStruct) {
-        self.enter(&it.generics);
-        syn::visit_mut::visit_item_struct_mut(self, it);
-        self.shadowed.pop();
-    }
-
-    fn visit_item_enum_mut(&mut self, it: &mut ItemEnum) {
-        self.enter(&it.generics);
-        syn::visit_mut::visit_item_enum_mut(self, it);
-        self.shadowed.pop();
-    }
-
-    fn visit_item_union_mut(&mut self, it: &mut ItemUnion) {
-        self.enter(&it.generics);
-        syn::visit_mut::visit_item_union_mut(self, it);
-        self.shadowed.pop();
-    }
-
-    fn visit_item_type_mut(&mut self, it: &mut ItemType) {
-        self.enter(&it.generics);
-        syn::visit_mut::visit_item_type_mut(self, it);
-        self.shadowed.pop();
-    }
-
-    fn visit_item_trait_mut(&mut self, it: &mut ItemTrait) {
-        self.enter(&it.generics);
-        syn::visit_mut::visit_item_trait_mut(self, it);
-        self.shadowed.pop();
-    }
-
-    fn visit_item_trait_alias_mut(&mut self, it: &mut ItemTraitAlias) {
-        self.enter(&it.generics);
-        syn::visit_mut::visit_item_trait_alias_mut(self, it);
-        self.shadowed.pop();
-    }
-
-    fn visit_trait_item_type_mut(&mut self, it: &mut TraitItemType) {
-        self.enter(&it.generics);
-        syn::visit_mut::visit_trait_item_type_mut(self, it);
-        self.shadowed.pop();
-    }
-
-    fn visit_impl_item_type_mut(&mut self, it: &mut ImplItemType) {
-        self.enter(&it.generics);
-        syn::visit_mut::visit_impl_item_type_mut(self, it);
-        self.shadowed.pop();
-    }
-
-    fn visit_foreign_item_type_mut(&mut self, it: &mut ForeignItemType) {
-        self.enter(&it.generics);
-        syn::visit_mut::visit_foreign_item_type_mut(self, it);
-        self.shadowed.pop();
-    }
-
-    /// Every fn (free, trait method, impl method, foreign): its generics scope its inputs, output and
-    /// where clause.
-    fn visit_signature_mut(&mut self, sig: &mut Signature) {
-        self.enter(&sig.generics);
-        syn::visit_mut::visit_signature_mut(self, sig);
-        self.shadowed.pop();
+    // Every fn (free, trait method, impl method, foreign) is scoped through its signature: its
+    // generics scope its inputs, output and where clause.
+    scoped! {
+        visit_item_struct_mut(ItemStruct),
+        visit_item_enum_mut(ItemEnum),
+        visit_item_union_mut(ItemUnion),
+        visit_item_type_mut(ItemType),
+        visit_item_trait_mut(ItemTrait),
+        visit_item_trait_alias_mut(ItemTraitAlias),
+        visit_trait_item_type_mut(TraitItemType),
+        visit_impl_item_type_mut(ImplItemType),
+        visit_foreign_item_type_mut(ForeignItemType),
+        visit_signature_mut(Signature),
     }
 
     // ----- left as written -----

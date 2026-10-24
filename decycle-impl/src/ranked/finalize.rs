@@ -1464,15 +1464,6 @@ fn normalize_obligation_targets(impl_: &mut ItemImpl, rules: &[(Type, Type)]) {
     );
 }
 
-/// Strips a leading `::` (global-path) marker so `::core::fmt::Debug` and `core::fmt::Debug`
-/// render identically (F1b: same-spelling paths must compare equal). Deliberately shallow —
-/// only the top-level `leading_colon` token is cleared, not any nested path (e.g. inside a
-/// generic argument); a genuinely different path (different segments, or a different crate
-/// root reached via `self::`/`crate::`) must keep comparing unequal.
-fn strip_leading_colon(path: &mut Path) {
-    path.leading_colon = None;
-}
-
 /// Renders one `Bounded : Bound` side predicate, substituting `bt` (already substituted by the
 /// caller) together with `tb`'s own generic arguments when `subst` is given — F1a: a sibling's
 /// bound like `X: Fixed<Y>` (its own generic `Y`) must have `Y` unified away too, not just the
@@ -1493,7 +1484,12 @@ fn format_side_bound(bt: &Type, tb: &TraitBound, subst: Option<&Subst>) -> Strin
             }
         }
     }
-    strip_leading_colon(&mut tb.path);
+    // Strip a leading `::` (global-path) marker so `::core::fmt::Debug` and `core::fmt::Debug`
+    // render identically (F1b: same-spelling paths must compare equal). Deliberately shallow —
+    // only the top-level `leading_colon` token is cleared, not any nested path (e.g. inside a
+    // generic argument); a genuinely different path (different segments, or a different crate
+    // root reached via `self::`/`crate::`) must keep comparing unequal.
+    tb.path.leading_colon = None;
     format!("{} : {}", quote!(#bt), quote!(#tb))
 }
 
@@ -1513,39 +1509,17 @@ fn side_predicate_strings(
     subst: Option<&Subst>,
 ) -> Vec<String> {
     let g = remove_cyclic_bounds(generics, replacing_table, false);
-    let sub = |ty: &Type| match subst {
-        Some(s) => crate::unify::substitute(ty, s),
-        None => ty.clone(),
-    };
-    let is_relaxed = |tb: &TraitBound| matches!(tb.modifier, TraitBoundModifier::Maybe(_));
     let mut out = Vec::new();
-    for p in &g.params {
-        if let GenericParam::Type(tp) = p {
-            let bt = sub(&Type::Path(TypePath {
-                qself: None,
-                path: Path::from(tp.ident.clone()),
-            }));
-            for b in &tp.bounds {
-                if let TypeParamBound::Trait(tb) = b {
-                    if is_relaxed(tb) {
-                        continue;
-                    }
+    for (ty, bounds) in g
+        .type_params()
+        .map(|tp| (parse_quote!(#{&tp.ident}), &tp.bounds))
+        .chain(crate::names::type_predicates(&g).map(|pt| (pt.bounded_ty.clone(), &pt.bounds)))
+    {
+        let bt = subst.map_or_else(|| ty.clone(), |s| crate::unify::substitute(&ty, s));
+        for b in bounds {
+            if let TypeParamBound::Trait(tb) = b {
+                if !matches!(tb.modifier, TraitBoundModifier::Maybe(_)) {
                     out.push(format_side_bound(&bt, tb, subst));
-                }
-            }
-        }
-    }
-    if let Some(wc) = &g.where_clause {
-        for pred in &wc.predicates {
-            if let WherePredicate::Type(pt) = pred {
-                let bt = sub(&pt.bounded_ty);
-                for b in &pt.bounds {
-                    if let TypeParamBound::Trait(tb) = b {
-                        if is_relaxed(tb) {
-                            continue;
-                        }
-                        out.push(format_side_bound(&bt, tb, subst));
-                    }
                 }
             }
         }
@@ -1553,16 +1527,6 @@ fn side_predicate_strings(
     out
 }
 
-/// Is every non-cyclic bound reachable through `target_ty: target_trait`'s cyclic-bound graph
-/// already among `registering_impl`'s own bounds? Walks the graph breadth-first: at each
-/// `(trait, ty)` node, finds every impl of `trait` whose `self_ty` structurally matches `ty`
-/// (`crate::unify::unify_obligation`, the registration reading), collects that impl's own side
-/// bounds (substituted into
-/// `registering_impl`'s terms), and continues through that impl's own cyclic bounds
-/// (substituted the same way). Fails closed — returns `false` — the moment anything can't be
-/// established syntactically: an unknown trait, no matching impl, more than one matching impl
-/// (ambiguous — treated as needing the union, but an actual mismatch between them still fails
-/// by spelling), or an impl type param left unresolved by unification.
 /// Apply a type substitution to every `GenericArgument::Type` in a trait arg list (const/lifetime
 /// args pass through), so a reachable-bound's trait args carry the same substitution its target
 /// type does when the reachability walk descends through a cross-edge.
@@ -1586,6 +1550,16 @@ fn apply_targs_subst(targs: &[GenericArgument], subst: &Subst) -> Vec<GenericArg
 /// instead: no input in this class is compilable anyway (see the comment at the cap check).
 const REACHABLE_OBLIGATIONS_CAP: usize = 1000;
 
+/// Is every non-cyclic bound reachable through `target_ty: target_trait`'s cyclic-bound graph
+/// already among `registering_impl`'s own bounds? Walks the graph breadth-first: at each
+/// `(trait, ty)` node, finds every impl of `trait` whose `self_ty` structurally matches `ty`
+/// (`crate::unify::unify_obligation`, the registration reading), collects that impl's own side
+/// bounds (substituted into
+/// `registering_impl`'s terms), and continues through that impl's own cyclic bounds
+/// (substituted the same way). Fails closed — returns `false` — the moment anything can't be
+/// established syntactically: an unknown trait, no matching impl, more than one matching impl
+/// (ambiguous — treated as needing the union, but an actual mismatch between them still fails
+/// by spelling), or an impl type param left unresolved by unification.
 fn reachable_side_bounds_ok(
     registering_impl: &ItemImpl,
     target_ty: &Type,

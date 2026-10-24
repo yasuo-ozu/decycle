@@ -742,8 +742,8 @@ fn associated_items_and_a_generic_method() {
 
 // The floor of the pair keeps an inline bound on the real trait for a parameter one of its
 // associated items mentions (`type Out = X::Out;` resolves through `X: Loop`), and a wrapper whose
-// floor keeps one is not planned. A doc comment or a string literal naming `X` is no mention: the
-// pair is planned and bridged as in `pair`.
+// floor keeps one is not planned. A doc comment or a string literal naming `X` is no mention, nor is
+// one inside a macro's tokens: the pair is planned and bridged as in `pair`.
 #[decycle::decycle]
 pub mod named_in_literal {
     #[decycle]
@@ -757,7 +757,7 @@ pub mod named_in_literal {
 
     impl<X: Loop, Y: Loop> Loop for (X, Y) {
         /// The pair of an `X` and a `Y`.
-        const NAME: &'static str = "(X, Y)";
+        const NAME: &'static str = concat!("(X", ", Y)");
         fn step(&self, n: u32) -> u32 {
             self.0.step(n) + self.1.step(n)
         }

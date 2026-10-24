@@ -163,22 +163,31 @@ fn cyclic_requirements(
 /// associated type or const of the impl mentions (`type Out = T::Out;` is copied verbatim onto the
 /// floor, and resolves through `T: Tr`). See [`floor_generics`].
 ///
-/// A mention is an ident of the item's syntax ([`crate::unify::Names`]), not a word of its text: a
-/// doc comment or a string literal naming `T` is none. An item holding a macro, whose tokens are not
-/// read, may mention any of them, so it keeps every one.
+/// A mention is an ident token of the item, a macro's included, not a word of its text: a doc
+/// comment or a string literal naming `T` is none.
 fn floor_kept_params(im: &ItemImpl) -> HashSet<Ident> {
-    let params = crate::names::type_param_idents(&im.generics);
-    let mut names = crate::unify::Names::default();
+    fn idents(tokens: TokenStream, out: &mut HashSet<String>) {
+        for tt in tokens {
+            match tt {
+                proc_macro2::TokenTree::Ident(i) => {
+                    out.insert(i.to_string());
+                }
+                proc_macro2::TokenTree::Group(g) => idents(g.stream(), out),
+                _ => {}
+            }
+        }
+    }
+    let mut words = HashSet::new();
     for item in im
         .items
         .iter()
         .filter(|item| !matches!(item, ImplItem::Fn(_)))
     {
-        syn::visit::Visit::visit_impl_item(&mut names, item);
+        idents(quote!(#item), &mut words);
     }
-    params
+    crate::names::type_param_idents(&im.generics)
         .into_iter()
-        .filter(|p| names.opaque || names.idents.contains(&p.to_string()))
+        .filter(|p| words.contains(&p.to_string()))
         .collect()
 }
 

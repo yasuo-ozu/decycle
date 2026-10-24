@@ -315,8 +315,8 @@ as **0.8.0**, not as a 0.7 patch.
   for a parameter one of its associated items mentions (`type Out = X::Out;` resolves through
   `X: Loop`), and a wrapper whose floor keeps one is not planned, so the call through it is
   `E0283`. The mentions were read off the item's text, so `/// The pair of an X and a Y` or
-  `const NAME: &str = "X";` counted one; they are now the idents of its syntax. An associated item
-  holding a macro, whose tokens are not read, keeps every parameter (`tests/wrapper_bridge.rs`).
+  `const NAME: &str = "X";` counted one; they are now its ident tokens, a macro's included
+  (`tests/wrapper_bridge.rs`).
 - **The ranked engine's expansion is deterministic.** It emitted its per-trait items (the ranked
   twins and re-entry items, the dummy shadows, the inductive and the Final impls) in the iteration
   order of a `HashMap`, which `std` seeds per process: a module with several `#[decycle]` traits

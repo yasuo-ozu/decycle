@@ -1,6 +1,6 @@
 use crate::generics_fmt::{masked, param_decl, split_lifetimes, type_const_idents, DeclBounds};
 use crate::helper::*;
-use crate::names::trait_fns;
+use crate::names::{trait_fns, type_has};
 use crate::unify::Subst;
 use proc_macro2::{Span, TokenStream};
 use proc_macro_error::*;
@@ -881,20 +881,8 @@ fn sig_has_impl_trait_input(sig: &Signature) -> bool {
 /// erased fn-pointer type (`fn(...) -> impl Trait` is E0562), so it can't be threaded through
 /// re-entry — used to reject return-position `impl Trait` up-front with a clear error.
 pub(crate) fn sig_has_impl_trait_output(sig: &Signature) -> bool {
-    struct Find(bool);
-    impl<'ast> syn::visit::Visit<'ast> for Find {
-        fn visit_type_impl_trait(&mut self, _: &'ast TypeImplTrait) {
-            self.0 = true;
-        }
-    }
-    match &sig.output {
-        ReturnType::Type(_, t) => {
-            let mut f = Find(false);
-            syn::visit::Visit::visit_type(&mut f, t);
-            f.0
-        }
-        ReturnType::Default => false,
-    }
+    matches!(&sig.output, ReturnType::Type(_, t)
+        if type_has(t, &|t| matches!(t, Type::ImplTrait(_))))
 }
 
 /// True iff the method has its own type/const generics or an argument-position `impl Trait`.
@@ -1326,21 +1314,8 @@ fn s_ident_only_behind_ref<'a>(tys: impl Iterator<Item = &'a Type>, s_ident: &Id
 /// str`) may leave a trait-level param like `T` entirely unmasked out of the alias's generic
 /// list, so unconditionally emitting the bound (regardless of whether anything needs it) is an
 /// E0412 "cannot find type" waiting to happen.
-fn any_type_has_projection<'a>(tys: impl Iterator<Item = &'a Type>) -> bool {
-    struct Check(bool);
-    impl<'ast> syn::visit::Visit<'ast> for Check {
-        fn visit_type_path(&mut self, tp: &'ast TypePath) {
-            if tp.qself.is_some() {
-                self.0 = true;
-            }
-            syn::visit::visit_type_path(self, tp);
-        }
-    }
-    let mut c = Check(false);
-    for ty in tys {
-        syn::visit::Visit::visit_type(&mut c, ty);
-    }
-    c.0
+fn any_type_has_projection<'a>(mut tys: impl Iterator<Item = &'a Type>) -> bool {
+    tys.any(|ty| type_has(ty, &|t| matches!(t, Type::Path(tp) if tp.qself.is_some())))
 }
 
 /// Build the layout-fingerprint expression for one registry key: a deterministic fold over the
@@ -2868,24 +2843,6 @@ fn is_self_type(ty: &Type) -> bool {
     matches!(ty, Type::Path(TypePath { qself: None, path }) if path.is_ident("Self"))
 }
 
-/// Whether `ty` contains `Self` ANYWHERE in its structure, not just as the whole type —
-/// `type Assoc = Box<Self>;` / `(Self,)` are just as cyclic as a bare `type Assoc = Self;`
-/// (`is_self_type` alone only catches the latter).
-fn type_contains_self(ty: &Type) -> bool {
-    struct FindSelf(bool);
-    impl<'ast> syn::visit::Visit<'ast> for FindSelf {
-        fn visit_type(&mut self, ty: &'ast Type) {
-            if is_self_type(ty) {
-                self.0 = true;
-            }
-            syn::visit::visit_type(self, ty);
-        }
-    }
-    let mut finder = FindSelf(false);
-    syn::visit::Visit::visit_type(&mut finder, ty);
-    finder.0
-}
-
 /// The entries of `replacing_table` in the order the traits are declared (`traits`, the module's
 /// own order, then the `#[decycle] use`s'). Every iteration that emits tokens, or picks which of
 /// several errors is reported, goes through this rather than through the `HashMap`, whose order is
@@ -2943,8 +2900,9 @@ fn check_assoc_type_self(in_order: &[&(ItemTrait, usize, Vec<ItemImpl>)]) {
             }
 
             // Check impls for a `Self`-containing assignment (`= Self;`, `= Box<Self>;`,
-            // `= (Self,);`, …) — any of them recreate the same cycle through the Final
-            // impl, not just the bare-`Self` case.
+            // `= (Self,);`, …: `Self` ANYWHERE in its structure, not just as the whole type) —
+            // any of them recreate the same cycle through the Final impl, not just the
+            // bare-`Self` case.
             for impl_ in impls {
                 for impl_item in &impl_.items {
                     let ImplItem::Type(ImplItemType { ident, ty, .. }) = impl_item else {
@@ -2953,7 +2911,7 @@ fn check_assoc_type_self(in_order: &[&(ItemTrait, usize, Vec<ItemImpl>)]) {
                     if ident != assoc_ident {
                         continue;
                     }
-                    if type_contains_self(ty) {
+                    if type_has(ty, &is_self_type) {
                         abort!(
                             ty,
                             "infinite recursive definition: `type {} = ...` referencing `Self` with #[decycle] trait bound",

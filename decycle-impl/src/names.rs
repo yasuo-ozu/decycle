@@ -130,6 +130,20 @@ pub(crate) fn names_bare(ty: &Type, names: &HashSet<Ident>) -> bool {
     !bare_named_in(ty, &|i| names.contains(i)).is_empty()
 }
 
+/// Whether `ty`, or any type inside it, satisfies `pred`.
+pub(crate) fn type_has(ty: &Type, pred: &dyn Fn(&Type) -> bool) -> bool {
+    struct Find<'p>(&'p dyn Fn(&Type) -> bool, bool);
+    impl<'ast> Visit<'ast> for Find<'_> {
+        fn visit_type(&mut self, ty: &'ast Type) {
+            self.1 |= (self.0)(ty);
+            syn::visit::visit_type(self, ty);
+        }
+    }
+    let mut find = Find(pred, false);
+    find.visit_type(ty);
+    find.1
+}
+
 /// The predicates of `generics`' `where`-clause, in order.
 pub(crate) fn where_predicates(generics: &Generics) -> impl Iterator<Item = &WherePredicate> {
     generics.where_clause.iter().flat_map(|wc| &wc.predicates)

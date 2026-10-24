@@ -232,10 +232,7 @@ pub(super) fn floor_generics(im: &ItemImpl, table: &Table, ranked: bool) -> Gene
             }
             let mut probe = tb.path.clone();
             crate::names::strip_leading_self(&mut probe);
-            if probe.leading_colon.is_none()
-                && probe.segments.len() == 1
-                && table.contains_key(&probe.segments[0].ident)
-            {
+            if names_table_trait(&probe, table) {
                 tb.path = probe;
                 replacer.try_replace_path(&mut tb.path);
             }
@@ -248,19 +245,18 @@ pub(super) fn floor_generics(im: &ItemImpl, table: &Table, ranked: bool) -> Gene
 /// A chain through such a wrapper could close the inductive cycle the ranked floor bound avoids.
 fn floor_keeps_cyclic_bound(im: &ItemImpl, table: &Table) -> bool {
     let kept = floor_kept_params(im);
-    im.generics.params.iter().any(|p| match p {
-        GenericParam::Type(tp) if kept.contains(&tp.ident) => tp.bounds.iter().any(|b| {
+    im.generics
+        .type_params()
+        .filter(|tp| kept.contains(&tp.ident))
+        .flat_map(|tp| &tp.bounds)
+        .any(|b| {
             let TypeParamBound::Trait(tb) = b else {
                 return false;
             };
             let mut probe = tb.path.clone();
             crate::names::strip_leading_self(&mut probe);
-            probe.leading_colon.is_none()
-                && probe.segments.len() == 1
-                && table.contains_key(&probe.segments[0].ident)
-        }),
-        _ => false,
-    })
+            names_table_trait(&probe, table)
+        })
 }
 
 /// The ranked supertraits of `trait_` ([`ranked_supertrait`]) with their arguments for the

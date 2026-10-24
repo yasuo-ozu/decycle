@@ -268,6 +268,25 @@ fn remove_cyclic_bounds(
     g
 }
 
+/// Whether `path` is one segment, with no leading `::`, that names a trait of `table` (`Tr`,
+/// `Tr<A>`): the bare spelling of a cyclic trait.
+fn names_table_trait(path: &Path, table: &Table) -> bool {
+    path.leading_colon.is_none()
+        && path.segments.len() == 1
+        && table.contains_key(&path.segments[0].ident)
+}
+
+/// Respell `path` as `super::Tr` when it [`names_table_trait`] — the public trait as seen from
+/// inside `shadowing_module`, which binds the bare name to an empty dummy; whether it did.
+fn qualify_super(path: &mut Path, table: &Table) -> bool {
+    if !names_table_trait(path, table) {
+        return false;
+    }
+    let seg = path.segments[0].clone();
+    *path = parse_quote!(super::#seg);
+    true
+}
+
 /// The head idents of every type that IMPLEMENTS a cyclic trait in this module — the set of targets
 /// a rank-lowered bound can actually descend into. Derived from `replacing_table` (which already
 /// holds each cyclic trait's impls), so no extra plumbing from `process_module` is needed.
@@ -324,24 +343,13 @@ fn requalify_foreign_premises(generics: &mut Generics, replacing_table: &Table) 
     }
     impl syn::visit_mut::VisitMut for Requalify<'_> {
         fn visit_path_mut(&mut self, path: &mut Path) {
-            if path.leading_colon.is_none()
-                && path.segments.len() == 1
-                && self.table.contains_key(&path.segments[0].ident)
-            {
-                let seg = path.segments[0].clone();
-                *path = parse_quote!(super::#seg);
-                return;
+            if !qualify_super(path, self.table) {
+                syn::visit_mut::visit_path_mut(self, path);
             }
-            syn::visit_mut::visit_path_mut(self, path);
         }
     }
 
-    let is_bare_routed = |b: &TypeParamBound| {
-        matches!(b, TypeParamBound::Trait(TraitBound { path, .. })
-            if path.leading_colon.is_none()
-                && path.segments.len() == 1
-                && replacing_table.contains_key(&path.segments[0].ident))
-    };
+    let is_bare_routed = |b: &TypeParamBound| matches!(b, TypeParamBound::Trait(tb) if names_table_trait(&tb.path, replacing_table));
     for pred in wc.predicates.iter_mut() {
         let WherePredicate::Type(pt) = pred else {
             continue;
@@ -720,14 +728,7 @@ fn qualify_apit_cyclic_bounds_super(sig: &mut Signature, replacing_table: &Table
         fn visit_type_impl_trait_mut(&mut self, it: &mut syn::TypeImplTrait) {
             for bound in it.bounds.iter_mut() {
                 if let syn::TypeParamBound::Trait(tb) = bound {
-                    let path = &mut tb.path;
-                    if path.leading_colon.is_none()
-                        && path.segments.len() == 1
-                        && self.table.contains_key(&path.segments[0].ident)
-                    {
-                        let seg = path.segments[0].clone();
-                        *path = parse_quote!(super::#seg);
-                    }
+                    qualify_super(&mut tb.path, self.table);
                 }
             }
             // A cyclic bound only appears at top level of the `impl Trait`; no need to recurse
@@ -1402,9 +1403,7 @@ pub fn fingerprint_expr(
 fn impl_has_bare_param_cyclic_bound(impl_: &ItemImpl, replacing_table: &Table) -> bool {
     let is_cyclic = |bounds: &Punctuated<TypeParamBound, Token![+]>| {
         bounds.iter().any(|b| {
-            matches!(b, TypeParamBound::Trait(tb) if tb.path.leading_colon.is_none()
-                && tb.path.segments.len() == 1
-                && replacing_table.contains_key(&tb.path.segments[0].ident))
+            matches!(b, TypeParamBound::Trait(tb) if names_table_trait(&tb.path, replacing_table))
         })
     };
     let param_idents = crate::names::type_param_idents(&impl_.generics);

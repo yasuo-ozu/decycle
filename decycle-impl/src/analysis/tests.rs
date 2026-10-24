@@ -15,28 +15,28 @@
 //!    (`::other::Stmt: Tr`) is no edge at all — the same bare-or-`self::` rule the engine's own
 //!    `peel::cycle_types_within` applies.
 
-use super::{analyze_module, cyclic_subgraph, EdgeKind};
+use super::{analyze_module, cyclic_subgraph};
 use proc_macro2::Ident;
 use safegraph::graph::Graph;
 use safegraph::VecGraph;
 use syn::parse_quote;
 
-/// `(from, kind, to)` triples, sorted, so assertions do not depend on insertion order.
-fn edges_of(g: &VecGraph<Ident, EdgeKind>) -> Vec<(String, EdgeKind, String)> {
+/// `(from, to)` pairs, sorted, so assertions do not depend on insertion order.
+fn edges_of(g: &VecGraph<Ident, ()>) -> Vec<(String, String)> {
     let (nodes, edges) = crate::graph::decompose(g);
     let mut out: Vec<_> = edges
         .into_iter()
-        .map(|(a, b, kind)| (nodes[a].to_string(), kind, nodes[b].to_string()))
+        .map(|(a, b, ())| (nodes[a].to_string(), nodes[b].to_string()))
         .collect();
     out.sort();
     out
 }
 
-fn edges(module: &syn::ItemMod) -> Vec<(String, EdgeKind, String)> {
+fn edges(module: &syn::ItemMod) -> Vec<(String, String)> {
     edges_of(&analyze_module(module, &parse_quote!(::decycle)))
 }
 
-fn sorted_nodes(g: &VecGraph<Ident, EdgeKind>) -> Vec<String> {
+fn sorted_nodes(g: &VecGraph<Ident, ()>) -> Vec<String> {
     let mut v: Vec<String> = g.nodes().map(|n| n.to_string()).collect();
     v.sort();
     v
@@ -47,7 +47,7 @@ fn nodes(module: &syn::ItemMod) -> Vec<String> {
 }
 
 #[test]
-fn direct_and_peeled() {
+fn wrapped_and_direct_bounds_are_edges() {
     let m: syn::ItemMod = parse_quote! {
         mod ast {
             #[decycle]
@@ -56,7 +56,7 @@ fn direct_and_peeled() {
             pub enum Stmt { B }
             // Wrapped: the head is `Vec`, so `Stmt` is only reachable inside the arguments.
             impl Tr for Expr where Vec<Box<Stmt>>: Tr { fn f(&self) {} }
-            // Direct: the bound names `Expr` outright.
+            // The bound names `Expr` outright.
             impl Tr for Stmt where Expr: Tr { fn f(&self) {} }
         }
     };
@@ -64,8 +64,8 @@ fn direct_and_peeled() {
     assert_eq!(
         edges(&m),
         vec![
-            ("Expr".into(), EdgeKind::Peeled, "Stmt".into()),
-            ("Stmt".into(), EdgeKind::Direct, "Expr".into()),
+            ("Expr".into(), "Stmt".into()),
+            ("Stmt".into(), "Expr".into()),
         ]
     );
 }
@@ -95,10 +95,7 @@ fn only_routed_traits_and_bare_spellings_count() {
         vec!["Expr", "Stmt"],
         "Leaf implements no routed trait"
     );
-    assert_eq!(
-        edges(&m),
-        vec![("Expr".into(), EdgeKind::Direct, "Stmt".into())]
-    );
+    assert_eq!(edges(&m), vec![("Expr".into(), "Stmt".into())]);
 }
 
 #[test]
@@ -132,10 +129,7 @@ fn one_edge_per_pair_even_with_several_routed_traits() {
             impl U for Stmt { fn u(&self) {} }
         }
     };
-    assert_eq!(
-        edges(&m),
-        vec![("Expr".into(), EdgeKind::Direct, "Stmt".into())]
-    );
+    assert_eq!(edges(&m), vec![("Expr".into(), "Stmt".into())]);
 }
 
 #[test]
@@ -151,10 +145,7 @@ fn decycle_use_routes_a_foreign_trait() {
         }
     };
     assert_eq!(nodes(&m), vec!["Expr", "Stmt"]);
-    assert_eq!(
-        edges(&m),
-        vec![("Expr".into(), EdgeKind::Peeled, "Stmt".into())]
-    );
+    assert_eq!(edges(&m), vec![("Expr".into(), "Stmt".into())]);
 }
 
 #[test]
@@ -263,7 +254,7 @@ fn own_type_param_shadowing_a_participant_is_not_an_edge() {
     };
     assert_eq!(
         edges(&m),
-        Vec::<(String, EdgeKind, String)>::new(),
+        Vec::<(String, String)>::new(),
         "a bound on the impl's own type parameter is not a graph edge"
     );
     // And therefore no fabricated cycle either.
@@ -289,8 +280,8 @@ fn unshadowed_bound_of_the_same_shape_still_counts() {
     assert_eq!(
         edges(&m),
         vec![
-            ("Expr".into(), EdgeKind::Direct, "Stmt".into()),
-            ("Stmt".into(), EdgeKind::Direct, "Expr".into()),
+            ("Expr".into(), "Stmt".into()),
+            ("Stmt".into(), "Expr".into()),
         ]
     );
 }
@@ -306,7 +297,7 @@ fn self_bound_is_not_an_edge() {
             impl Tr for Expr where Self: Tr { fn f(&self) {} }
         }
     };
-    assert_eq!(edges(&m), Vec::<(String, EdgeKind, String)>::new());
+    assert_eq!(edges(&m), Vec::<(String, String)>::new());
 }
 
 /// Defect 2: a raw-identifier participant must round-trip without panicking, keeping its raw
@@ -330,8 +321,8 @@ fn raw_ident_participant_does_not_panic() {
     assert_eq!(
         edges_of(&g),
         vec![
-            ("Expr".into(), EdgeKind::Direct, "r#loop".into()),
-            ("r#loop".into(), EdgeKind::Direct, "Expr".into()),
+            ("Expr".into(), "r#loop".into()),
+            ("r#loop".into(), "Expr".into()),
         ]
     );
     // The cycle machinery must survive the raw ident too (compose/decompose round-trip).
@@ -350,9 +341,9 @@ fn cyclic_subgraph_keeps_same_named_nodes_distinct() {
     use proc_macro2::Span;
 
     // a0 <-> b is a real cycle; a1 (same NAME as a0) is an isolated bystander.
-    let g: VecGraph<Ident, EdgeKind> = crate::graph::compose(
+    let g: VecGraph<Ident, ()> = crate::graph::compose(
         ["A", "B", "A"].map(|name| Ident::new(name, Span::call_site())),
-        [(0, 1, EdgeKind::Direct), (1, 0, EdgeKind::Direct)],
+        [(0, 1, ()), (1, 0, ())],
     );
 
     let cyc = cyclic_subgraph(&g);
@@ -361,10 +352,7 @@ fn cyclic_subgraph_keeps_same_named_nodes_distinct() {
     assert_eq!(nodes, vec!["A", "B"], "only the cycling A survives, once");
     assert_eq!(
         edges_of(&cyc),
-        vec![
-            ("A".into(), EdgeKind::Direct, "B".into()),
-            ("B".into(), EdgeKind::Direct, "A".into()),
-        ]
+        vec![("A".into(), "B".into()), ("B".into(), "A".into())]
     );
 }
 
@@ -426,7 +414,7 @@ fn wrapped_cycle_module() -> syn::ItemMod {
     }
 }
 
-/// The head of `Wrap<Stmt>` is a participant, so the bound is a `Direct` edge to `Wrap` — and that
+/// The head of `Wrap<Stmt>` is a participant, so the bound is an edge to `Wrap` — and that
 /// used to be ALL of it: the nested `Stmt` was dropped, both back-edges with it, and the graph came
 /// out acyclic. Both endpoints are now reported.
 #[test]
@@ -435,10 +423,10 @@ fn a_participating_container_does_not_swallow_its_nested_participants() {
     assert_eq!(
         edges(&m),
         vec![
-            ("Expr".into(), EdgeKind::Direct, "Wrap".into()),
-            ("Expr".into(), EdgeKind::Peeled, "Stmt".into()),
-            ("Stmt".into(), EdgeKind::Direct, "Wrap".into()),
-            ("Stmt".into(), EdgeKind::Peeled, "Expr".into()),
+            ("Expr".into(), "Stmt".into()),
+            ("Expr".into(), "Wrap".into()),
+            ("Stmt".into(), "Expr".into()),
+            ("Stmt".into(), "Wrap".into()),
         ],
         "`Wrap<Stmt>: Tr` reaches Wrap directly AND Stmt inside it"
     );
@@ -454,8 +442,8 @@ fn a_participating_container_does_not_swallow_its_nested_participants() {
     assert_eq!(
         edges_of(&cyc),
         vec![
-            ("Expr".into(), EdgeKind::Peeled, "Stmt".into()),
-            ("Stmt".into(), EdgeKind::Peeled, "Expr".into()),
+            ("Expr".into(), "Stmt".into()),
+            ("Stmt".into(), "Expr".into()),
         ]
     );
 }
@@ -501,7 +489,7 @@ fn a_foreign_bound_target_is_not_an_edge_to_the_local_type_of_that_name() {
     };
     assert_eq!(
         edges(&m),
-        vec![("Stmt".into(), EdgeKind::Direct, "Expr".into())],
+        vec![("Stmt".into(), "Expr".into())],
         "only the local `Expr: Tr` bound is an edge"
     );
     let cyc = cyclic_subgraph(&analyze_module(&m, &parse_quote!(::decycle)));
@@ -526,8 +514,8 @@ fn local_spellings_and_foreign_containers_still_reach_the_participant() {
     assert_eq!(
         edges(&m),
         vec![
-            ("Expr".into(), EdgeKind::Direct, "Stmt".into()),
-            ("Stmt".into(), EdgeKind::Peeled, "Expr".into()),
+            ("Expr".into(), "Stmt".into()),
+            ("Stmt".into(), "Expr".into()),
         ]
     );
 }
@@ -648,7 +636,7 @@ fn a_leading_colon_is_a_path() {
     );
     assert_eq!(
         edges(&m),
-        vec![("Stmt".into(), EdgeKind::Direct, "Expr".into())],
+        vec![("Stmt".into(), "Expr".into())],
         "`Stmt: ::Tr` is no edge"
     );
 }

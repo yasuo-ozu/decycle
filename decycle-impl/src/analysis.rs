@@ -15,8 +15,8 @@
 //!     pub enum Stmt { … }   impl Tr for Stmt where Expr: Tr          { … }
 //! }
 //! nodes: Expr, Stmt
-//! edges: Expr -Peeled-> Stmt   (the bound was written on `Vec<Box<Stmt>>`)
-//!        Stmt -Direct-> Expr   (the bound named `Expr` itself)
+//! edges: Expr -> Stmt   (the bound was written on `Vec<Box<Stmt>>`)
+//!        Stmt -> Expr   (the bound named `Expr` itself)
 //! ```
 
 use crate::names::{bare_ident, is_routed_bound};
@@ -25,39 +25,19 @@ use safegraph::VecGraph;
 use std::collections::{HashMap, HashSet};
 use syn::{Attribute, Item, ItemImpl, ItemMod, Path, Type};
 
-/// How a cyclic where-bound names the participant it reaches.
-///
-/// The distinction is the ranked engine's: a bound can only be rank-lowered when its target's *head*
-/// is a participant, so a wrapped bound has to be peeled to one first (see [`crate::ranked::peel`]).
-/// The structural engine draws the same line for a different reason — it *strips* cyclic bounds, and
-/// stripping a wrapped one is only sound if the container forwards the trait, so it emits a
-/// forwarding assertion in exactly the [`EdgeKind::Peeled`] case.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub(crate) enum EdgeKind {
-    /// The bound names the participant directly: `Stmt: Tr` — its head *is* the target.
-    Direct,
-    /// The bound names a type that *contains* the participant: `Vec<Box<Stmt>>: Tr` — reaching
-    /// `Stmt` means looking inside the arguments.
-    ///
-    /// The two kinds are per *endpoint*, not per bound: one predicate can yield both. When the head
-    /// is itself a participant (`Wrap<Stmt>: Tr`, with `Wrap` implementing the trait too) the bound
-    /// is a [`EdgeKind::Direct`] edge to `Wrap` **and** a `Peeled` edge to `Stmt`, because the
-    /// obligation on `Expr` really does travel through both.
-    Peeled,
-}
-
 /// Build the obligation graph of `module`.
 ///
 /// Nodes are the head idents of types with an `impl` of a routed trait — the same set the engines
 /// call `cycle_self_heads`. Edges go **from** the type carrying the bound **to** the participant the
-/// bound reaches, labelled by how it was reached.
+/// bound reaches, whether the bound names it (`Stmt: Tr`) or a type containing it
+/// (`Vec<Box<Stmt>>: Tr`).
 ///
 /// `decycle` is the path the caller passes to an engine (e.g. `::my_crate::__decycle`); only its
 /// first segment is used, to recognise `#[<crate>::decycle]` alongside the bare `#[decycle]`. A
 /// path with no segments names no crate, so nothing is routed and the graph is empty.
 ///
 /// A bound reaches **every** participant it names: `Wrap<Stmt>: Tr`, with `Wrap` implementing the
-/// trait too, is a `Direct` edge to `Wrap` *and* a `Peeled` edge to `Stmt`.
+/// trait too, is an edge to `Wrap` *and* an edge to `Stmt`.
 ///
 /// Not represented, deliberately:
 /// - bounds whose target is `Self` or one of the impl's own type parameters — those name no other
@@ -77,7 +57,7 @@ pub(crate) enum EdgeKind {
 /// do: a glob `#[decycle] use path::*;` routes no trait, because a glob names none. A module whose
 /// only marker is a glob therefore yields the empty graph — the ranked engine rejects that module
 /// outright ("glob is not supported in #[decycle] use"), so there is no expansion to describe.
-pub(crate) fn analyze_module(module: &ItemMod, decycle: &Path) -> VecGraph<Ident, EdgeKind> {
+pub(crate) fn analyze_module(module: &ItemMod, decycle: &Path) -> VecGraph<Ident, ()> {
     let Some((_, items)) = module.content.as_ref() else {
         return VecGraph::default();
     };
@@ -90,7 +70,7 @@ pub(crate) fn analyze_module(module: &ItemMod, decycle: &Path) -> VecGraph<Ident
     build(items, &routed)
 }
 
-fn build(items: &[Item], routed: &HashSet<Ident>) -> VecGraph<Ident, EdgeKind> {
+fn build(items: &[Item], routed: &HashSet<Ident>) -> VecGraph<Ident, ()> {
     let participants = participants(items, routed);
 
     // Deterministic node order, so the indices a caller sees are reproducible across runs. The
@@ -104,8 +84,8 @@ fn build(items: &[Item], routed: &HashSet<Ident>) -> VecGraph<Ident, EdgeKind> {
         .map(|(k, ident)| (ident.to_string(), k))
         .collect();
 
-    let mut edges: Vec<(usize, usize, EdgeKind)> = Vec::new();
-    let mut seen: HashSet<(usize, usize, EdgeKind)> = HashSet::new();
+    let mut edges: Vec<(usize, usize, ())> = Vec::new();
+    let mut seen: HashSet<(usize, usize)> = HashSet::new();
     for item in items {
         let Item::Impl(im) = item else { continue };
         if !impls_routed_trait(im, routed) {
@@ -117,10 +97,10 @@ fn build(items: &[Item], routed: &HashSet<Ident>) -> VecGraph<Ident, EdgeKind> {
         if !participants.contains(&from) {
             continue;
         }
-        for (to, kind) in bound_edges(im, routed, &participants) {
-            let key = (position[&from.to_string()], position[&to.to_string()], kind);
+        for to in bound_edges(im, routed, &participants) {
+            let key = (position[&from.to_string()], position[&to.to_string()]);
             if seen.insert(key) {
-                edges.push(key);
+                edges.push((key.0, key.1, ()));
             }
         }
     }
@@ -193,12 +173,12 @@ fn impls_routed_trait(im: &ItemImpl, routed: &HashSet<Ident>) -> bool {
         .is_some_and(|ident| routed.contains(ident))
 }
 
-/// The participants reached by this impl's cyclic where-bounds, with how each was reached.
+/// The participants reached by this impl's cyclic where-bounds.
 fn bound_edges(
     im: &ItemImpl,
     routed: &HashSet<Ident>,
     participants: &HashSet<Ident>,
-) -> Vec<(Ident, EdgeKind)> {
+) -> Vec<Ident> {
     // The impl's own type parameters. A bound on one of them (`impl<Stmt> Tr for Expr where
     // Stmt: Tr`) targets the parameter, not a same-named participant it may shadow — the doc
     // above promises such bounds are not represented, and the engine's own matchers
@@ -219,47 +199,30 @@ fn bound_edges(
             }
         }
         // A bound reaches EVERY participant it names, and the head being one of them does not stop
-        // the search: `Wrap<Stmt>: Tr` — where `Wrap` implements the trait as well — is a `Direct`
-        // edge to `Wrap` *and* a `Peeled` edge to `Stmt`. Treating the two as alternatives dropped
-        // the nested endpoints of any bound wrapped in a participating container, which is enough
-        // to turn a fully cyclic module (`Expr: Tr <= Wrap<Stmt>: Tr <= Stmt: Tr <= Wrap<Expr>:
-        // Tr`) into an acyclic graph — `cyclic_subgraph` then reported NO participants at all, and
-        // an engine fed that answer left the module un-decycled.
-        let head = local_participant_head(&pt.bounded_ty, participants);
-        if let Some(head) = &head {
-            out.push((head.clone(), EdgeKind::Direct));
-        }
-        // `nested_participants` walks the whole type, head included; the head already has its
-        // `Direct` edge, so it must not also be reported as reached-from-inside.
-        out.extend(
-            nested_participants(&pt.bounded_ty, participants)
-                .into_iter()
-                .filter(|t| head.as_ref() != Some(t))
-                .map(|t| (t, EdgeKind::Peeled)),
-        );
+        // the search: `Wrap<Stmt>: Tr` — where `Wrap` implements the trait as well — is an edge to
+        // `Wrap` *and* to `Stmt`. Treating the two as alternatives dropped the nested endpoints of
+        // any bound wrapped in a participating container, which is enough to turn a fully cyclic
+        // module (`Expr: Tr <= Wrap<Stmt>: Tr <= Stmt: Tr <= Wrap<Expr>: Tr`) into an acyclic graph
+        // — `cyclic_subgraph` then reported NO participants at all, and an engine fed that answer
+        // left the module un-decycled.
+        out.extend(nested_participants(&pt.bounded_ty, participants));
     }
     out
 }
 
-/// The participant `ty`'s head names — but only when its path can actually *denote* one: a bare
-/// ident, or its no-op `self::`-qualified form (`crate::names::bare_ident`). `None` for a non-path
-/// type (`&Stmt`, `(A, B)`) or a `<T as Tr>::X` qself.
+/// Participant idents appearing anywhere inside `ty`, its head included, outermost first, without
+/// repeats — each only where its path can actually *denote* one: a bare ident, or its no-op
+/// `self::`-qualified form (`crate::names::bare_ident`).
 ///
 /// A path rooted anywhere else (`crate::other::Stmt`, `super::Stmt`, `::dep::Stmt`) reaches a
 /// DIFFERENT item that merely shares its last segment with a participant, so a bound on it is an
 /// ordinary outer premise and no edge at all. This is the rule the engine already applies when it
-/// decides what a bound may be peeled to (`ranked::peel::cycle_types_within`) and when a
-/// graph-supplied participant set is spelled back onto the impls (`ranked::contract`); matching the
-/// last segment instead made `impl Tr for Expr where ::other::Stmt: Tr` report a cycle
-/// `{Expr, Stmt}` over the LOCAL `Stmt` that no engine would ever break.
+/// decides what a bound may be peeled to (`ranked::peel::cycle_types_within`); matching the last
+/// segment instead made `impl Tr for Expr where ::other::Stmt: Tr` report a cycle `{Expr, Stmt}`
+/// over the LOCAL `Stmt` that no engine would ever break. A foreign wrapper still has its
+/// arguments visited: `crate::other::Wrap<Stmt>` reaches the local `Stmt`.
 ///
-/// The returned ident is cloned from the source, never rebuilt, so a raw identifier survives.
-fn local_participant_head(ty: &Type, participants: &HashSet<Ident>) -> Option<Ident> {
-    crate::names::local_type_head_ident(ty).filter(|head| participants.contains(head))
-}
-
-/// Participant idents appearing anywhere inside `ty`, outermost first, without repeats. A foreign
-/// wrapper still has its arguments visited: `crate::other::Wrap<Stmt>` reaches the local `Stmt`.
+/// The returned idents are cloned from the source, never rebuilt, so a raw identifier survives.
 fn nested_participants(ty: &Type, participants: &HashSet<Ident>) -> Vec<Ident> {
     let mut seen: HashSet<String> = HashSet::new();
     crate::names::bare_named_in(ty, &|i| participants.contains(i))
@@ -276,7 +239,7 @@ fn nested_participants(ty: &Type, participants: &HashSet<Ident>) -> Vec<Ident> {
 /// when it has a self-edge. A lone node with no self-edge is not recursive, however many other nodes
 /// point at it.
 ///
-pub(crate) fn cyclic_subgraph(graph: &VecGraph<Ident, EdgeKind>) -> VecGraph<Ident, EdgeKind> {
+pub(crate) fn cyclic_subgraph(graph: &VecGraph<Ident, ()>) -> VecGraph<Ident, ()> {
     // Keyed by node position rather than by name, so a caller-built graph with two same-named
     // nodes keeps them distinct throughout.
     let (nodes, edges) = crate::graph::decompose(graph);
@@ -298,7 +261,7 @@ pub(crate) fn cyclic_subgraph(graph: &VecGraph<Ident, EdgeKind>) -> VecGraph<Ide
         .map(|(_, n)| n);
     let edges = edges
         .into_iter()
-        .filter_map(|(a, b, kind)| Some((*remap.get(&a)?, *remap.get(&b)?, kind)));
+        .filter_map(|(a, b, ())| Some((*remap.get(&a)?, *remap.get(&b)?, ())));
     crate::graph::compose(nodes, edges)
 }
 

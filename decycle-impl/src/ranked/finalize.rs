@@ -848,80 +848,26 @@ impl syn::visit_mut::VisitMut for SelfSubst<'_> {
     }
 }
 
-/// Gives every elided lifetime (`&T`, `'_`) a fresh name. Fn-pointer types and free fns
-/// have no `self` elision rule, so the re-entry fn / floor alias signatures must be fully
-/// named before output elision can be resolved against the receiver.
-struct LtNamer {
-    fresh: Vec<Lifetime>,
-    counter: usize,
-}
-
-impl LtNamer {
-    fn fresh_lt(&mut self) -> Lifetime {
-        let lt = Lifetime::new(&format!("'__dcl{}", self.counter), Span::call_site());
-        self.counter += 1;
-        self.fresh.push(lt.clone());
-        lt
-    }
-}
-
-impl syn::visit_mut::VisitMut for LtNamer {
-    fn visit_type_reference_mut(&mut self, tr: &mut TypeReference) {
-        match &tr.lifetime {
-            None => tr.lifetime = Some(self.fresh_lt()),
-            Some(l) if l.ident == "_" => tr.lifetime = Some(self.fresh_lt()),
-            _ => {}
-        }
-        self.visit_type_mut(&mut tr.elem);
-    }
-
-    fn visit_lifetime_mut(&mut self, l: &mut Lifetime) {
-        if l.ident == "_" {
-            *l = self.fresh_lt();
-        }
-    }
-}
-
-fn count_elided_lifetimes(ty: &Type) -> usize {
-    struct Counter(usize);
-    impl<'ast> syn::visit::Visit<'ast> for Counter {
-        fn visit_type_reference(&mut self, tr: &'ast TypeReference) {
-            match &tr.lifetime {
-                None => self.0 += 1,
-                Some(l) if l.ident == "_" => self.0 += 1,
-                _ => {}
-            }
-            self.visit_type(&tr.elem);
-        }
-        fn visit_lifetime(&mut self, l: &'ast Lifetime) {
-            if l.ident == "_" {
-                self.0 += 1;
-            }
-        }
-    }
-    let mut c = Counter(0);
-    syn::visit::Visit::visit_type(&mut c, ty);
-    c.0
-}
-
-fn subst_elided_lifetimes(ty: &mut Type, subst: &Lifetime) {
-    struct Subst(Lifetime);
-    impl syn::visit_mut::VisitMut for Subst {
+/// Give every elided lifetime in `ty` (`&T`, `'_`) the lifetime `next` returns. Fn-pointer types
+/// and free fns have no `self` elision rule, so the re-entry fn / floor alias signatures must be
+/// fully named before output elision can be resolved against the receiver.
+fn fill_elided_lifetimes(ty: &mut Type, next: &mut dyn FnMut() -> Lifetime) {
+    struct Fill<'a>(&'a mut dyn FnMut() -> Lifetime);
+    impl syn::visit_mut::VisitMut for Fill<'_> {
         fn visit_type_reference_mut(&mut self, tr: &mut TypeReference) {
-            match &tr.lifetime {
-                None => tr.lifetime = Some(self.0.clone()),
-                Some(l) if l.ident == "_" => tr.lifetime = Some(self.0.clone()),
-                _ => {}
+            if tr.lifetime.as_ref().map_or(true, |l| l.ident == "_") {
+                tr.lifetime = Some((self.0)());
             }
             self.visit_type_mut(&mut tr.elem);
         }
+
         fn visit_lifetime_mut(&mut self, l: &mut Lifetime) {
             if l.ident == "_" {
-                *l = self.0.clone();
+                *l = (self.0)();
             }
         }
     }
-    syn::visit_mut::VisitMut::visit_type_mut(&mut Subst(subst.clone()), ty);
+    syn::visit_mut::VisitMut::visit_type_mut(&mut Fill(next), ty);
 }
 
 fn distinct_lifetimes_in(tys: impl Iterator<Item = Type>) -> Vec<Lifetime> {
@@ -1877,58 +1823,56 @@ fn normalize_reentry_sig(tf: &TraitItemFn, s_ty: &Type, trait_path_full: &Path) 
             }
         }
     }
-    let mut namer = LtNamer {
-        fresh: Vec::new(),
-        counter: 0,
+    let mut self_subst = SelfSubst {
+        s_ty,
+        trait_path: trait_path_full,
     };
+    let mut fresh = Vec::new();
     for (_, ty) in params.iter_mut() {
-        syn::visit_mut::VisitMut::visit_type_mut(
-            &mut SelfSubst {
-                s_ty,
-                trait_path: trait_path_full,
-            },
-            ty,
-        );
-        syn::visit_mut::VisitMut::visit_type_mut(&mut namer, ty);
+        syn::visit_mut::VisitMut::visit_type_mut(&mut self_subst, ty);
+        fill_elided_lifetimes(ty, &mut || {
+            let lt = Lifetime::new(&format!("'__dcl{}", fresh.len()), Span::call_site());
+            fresh.push(lt.clone());
+            lt
+        });
     }
     let mut output_ty: Option<Type> = match &sig.output {
         ReturnType::Type(_, t) => Some((**t).clone()),
         ReturnType::Default => None,
     };
     if let Some(t) = output_ty.as_mut() {
-        syn::visit_mut::VisitMut::visit_type_mut(
-            &mut SelfSubst {
-                s_ty,
-                trait_path: trait_path_full,
-            },
-            t,
-        );
-        if count_elided_lifetimes(t) > 0 {
-            let subst = if let Some(ix) = recv_ref_slot {
-                match &params[ix].1 {
-                    Type::Reference(tr) => tr.lifetime.clone().unwrap(),
-                    _ => unreachable!("reference receiver flattens to a reference type"),
-                }
-            } else {
-                let named = distinct_lifetimes_in(params.iter().map(|(_, t)| t.clone()));
-                if named.len() == 1 {
-                    named.into_iter().next().unwrap()
-                } else {
-                    abort!(
-                        orig_sig,
-                        "cannot resolve the elided output lifetime for #[decycle] unbounded \
-                         re-entry; name the lifetime explicitly"
-                    )
-                }
-            };
-            subst_elided_lifetimes(t, &subst);
-        }
+        syn::visit_mut::VisitMut::visit_type_mut(&mut self_subst, t);
+        // The output's elided lifetimes are the reference receiver's, or else the one lifetime the
+        // parameters name (resolved only when the output elides one).
+        let mut resolved: Option<Lifetime> = None;
+        fill_elided_lifetimes(t, &mut || {
+            resolved
+                .get_or_insert_with(|| match recv_ref_slot {
+                    Some(ix) => match &params[ix].1 {
+                        Type::Reference(tr) => tr.lifetime.clone().unwrap(),
+                        _ => unreachable!("reference receiver flattens to a reference type"),
+                    },
+                    None => {
+                        let named = distinct_lifetimes_in(params.iter().map(|(_, t)| t.clone()));
+                        if named.len() == 1 {
+                            named.into_iter().next().unwrap()
+                        } else {
+                            abort!(
+                                orig_sig,
+                                "cannot resolve the elided output lifetime for #[decycle] \
+                                 unbounded re-entry; name the lifetime explicitly"
+                            )
+                        }
+                    }
+                })
+                .clone()
+        });
     }
     NormSig {
         params,
         arg_idents,
         output_ty,
-        fresh: namer.fresh,
+        fresh,
         sig,
     }
 }

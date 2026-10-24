@@ -187,7 +187,8 @@ fn expand(
     }
 
     let mut replaced_impls: HashSet<(String, String)> = HashSet::new();
-    let mut cycle_adts: HashSet<String> = HashSet::new();
+    // Ordered, so the terminators below are emitted in a stable order.
+    let mut cycle_adts: BTreeSet<String> = BTreeSet::new();
     for scc in &sccs {
         for (ty, tr) in &scc.pairs {
             replaced_impls.insert((ty.clone(), tr.clone()));
@@ -230,24 +231,19 @@ fn expand(
     // Re-emit every item (the `__MTerm` is `#[repr(transparent)]`, so the natural types need no repr
     // change), skipping impls that are replaced by generated ones.
     for it in &items {
-        match it {
-            Item::Impl(im) => {
-                if let (Some(key), Some(self_id)) = (impl_trait_key(im), impl_self_ident(im)) {
-                    if replaced_impls.contains(&(self_id.to_string(), key)) {
-                        continue;
-                    }
+        if let Item::Impl(im) = it {
+            if let (Some(key), Some(self_id)) = (impl_trait_key(im), impl_self_ident(im)) {
+                if replaced_impls.contains(&(self_id.to_string(), key)) {
+                    continue;
                 }
-                out.extend(qualify(it).to_token_stream());
             }
-            other => out.extend(qualify(other).to_token_stream()),
         }
+        out.extend(qualify(it).to_token_stream());
     }
 
     // One terminator per unique cycle member (deduped across SCCs, so a type cyclic under several
     // traits gets a single `__MTerm`).
-    let mut cycle_members: Vec<&String> = cycle_adts.iter().collect();
-    cycle_members.sort();
-    for m in cycle_members {
+    for m in &cycle_adts {
         let adt = model
             .adts
             .get(m)

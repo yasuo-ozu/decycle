@@ -5,6 +5,7 @@ use super::*;
 use crate::generics_fmt::{params_decl, params_use, wrap_angle, DeclBounds};
 // See through `(T)` and invisible groups, so the shape checks below match on the real type.
 use crate::names::strip_parens;
+use syn::punctuated::Punctuated;
 
 /// An expression that reinterprets the receiver `self` into `target`-space (a same-layout type).
 /// `&self`/`&mut self` use a pointer cast; any other receiver — owned `self`, or a custom type such as
@@ -388,8 +389,8 @@ fn canon_self_args(args: &mut PathArguments, decl_args: &PathArguments, self_ty:
 
 /// [`canon_self`] through the trait bounds of a `dyn`/`impl Trait` type (bounds matched by position).
 fn canon_self_bounds(
-    bounds: &mut syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
-    decl: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
+    bounds: &mut Punctuated<syn::TypeParamBound, syn::Token![+]>,
+    decl: &Punctuated<syn::TypeParamBound, syn::Token![+]>,
     self_ty: &Type,
 ) {
     if bounds.len() != decl.len() {
@@ -500,7 +501,7 @@ fn reject_self_mentioning_method_bounds(sig: &syn::Signature, ctx: &ProjCtx) -> 
 /// bound would not compile on both sides either way, and this keeps the *bound* diagnostic — which
 /// names the real problem — rather than the projection one).
 fn bounds_mention_self_resolved(
-    bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
+    bounds: &Punctuated<syn::TypeParamBound, syn::Token![+]>,
     ctx: &ProjCtx,
 ) -> bool {
     if !bounds_mention_self(bounds) {
@@ -1048,9 +1049,7 @@ fn args_mention_self(args: &PathArguments) -> bool {
     }
 }
 
-fn bounds_mention_self(
-    bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
-) -> bool {
+fn bounds_mention_self(bounds: &Punctuated<syn::TypeParamBound, syn::Token![+]>) -> bool {
     bounds.iter().any(|b| match b {
         syn::TypeParamBound::Trait(tb) => tb
             .path
@@ -1287,7 +1286,7 @@ fn normalize_in_args(args: &mut PathArguments, ctx: &ProjCtx, depth: u8) -> syn:
 }
 
 fn normalize_in_bounds(
-    bounds: &mut syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
+    bounds: &mut Punctuated<syn::TypeParamBound, syn::Token![+]>,
     ctx: &ProjCtx,
     depth: u8,
 ) -> syn::Result<()> {
@@ -1387,15 +1386,12 @@ fn reduce_generics(
     model: &Model,
 ) -> (syn::Generics, syn::Generics, Vec<StrippedWrapped>) {
     let adt_names: HashSet<String> = model.adts.keys().cloned().collect();
-    let member_set: HashSet<String> = scc.types().into_iter().collect();
+    let member_set = scc.types();
     let mut reduced = generics.clone();
     let mut local = generics.clone();
     let mut wrapped = Vec::new();
 
-    let mut reduced_preds: syn::punctuated::Punctuated<WherePredicate, syn::Token![,]> =
-        syn::punctuated::Punctuated::new();
-    let mut local_preds: syn::punctuated::Punctuated<WherePredicate, syn::Token![,]> =
-        syn::punctuated::Punctuated::new();
+    let (mut reduced_preds, mut local_preds) = (Punctuated::new(), Punctuated::new());
 
     for pred in generics.where_clause.iter().flat_map(|w| &w.predicates) {
         let WherePredicate::Type(pt) = pred else {
@@ -1408,12 +1404,8 @@ fn reduce_generics(
         // `where Box<Self>: Tr`) is detected, classified, and re-emitted exactly like `where A: Tr`:
         // the SCC graph and the forwarding assertion key on the concrete ADT, which `Self` alone
         // never matches. A bound with no `Self` is unchanged.
-        let pt_owned = {
-            let mut p = pt.clone();
-            p.bounded_ty = subst_self(&p.bounded_ty, self_ty);
-            p
-        };
-        let pt = &pt_owned;
+        let mut pt = pt.clone();
+        pt.bounded_ty = subst_self(&pt.bounded_ty, self_ty);
         let refs = local_refs(&pt.bounded_ty, &adt_names);
         // Split THIS predicate's bounds: a *cyclic* bound is a trait `TrB` where a referenced type
         // `B` makes `(B, TrB)` a member of THIS SCC (possibly a different trait — that is what breaks
@@ -1421,8 +1413,7 @@ fn reduce_generics(
         // same predicate (`Clone` in `Expr: Eval + Clone`) must SURVIVE onto the reduced impls, else
         // valid input fails to compile.
         let mut cyclic_paths: Vec<syn::Path> = Vec::new();
-        let mut noncyclic: syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]> =
-            syn::punctuated::Punctuated::new();
+        let mut noncyclic: Punctuated<syn::TypeParamBound, syn::Token![+]> = Punctuated::new();
         for b in &pt.bounds {
             let is_cyclic_bound = matches!(b,
                 syn::TypeParamBound::Trait(tb) if trait_key(&tb.path)
@@ -1437,7 +1428,7 @@ fn reduce_generics(
         if cyclic_paths.is_empty() {
             // no cyclic bound: keep the whole (Self-resolved) predicate in both.
             reduced_preds.push(WherePredicate::Type(pt.clone()));
-            local_preds.push(WherePredicate::Type(pt.clone()));
+            local_preds.push(WherePredicate::Type(pt));
             continue;
         }
         // The surviving (non-cyclic) bounds rebuilt as their own predicate, if any remain.
@@ -1466,7 +1457,7 @@ fn reduce_generics(
             if let Some(s) = survivor {
                 reduced_preds.push(s);
             }
-            local_preds.push(WherePredicate::Type(pt.clone()));
+            local_preds.push(WherePredicate::Type(pt));
         }
     }
 
@@ -1475,10 +1466,7 @@ fn reduce_generics(
     (reduced, local, wrapped)
 }
 
-fn finish_where(
-    g: &mut syn::Generics,
-    preds: syn::punctuated::Punctuated<WherePredicate, syn::Token![,]>,
-) {
+fn finish_where(g: &mut syn::Generics, preds: Punctuated<WherePredicate, syn::Token![,]>) {
     if preds.is_empty() {
         g.where_clause = None;
     } else if let Some(wc) = &mut g.where_clause {
@@ -1567,7 +1555,7 @@ fn emit_forwarding_assertion(
     scc: &Scc,
     reduced: &syn::Generics,
 ) -> TokenStream {
-    let member_set: HashSet<String> = scc.types().into_iter().collect();
+    let member_set = scc.types();
     let generalized = generalize_members(&sw.container, &member_set);
     let trait_path = &sw.trait_path;
 

@@ -20,14 +20,8 @@ impl Scc {
         self.pairs.iter().any(|(t, k)| t == ty && k == tr)
     }
     /// The distinct cycle-member type idents (each gets one terminator).
-    pub fn types(&self) -> Vec<String> {
-        let mut v: Vec<String> = Vec::new();
-        for (t, _) in &self.pairs {
-            if !v.contains(t) {
-                v.push(t.clone());
-            }
-        }
-        v
+    pub fn types(&self) -> HashSet<String> {
+        self.pairs.iter().map(|(t, _)| t.clone()).collect()
     }
 }
 

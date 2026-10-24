@@ -215,7 +215,7 @@ fn remove_cyclic_bounds(
     let param_idents = crate::names::type_param_idents(generics);
     let self_heads = cycle_self_heads(replacing_table);
     let mut g = generics.clone();
-    replace_constraints(&mut g, |ty, trait_path| {
+    retain_trait_bounds(&mut g, |ty, trait_path| {
         // How the trait is SPELLED decides whether this is a cyclic reference at all — matching the
         // convention every other matcher here already uses (`TraitReplacer`, `cyclic_where_bounds`,
         // `impl_has_bare_param_cyclic_bound`, `validate_impl_where_bounds` are all single-segment).
@@ -231,12 +231,12 @@ fn remove_cyclic_bounds(
         // A `super::`-rooted spelling must still be stripped whatever its target: these impls are
         // re-emitted at other module depths, where that prefix no longer denotes the same item.
         let names_cyclic_trait =
-            last_names_cyclic && crate::helper::path_is_depth_fragile(&trait_path);
-        let bare_names_cyclic = crate::names::bare_ident(&trait_path)
+            last_names_cyclic && crate::helper::path_is_depth_fragile(trait_path);
+        let bare_names_cyclic = crate::names::bare_ident(trait_path)
             .is_some_and(|ident| replacing_table.contains_key(ident));
-        let is_bareparam_target = matches!(&ty, Type::Path(TypePath { qself: None, path })
+        let is_bareparam_target = matches!(ty, Type::Path(TypePath { qself: None, path })
             if path.segments.len() == 1 && param_idents.contains(&path.segments[0].ident));
-        let is_self_target = matches!(&ty, Type::Path(TypePath { qself: None, path })
+        let is_self_target = matches!(ty, Type::Path(TypePath { qself: None, path })
             if path.is_ident("Self"));
         // Targets the ranked chain can descend: a cycle self type, `Self`, or a bare impl param.
         //
@@ -253,8 +253,8 @@ fn remove_cyclic_bounds(
         // names a member by its bare name without being headed by one, is an edge too (`wrapper`).
         let target_is_participant = is_self_target
             || is_bareparam_target
-            || crate::helper::type_head_ident(&ty).is_some_and(|h| self_heads.contains(&h))
-            || crate::names::names_bare(&ty, &self_heads);
+            || crate::helper::type_head_ident(ty).is_some_and(|h| self_heads.contains(&h))
+            || crate::names::names_bare(ty, &self_heads);
         // Cyclic iff: a depth-fragile spelling (always), or a BARE spelling whose target the ranked
         // chain can actually descend. A crate-rooted or absolute path is never cyclic — that is the
         // opt-out, and it is what lets a leaf premise on a bare type parameter survive, which no
@@ -263,7 +263,7 @@ fn remove_cyclic_bounds(
         let is_cyclic_bound = names_cyclic_trait || (bare_names_cyclic && target_is_participant);
         let is_bareparam = keep_bareparam && is_bareparam_target;
         // keep iff not a cyclic bound, OR it is a bare-param cyclic bound we deliberately retain
-        (!is_cyclic_bound || is_bareparam).then_some((ty, trait_path))
+        !is_cyclic_bound || is_bareparam
     });
     g
 }
@@ -3151,106 +3151,57 @@ fn initial_rank(recurse_level: usize) -> Type {
     rank
 }
 
-fn replace_constraints(
-    generics: &mut Generics,
-    mut f: impl FnMut(Type, Path) -> Option<(Type, Path)>,
-) {
+/// Drop the plain trait bounds (`T: Tr`, not `?Sized`) of `generics` that `keep` rejects, given the
+/// bounded type and the trait's path: of the type parameters (`impl<T: Tr>`) and of the
+/// `where`-predicates, a predicate left with no bound going too. The bounds and the `where`-clause
+/// are rebuilt (with a default `where` token), the bounds of a parameter left with none losing its
+/// colon.
+fn retain_trait_bounds(generics: &mut Generics, mut keep: impl FnMut(&Type, &Path) -> bool) {
+    let mut keep_bound = |ty: &Type, bound: &TypeParamBound| match bound {
+        TypeParamBound::Trait(TraitBound {
+            modifier: TraitBoundModifier::None,
+            path,
+            ..
+        }) => keep(ty, path),
+        _ => true,
+    };
+    for param in &mut generics.params {
+        if let GenericParam::Type(tp) = param {
+            let ty = Type::Path(TypePath {
+                qself: None,
+                path: tp.ident.clone().into(),
+            });
+            tp.bounds = std::mem::take(&mut tp.bounds)
+                .into_iter()
+                .filter(|b| keep_bound(&ty, b))
+                .collect();
+            if tp.bounds.is_empty() {
+                tp.colon_token = None;
+            }
+        }
+    }
     let mut where_clause = WhereClause {
         where_token: Default::default(),
         predicates: Punctuated::new(),
     };
-    let mut where_predicates_to_add = Vec::new();
-    let mut process_type_param_bound =
-        |param_type: &Type, bound: TypeParamBound| -> Option<TypeParamBound> {
-            match bound {
-                TypeParamBound::Trait(TraitBound {
-                    paren_token,
-                    modifier: TraitBoundModifier::None,
-                    lifetimes,
-                    path,
-                }) => {
-                    if let Some((new_ty, new_path)) = f(param_type.clone(), path.clone()) {
-                        if new_ty == *param_type {
-                            Some(TypeParamBound::Trait(TraitBound {
-                                paren_token,
-                                modifier: TraitBoundModifier::None,
-                                lifetimes,
-                                path,
-                            }))
-                        } else {
-                            where_predicates_to_add.push(WherePredicate::Type(PredicateType {
-                                lifetimes: None,
-                                bounded_ty: new_ty,
-                                colon_token: Default::default(),
-                                bounds: std::iter::once(TypeParamBound::Trait(TraitBound {
-                                    paren_token: None,
-                                    modifier: TraitBoundModifier::None,
-                                    lifetimes: None,
-                                    path: new_path,
-                                }))
-                                .collect(),
-                            }));
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                }
-                bound => Some(bound),
-            }
-        };
-    for param in &mut generics.params {
-        if let GenericParam::Type(ref mut type_param) = param {
-            let param_type = Type::Path(TypePath {
-                qself: None,
-                path: type_param.ident.clone().into(),
-            });
-
-            type_param.bounds = std::mem::take(&mut type_param.bounds)
-                .into_iter()
-                .filter_map(|bound| process_type_param_bound(&param_type, bound))
-                .collect();
-
-            if type_param.bounds.is_empty() {
-                type_param.colon_token = None;
-            }
-        }
-    }
-
     for pred in std::mem::take(&mut generics.where_clause)
         .map(|wc| wc.predicates)
         .into_iter()
         .flatten()
     {
         match pred {
-            WherePredicate::Type(PredicateType {
-                lifetimes,
-                bounded_ty,
-                colon_token,
-                mut bounds,
-            }) => {
-                bounds = bounds
+            WherePredicate::Type(mut pt) => {
+                pt.bounds = std::mem::take(&mut pt.bounds)
                     .into_iter()
-                    .filter_map(|bound| process_type_param_bound(&bounded_ty, bound))
+                    .filter(|b| keep_bound(&pt.bounded_ty, b))
                     .collect();
-
-                if !bounds.is_empty() {
-                    where_clause
-                        .predicates
-                        .push(WherePredicate::Type(PredicateType {
-                            lifetimes,
-                            bounded_ty,
-                            colon_token,
-                            bounds,
-                        }));
+                if !pt.bounds.is_empty() {
+                    where_clause.predicates.push(WherePredicate::Type(pt));
                 }
             }
-            o => where_clause.predicates.push(o),
+            other => where_clause.predicates.push(other),
         }
     }
-
-    where_clause.predicates.extend(where_predicates_to_add);
-
     generics.where_clause = (!where_clause.predicates.is_empty()).then_some(where_clause);
 }
 

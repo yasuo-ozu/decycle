@@ -210,7 +210,12 @@ fn by_value_generic_args(sig: &Signature) -> Vec<(usize, Option<Ident>)> {
 /// Only projections are peeled. A call, macro, or struct literal is not a projection — its result is a
 /// fresh value whose type need not involve the parameter at all — so those return `None`. This is the
 /// strict form, used on the flagged *argument*: `recurse(&mut make_buffer(), ..)` must not be flagged.
-fn root_ident(mut e: &Expr) -> Option<&Ident> {
+///
+/// With `derived`, a **method-call receiver** and `.await` are peeled too — the "derived from"
+/// relation rather than the "same place as" one. That is used only to propagate taint along `let`
+/// chains, where `let s = src.into_src();` is the spelling that matters; the looser relation would
+/// be wrong on the flagged argument.
+fn root_ident(mut e: &Expr, derived: bool) -> Option<&Ident> {
     loop {
         e = match e {
             Expr::Path(p) if p.qself.is_none() && p.path.segments.len() == 1 => {
@@ -222,30 +227,8 @@ fn root_ident(mut e: &Expr) -> Option<&Ident> {
             Expr::Index(x) => &x.expr,
             Expr::Reference(x) => &x.expr,
             Expr::Try(x) => &x.expr,
-            Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => &u.expr,
-            _ => return None,
-        };
-    }
-}
-
-/// [`root_ident`], but also peeling a **method-call receiver**, `?` and `.await` — the "derived from"
-/// relation rather than the "same place as" one. Used only to propagate taint along `let` chains,
-/// where `let s = src.into_src();` is the spelling that matters. Kept separate from [`root_ident`]
-/// because the looser relation would be wrong on the flagged argument.
-fn taint_root(mut e: &Expr) -> Option<&Ident> {
-    loop {
-        e = match e {
-            Expr::Path(p) if p.qself.is_none() && p.path.segments.len() == 1 => {
-                return Some(&p.path.segments[0].ident)
-            }
-            Expr::Paren(x) => &x.expr,
-            Expr::Group(x) => &x.expr,
-            Expr::Field(x) => &x.base,
-            Expr::Index(x) => &x.expr,
-            Expr::Reference(x) => &x.expr,
-            Expr::Try(x) => &x.expr,
-            Expr::MethodCall(x) => &x.receiver,
-            Expr::Await(x) => &x.base,
+            Expr::MethodCall(x) if derived => &x.receiver,
+            Expr::Await(x) if derived => &x.base,
             Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => &u.expr,
             _ => return None,
         };
@@ -326,7 +309,7 @@ fn collect_lets(
                     // An annotation that names no method generic states a fixed type: opt out.
                     let annotated_fixed = ann.is_some_and(|t| !mentions_any(t, self.generics));
                     if !annotated_fixed
-                        && taint_root(&init.expr)
+                        && root_ident(&init.expr, true)
                             .is_some_and(|r| self.taint.contains(&r.to_string()))
                     {
                         self.taint.insert(name.to_string());
@@ -386,7 +369,7 @@ fn check_method(sig: &Signature, block: &syn::Block, callees: &Callees) -> syn::
                 // Only a reference GROWS. Passing the value on unchanged keeps the same `S` and
                 // terminates, which is the whole point of a by-value generic being legal here.
                 let Expr::Reference(r) = a else { continue };
-                let Some(root) = root_ident(&r.expr) else {
+                let Some(root) = root_ident(&r.expr, false) else {
                     continue;
                 };
                 if self.taint.contains(&root.to_string()) && self.found.is_none() {
@@ -432,7 +415,7 @@ fn check_method(sig: &Signature, block: &syn::Block, callees: &Callees) -> syn::
         /// Is this method call's receiver one the cycle's own trait method can be reached through —
         /// `self` (or a projection of it), or a cycle member named outright (`B.eval(..)`)?
         fn receiver_reaches_cycle(&self, receiver: &Expr) -> bool {
-            root_ident(receiver)
+            root_ident(receiver, false)
                 .is_some_and(|id| id == "self" || self.callees.members.contains(&id.to_string()))
         }
     }

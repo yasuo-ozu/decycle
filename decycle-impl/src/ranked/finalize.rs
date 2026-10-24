@@ -374,46 +374,15 @@ fn requalify_foreign_premises(generics: &mut Generics, replacing_table: &Table) 
 /// the literal `Self` keyword (E0411 — "cannot find type `Self` in this scope").
 fn subst_bare_self_in_generics(generics: &Generics, self_ty: &Type) -> Generics {
     let mut g = generics.clone();
-    syn::visit_mut::VisitMut::visit_generics_mut(&mut BareSelfSubst::new(self_ty), &mut g);
+    syn::visit_mut::VisitMut::visit_generics_mut(&mut SelfSubst::bare(self_ty), &mut g);
     g
-}
-
-struct BareSelfSubst<'a> {
-    self_ty: &'a Type,
-    /// Leave a receiver's type (`self: Box<Self>`) as written ([`replace_self`]).
-    skip_receivers: bool,
-}
-impl<'a> BareSelfSubst<'a> {
-    fn new(self_ty: &'a Type) -> Self {
-        BareSelfSubst {
-            self_ty,
-            skip_receivers: false,
-        }
-    }
-}
-impl syn::visit_mut::VisitMut for BareSelfSubst<'_> {
-    fn visit_receiver_mut(&mut self, receiver: &mut Receiver) {
-        if !self.skip_receivers {
-            syn::visit_mut::visit_receiver_mut(self, receiver);
-        }
-    }
-
-    fn visit_type_mut(&mut self, ty: &mut Type) {
-        if let Type::Path(TypePath { qself: None, path }) = ty {
-            if path.is_ident("Self") {
-                *ty = self.self_ty.clone();
-                return;
-            }
-        }
-        syn::visit_mut::visit_type_mut(self, ty);
-    }
 }
 
 /// [`subst_bare_self_in_generics`] for a single type: every bare `Self` occurrence anywhere
 /// inside `ty` (`Self`, `Vec<Self>`, `(Self, u8)`) becomes `self_ty`.
 fn subst_bare_self_in_type(ty: &Type, self_ty: &Type) -> Type {
     let mut t = ty.clone();
-    syn::visit_mut::VisitMut::visit_type_mut(&mut BareSelfSubst::new(self_ty), &mut t);
+    syn::visit_mut::VisitMut::visit_type_mut(&mut SelfSubst::bare(self_ty), &mut t);
     t
 }
 
@@ -671,9 +640,9 @@ fn emit_impl_items_delegate(
 /// Every bare `Self` in `sig` replaced by `base_self_ty`, except in the receiver, which keeps its
 /// `Self` (`self: Box<Self>`).
 fn replace_self(sig: &mut Signature, base_self_ty: &Type) {
-    let mut replacer = BareSelfSubst {
-        self_ty: base_self_ty,
+    let mut replacer = SelfSubst {
         skip_receivers: true,
+        ..SelfSubst::bare(base_self_ty)
     };
     syn::visit_mut::VisitMut::visit_signature_mut(&mut replacer, sig);
 }
@@ -786,43 +755,53 @@ fn process_trait_item_for_ranked(item: &TraitItem) -> TraitItem {
     item
 }
 
-/// Replaces `Self` with a concrete type in a type tree, including `Self::Assoc`
-/// projections (which become `<S as Trait<...>>::Assoc` — a bare `S::Assoc` would not
-/// resolve on a generic `S`).
+/// Replaces `Self` with a concrete type in a type tree. With a `trait_path`, also a `Self::Assoc`
+/// projection, which becomes `<S as Trait<...>>::Assoc` (a bare `S::Assoc` would not resolve on a
+/// generic `S`); without one, it substitutes only a bare `Self` (`Self`, `Vec<Self>`).
 struct SelfSubst<'a> {
     s_ty: &'a Type,
-    trait_path: &'a Path,
+    trait_path: Option<&'a Path>,
+    /// Leave a receiver's type (`self: Box<Self>`) as written ([`replace_self`]).
+    skip_receivers: bool,
+}
+
+impl<'a> SelfSubst<'a> {
+    fn new(s_ty: &'a Type, trait_path: &'a Path) -> Self {
+        SelfSubst {
+            trait_path: Some(trait_path),
+            ..SelfSubst::bare(s_ty)
+        }
+    }
+
+    fn bare(s_ty: &'a Type) -> Self {
+        SelfSubst {
+            s_ty,
+            trait_path: None,
+            skip_receivers: false,
+        }
+    }
 }
 
 impl syn::visit_mut::VisitMut for SelfSubst<'_> {
+    fn visit_receiver_mut(&mut self, receiver: &mut Receiver) {
+        if !self.skip_receivers {
+            syn::visit_mut::visit_receiver_mut(self, receiver);
+        }
+    }
+
     fn visit_type_mut(&mut self, ty: &mut Type) {
         if let Type::Path(TypePath { qself: None, path }) = ty {
             if path.is_ident("Self") {
                 *ty = self.s_ty.clone();
                 return;
             }
-            if path.leading_colon.is_none()
-                && path.segments.len() > 1
-                && path.segments[0].ident == "Self"
-            {
-                let mut segments: Punctuated<PathSegment, Token![::]> =
-                    self.trait_path.segments.clone();
-                for seg in path.segments.iter().skip(1) {
-                    segments.push(seg.clone());
-                }
-                *ty = Type::Path(TypePath {
-                    qself: Some(QSelf {
-                        lt_token: Default::default(),
-                        ty: Box::new(self.s_ty.clone()),
-                        position: self.trait_path.segments.len(),
-                        as_token: Some(Default::default()),
-                        gt_token: Default::default(),
-                    }),
-                    path: Path {
-                        leading_colon: self.trait_path.leading_colon,
-                        segments,
-                    },
-                });
+            if let Some(trait_path) = self.trait_path.filter(|_| {
+                path.leading_colon.is_none()
+                    && path.segments.len() > 1
+                    && path.segments[0].ident == "Self"
+            }) {
+                let rest = path.segments.iter().skip(1);
+                *ty = parse_quote!(<#{self.s_ty} as #trait_path> #(for seg in rest) { :: #seg });
                 return;
             }
         }
@@ -1778,10 +1757,7 @@ fn normalize_reentry_sig(tf: &TraitItemFn, s_ty: &Type, trait_path_full: &Path) 
             }
         }
     }
-    let mut self_subst = SelfSubst {
-        s_ty,
-        trait_path: trait_path_full,
-    };
+    let mut self_subst = SelfSubst::new(s_ty, trait_path_full);
     let mut fresh = Vec::new();
     for (_, ty) in params.iter_mut() {
         syn::visit_mut::VisitMut::visit_type_mut(&mut self_subst, ty);
@@ -1918,10 +1894,7 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize) -> TokenStream {
         .insert(rank_loc, parse_quote!(()));
     let ranked_trait_path_leaf: Path = parse_quote!(#ranked_trait_ident #ranked_args_at_leaf);
 
-    let mut self_subst = SelfSubst {
-        s_ty: &s_ty,
-        trait_path: &trait_path_full,
-    };
+    let mut self_subst = SelfSubst::new(&s_ty, &trait_path_full);
     let mut tg = trait_.generics.clone();
     syn::visit_mut::VisitMut::visit_generics_mut(&mut self_subst, &mut tg);
     let (trait_lts, trait_tycon) = split_lifetimes(&tg.params);

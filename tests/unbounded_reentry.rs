@@ -415,8 +415,14 @@ mod fold_m {
 #[test]
 fn impl_trait_arg_multi_closure_past_floor() {
     use fold_m::Fold;
-    assert_eq!(fold_m::A.fold((|v| v + 7) as fn(usize) -> usize, 25), 25 + 7);
-    assert_eq!(fold_m::A.fold((|v| v + 1000) as fn(usize) -> usize, 25), 25 + 1000);
+    assert_eq!(
+        fold_m::A.fold((|v| v + 7) as fn(usize) -> usize, 25),
+        25 + 7
+    );
+    assert_eq!(
+        fold_m::A.fold((|v| v + 1000) as fn(usize) -> usize, 25),
+        25 + 1000
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -585,7 +591,8 @@ fn closure_instantiation_is_rejected_up_front() {
     let c_small = move |v: usize| v + small as usize;
     let got = std::panic::catch_unwind(move || fold_m::A.fold(c_small, 40));
     let msg = got.err().map(|e| {
-        e.downcast_ref::<String>().cloned()
+        e.downcast_ref::<String>()
+            .cloned()
             .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
             .unwrap_or_default()
     });
@@ -653,9 +660,12 @@ fn unsafe_and_extern_c_methods_past_floor() {
 // F-C1: heterogeneous side-bounds cycle (regression vs v0.3.0). Naming a re-entry fn's `Self:
 // T` obligation resolves through the REAL, un-ranked impls — `impl<T: Clone> Ca for A<T> where
 // B<T>: Cb` needs `B<T>: Cb`, whose only impl needs `T: Default` — so every registering frame
-// would need the UNION of the whole cycle's non-cyclic side-bounds, which isn't in scope
-// anywhere. This must now COMPILE (it did on v0.3.0 and in bounded mode); a floor crossing
-// with no prior same-instantiation registration is the clean, isolated, actionable panic.
+// needs the UNION of the whole cycle's non-cyclic side-bounds. This must COMPILE (it did on
+// v0.3.0 and in bounded mode). It also runs past the floor now: the two impls are of different
+// traits, and the premises now carried along the cycle's bounds, across traits, give `A` the
+// `T: Default` and `B` the `T: Clone`, so both register. (It used to fail closed there, with the
+// isolated "not registered" panic `tests/limitation.rs` still pins for side bounds that cannot be
+// carried.)
 // ---------------------------------------------------------------------------------------------
 
 #[decycle(recurse_level = 3)]
@@ -702,6 +712,13 @@ fn hetero_side_bounds_shallow_works() {
     use hetero_side_bounds::{Ca, Cb};
     assert_eq!(hetero_side_bounds::A(1i32).ca(2), 2);
     assert_eq!(hetero_side_bounds::B(2i32).cb(2), 2);
+}
+
+#[test]
+fn hetero_side_bounds_deep_works() {
+    use hetero_side_bounds::{Ca, Cb};
+    assert_eq!(hetero_side_bounds::A(1i32).ca(50), 50);
+    assert_eq!(hetero_side_bounds::B(2i32).cb(50), 50);
 }
 
 // ---------------------------------------------------------------------------------------------

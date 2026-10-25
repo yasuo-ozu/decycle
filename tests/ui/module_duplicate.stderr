@@ -1,0 +1,5 @@
+error: duplicate argument 'module'
+ --> tests/ui/module_duplicate.rs:3:51
+  |
+3 | #[decycle::decycle(structural, module = crate::m, module = crate::m)]
+  |                                                   ^^^^^^

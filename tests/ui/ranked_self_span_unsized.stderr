@@ -1,0 +1,66 @@
+error[E0277]: the size for values of type `str` cannot be known at compilation time
+  --> tests/ui/ranked_self_span_unsized.rs:21:31
+   |
+21 |         fn take(&self, other: Self) -> u32 {
+   |                               ^^^^ doesn't have a size known at compile-time
+   |
+   = help: the trait `Sized` is not implemented for `str`
+help: function arguments must have a statically known size, borrowed types always have a known size
+   |
+21 |         fn take(&self, other: &Self) -> u32 {
+   |                               +
+
+error[E0277]: the size for values of type `str` cannot be known at compilation time
+ --> tests/ui/ranked_self_span_unsized.rs:8:1
+  |
+8 | #[decycle]
+  | ^^^^^^^^^^ doesn't have a size known at compile-time
+  |
+  = help: the trait `Sized` is not implemented for `str`
+note: required by an implicit `Sized` bound in `__Re_Tr_take8909385c15d27adc`
+ --> tests/ui/ranked_self_span_unsized.rs:8:1
+  |
+8 | #[decycle]
+  | ^^^^^^^^^^ required by the implicit `Sized` requirement on this type parameter in `__Re_Tr_take8909385c15d27adc`
+  = note: this error originates in the attribute macro `decycle` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: consider relaxing the implicit `Sized` restriction
+  |
+8 | #[decycle]: ?Sized
+  |           ++++++++
+
+error[E0277]: the size for values of type `str` cannot be known at compilation time
+  --> tests/ui/ranked_self_span_unsized.rs:28:9
+   |
+28 |         str: Tr,
+   |         ^^^ doesn't have a size known at compile-time
+   |
+   = help: the trait `Sized` is not implemented for `str`
+note: required by an implicit `Sized` bound in `__Re_Tr_take8909385c15d27adc`
+  --> tests/ui/ranked_self_span_unsized.rs:8:1
+   |
+ 8 | #[decycle]
+   | ^^^^^^^^^^ required by the implicit `Sized` requirement on this type parameter in `__Re_Tr_take8909385c15d27adc`
+   = note: this error originates in the attribute macro `decycle` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: consider relaxing the implicit `Sized` restriction
+   |
+ 8 | #[decycle]: ?Sized
+   |           ++++++++
+
+error[E0277]: the size for values of type `str` cannot be known at compilation time
+ --> tests/ui/ranked_self_span_unsized.rs:8:1
+  |
+8 | #[decycle]
+  | ^^^^^^^^^^ doesn't have a size known at compile-time
+  |
+  = help: the trait `Sized` is not implemented for `str`
+  = note: all function arguments must have a statically known size
+  = note: this error originates in the attribute macro `decycle` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the size for values of type `str` cannot be known at compilation time
+  --> tests/ui/ranked_self_span_unsized.rs:21:24
+   |
+21 |         fn take(&self, other: Self) -> u32 {
+   |                        ^^^^^ doesn't have a size known at compile-time
+   |
+   = help: the trait `Sized` is not implemented for `str`
+   = note: all function arguments must have a statically known size

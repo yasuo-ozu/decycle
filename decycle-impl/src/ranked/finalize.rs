@@ -1,9 +1,10 @@
-use crate::generics_fmt::{param_decl, DeclBounds};
+use crate::generics_fmt::{masked, param_decl, split_lifetimes, type_const_idents, DeclBounds};
 use crate::helper::*;
+use crate::names::{trait_fns, type_has};
+use crate::unify::Subst;
 use proc_macro2::{Span, TokenStream};
 use proc_macro_error::*;
-use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::collections::{HashMap, HashSet};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::*;
@@ -22,11 +23,16 @@ macro_rules! name {
 }
 
 fn name(s: &str) -> Ident {
-    static RANDOM_SUFFIX: OnceLock<String> = OnceLock::new();
-
-    let suffix = RANDOM_SUFFIX.get_or_init(|| crate::name_suffix(crate::get_random()));
-    Ident::new(&format!("{}{}", s, suffix), Span::call_site())
+    crate::suffixed_ident(s, crate::get_random())
 }
+
+// Declared after the macros above, so that their textual scope covers it.
+#[path = "wrapper.rs"]
+pub(crate) mod wrapper;
+
+/// The `#[decycle]` traits of the module by ident: each trait, the position of its rank parameter,
+/// and the impls of it the module takes over.
+type Table = HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>;
 
 /// Rewrites single-segment trait paths that match the replacing table to their
 /// ranked equivalents. E.g., `Evaluate` → `ranked_traits::EvaluateRanked<Rank, ()>`.
@@ -43,29 +49,50 @@ struct TraitReplacer {
 }
 
 impl TraitReplacer {
+    /// The replacer to each trait of `table`'s ranked twin, spelled `#prefix TraitRanked`.
+    fn new(table: &Table, prefix: &TokenStream, rank_type: Type) -> Self {
+        let table = table
+            .iter()
+            .map(|(ident, (_, rank_loc, _))| {
+                let ranked = parse_quote!(#prefix #{name!("{}Ranked", ident)});
+                (ident.clone(), (*rank_loc, ranked))
+            })
+            .collect();
+        Self { table, rank_type }
+    }
+
+    /// The ranked path for the written trait segment `seg` (`Trait<A>` →
+    /// `ranked_traits::TraitRanked<Rank, A>`), when its trait is in the table.
+    fn ranked(&self, seg: &PathSegment) -> Option<Path> {
+        let (rank_loc, replacement) = self.table.get(&seg.ident)?;
+        let mut new_path = replacement.clone();
+        new_path.segments.last_mut().unwrap().arguments = seg.arguments.clone();
+        path_insert_type_arg(&mut new_path, *rank_loc, self.rank_type.clone());
+        Some(new_path)
+    }
+
     /// Try to rewrite a single-segment path, or a two-segment `Trait::method` value/type
     /// path, that names a trait ident in the table — either form optionally prefixed with
     /// a no-op leading `self::` (`self::Trait`, `self::Trait::method`). Returns true if a
     /// replacement was made; `path` is left untouched on a non-match (the self:: peel is
     /// only used to LOOK UP the match, never applied unless one is found).
     fn try_replace_path(&self, path: &mut Path) -> bool {
+        // `::Trait` is a path to the item itself, the opt-out: left as written.
+        if path.leading_colon.is_some() {
+            return false;
+        }
         let offset = self_offset(path);
         let rest_len = path.segments.len() - offset;
         if rest_len != 1 && rest_len != 2 {
             return false;
         }
-        let Some((rank_loc, replacement)) = self.table.get(&path.segments[offset].ident) else {
+        let Some(mut new_path) = self.ranked(&path.segments[offset]) else {
             return false;
         };
-        let orig_args =
-            std::mem::replace(&mut path.segments[offset].arguments, PathArguments::None);
-        let mut new_path = replacement.clone();
-        new_path.segments.last_mut().unwrap().arguments = orig_args;
-        path_insert_type_arg(&mut new_path, *rank_loc, self.rank_type.clone());
-        if rest_len == 2 {
-            // `Trait::method` -> `ranked_traits::TraitRanked<Rank, ...>::method`
-            new_path.segments.push(path.segments[offset + 1].clone());
-        }
+        // `Trait::method` -> `ranked_traits::TraitRanked<Rank, ...>::method`
+        new_path
+            .segments
+            .extend(path.segments.iter().skip(offset + 1).cloned());
         *path = new_path;
         true
     }
@@ -74,46 +101,34 @@ impl TraitReplacer {
     /// (also `<_ as self::Trait>::method`). The trait name appears as the first segment
     /// before the QSelf position (optionally preceded by a no-op leading `self`).
     fn try_replace_qself_path(&self, qself: &mut Option<QSelf>, path: &mut Path) -> bool {
-        if let Some(ref mut qs) = qself {
-            // A leading `self` can only be part of the "as Trait" portion when there's a
-            // segment after it still within that portion (qs.position > 1).
-            let offset = if qs.position > 1 { self_offset(path) } else { 0 };
-            // In `<_ as Trait>::method`, qself.position is 1 and path is `Trait::method`.
-            // Check if the first (post-`self::`) segment is a trait in our table.
-            if qs.position > offset && qs.position <= path.segments.len() {
-                let first_ident = &path.segments[offset].ident;
-                if let Some((rank_loc, replacement)) = self.table.get(first_ident) {
-                    let orig_args =
-                        std::mem::replace(&mut path.segments[offset].arguments, PathArguments::None);
-                    // Build the replacement: replace segments[offset] with the ranked path segments
-                    let mut new_segments: Punctuated<PathSegment, Token![::]> = Punctuated::new();
-                    for seg in &replacement.segments {
-                        new_segments.push(seg.clone());
-                    }
-                    // Apply original type args + insert rank on the last replacement segment
-                    new_segments.last_mut().unwrap().arguments = orig_args;
-                    {
-                        let last_seg = new_segments.last_mut().unwrap();
-                        let mut temp_path: Path = Path {
-                            leading_colon: None,
-                            segments: std::iter::once(last_seg.clone()).collect(),
-                        };
-                        path_insert_type_arg(&mut temp_path, *rank_loc, self.rank_type.clone());
-                        *last_seg = temp_path.segments.into_iter().next().unwrap();
-                    }
-                    // Append remaining segments after the trait (e.g., `::method`)
-                    for seg in path.segments.iter().skip(offset + 1) {
-                        new_segments.push(seg.clone());
-                    }
-                    // Update QSelf position to account for the stripped `self::` (if any)
-                    // and the replacement having more segments.
-                    qs.position = qs.position - offset - 1 + replacement.segments.len();
-                    path.segments = new_segments;
-                    return true;
-                }
-            }
+        // `<_ as ::Trait>::method` names the item itself, the opt-out: left as written.
+        let Some(qs) = qself.as_mut().filter(|_| path.leading_colon.is_none()) else {
+            return false;
+        };
+        // A leading `self` can only be part of the "as Trait" portion when there's a
+        // segment after it still within that portion (qs.position > 1).
+        let offset = if qs.position > 1 {
+            self_offset(path)
+        } else {
+            0
+        };
+        // In `<_ as Trait>::method`, qself.position is 1 and path is `Trait::method`.
+        // Check if the first (post-`self::`) segment is a trait in our table.
+        if qs.position <= offset || qs.position > path.segments.len() {
+            return false;
         }
-        false
+        let Some(mut new_path) = self.ranked(&path.segments[offset]) else {
+            return false;
+        };
+        // Update QSelf position to account for the stripped `self::` (if any) and the
+        // replacement having more segments, then append the segments after the trait
+        // (e.g., `::method`).
+        qs.position = qs.position - offset - 1 + new_path.segments.len();
+        new_path
+            .segments
+            .extend(path.segments.iter().skip(offset + 1).cloned());
+        path.segments = new_path.segments;
+        true
     }
 }
 
@@ -192,22 +207,15 @@ impl syn::visit_mut::VisitMut for TraitReplacer {
 /// `Wrap<T>: CaRanked<InitialRank>` (an extra premise, and it is the user's own declared bound).
 fn remove_cyclic_bounds(
     generics: &Generics,
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+    replacing_table: &Table,
     keep_bareparam: bool,
 ) -> Generics {
     // Needed unconditionally now: a bare-param target counts as a cycle participant either way
     // (`keep_bareparam` only decides whether such a bound is RETAINED, not whether it is cyclic).
-    let param_idents: std::collections::HashSet<Ident> = generics
-        .params
-        .iter()
-        .filter_map(|p| match p {
-            GenericParam::Type(t) => Some(t.ident.clone()),
-            _ => None,
-        })
-        .collect();
+    let param_idents = crate::names::type_param_idents(generics);
     let self_heads = cycle_self_heads(replacing_table);
     let mut g = generics.clone();
-    replace_constraints(&mut g, |ty, trait_path| {
+    retain_trait_bounds(&mut g, |ty, trait_path| {
         // How the trait is SPELLED decides whether this is a cyclic reference at all — matching the
         // convention every other matcher here already uses (`TraitReplacer`, `cyclic_where_bounds`,
         // `impl_has_bare_param_cyclic_bound`, `validate_impl_where_bounds` are all single-segment).
@@ -215,7 +223,7 @@ fn remove_cyclic_bounds(
         // deliberately-qualified reference was stripped too — and that is the caller's only way to
         // say "this is an ordinary leaf premise, not an edge".
         let mut probe = trait_path.clone();
-        crate::helper::strip_leading_self(&mut probe);
+        crate::names::strip_leading_self(&mut probe);
         let last_names_cyclic = probe
             .segments
             .last()
@@ -223,12 +231,12 @@ fn remove_cyclic_bounds(
         // A `super::`-rooted spelling must still be stripped whatever its target: these impls are
         // re-emitted at other module depths, where that prefix no longer denotes the same item.
         let names_cyclic_trait =
-            last_names_cyclic && crate::helper::path_is_depth_fragile(&trait_path);
-        let bare_names_cyclic = last_names_cyclic && probe.segments.len() == 1;
-        let is_bareparam_target = matches!(&ty, Type::Path(TypePath { qself: None, path })
+            last_names_cyclic && crate::helper::path_is_depth_fragile(trait_path);
+        let bare_names_cyclic = crate::names::bare_ident(trait_path)
+            .is_some_and(|ident| replacing_table.contains_key(ident));
+        let is_bareparam_target = matches!(ty, Type::Path(TypePath { qself: None, path })
             if path.segments.len() == 1 && param_idents.contains(&path.segments[0].ident));
-        let is_self_target = matches!(&ty, Type::Path(TypePath { qself: None, path })
-            if path.is_ident("Self"));
+        let is_self_target = is_self_type(ty);
         // Targets the ranked chain can descend: a cycle self type, `Self`, or a bare impl param.
         //
         // A bare param must stay here even though it is often just a leaf premise
@@ -239,9 +247,13 @@ fn remove_cyclic_bounds(
         // them apart needs the *field* graph, which decycle deliberately never reads. Excluding bare
         // params here breaks `bareparam_reentry`/`limitation`; a caller that needs such a leaf bound
         // to survive must still route it through a non-cyclic supertrait alias.
+        //
+        // A wrapper `peel` kept whole (`(B, crate::other::Leaf)`, the pair's impl taken over), which
+        // names a member by its bare name without being headed by one, is an edge too (`wrapper`).
         let target_is_participant = is_self_target
             || is_bareparam_target
-            || crate::helper::type_head_ident(&ty).is_some_and(|h| self_heads.contains(&h));
+            || crate::helper::type_head_ident(ty).is_some_and(|h| self_heads.contains(&h))
+            || crate::names::names_bare(ty, &self_heads);
         // Cyclic iff: a depth-fragile spelling (always), or a BARE spelling whose target the ranked
         // chain can actually descend. A crate-rooted or absolute path is never cyclic — that is the
         // opt-out, and it is what lets a leaf premise on a bare type parameter survive, which no
@@ -250,17 +262,34 @@ fn remove_cyclic_bounds(
         let is_cyclic_bound = names_cyclic_trait || (bare_names_cyclic && target_is_participant);
         let is_bareparam = keep_bareparam && is_bareparam_target;
         // keep iff not a cyclic bound, OR it is a bare-param cyclic bound we deliberately retain
-        (!is_cyclic_bound || is_bareparam).then_some((ty, trait_path))
+        !is_cyclic_bound || is_bareparam
     });
     g
+}
+
+/// Whether `path` is one segment, with no leading `::`, that names a trait of `table` (`Tr`,
+/// `Tr<A>`): the bare spelling of a cyclic trait.
+fn names_table_trait(path: &Path, table: &Table) -> bool {
+    path.leading_colon.is_none()
+        && path.segments.len() == 1
+        && table.contains_key(&path.segments[0].ident)
+}
+
+/// Respell `path` as `super::Tr` when it [`names_table_trait`] — the public trait as seen from
+/// inside `shadowing_module`, which binds the bare name to an empty dummy; whether it did.
+fn qualify_super(path: &mut Path, table: &Table) -> bool {
+    if !names_table_trait(path, table) {
+        return false;
+    }
+    let seg = path.segments[0].clone();
+    *path = parse_quote!(super::#seg);
+    true
 }
 
 /// The head idents of every type that IMPLEMENTS a cyclic trait in this module — the set of targets
 /// a rank-lowered bound can actually descend into. Derived from `replacing_table` (which already
 /// holds each cyclic trait's impls), so no extra plumbing from `process_module` is needed.
-fn cycle_self_heads(
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
-) -> std::collections::HashSet<Ident> {
+fn cycle_self_heads(replacing_table: &Table) -> HashSet<Ident> {
     replacing_table
         .values()
         .flat_map(|(_, _, impls)| impls.iter())
@@ -301,46 +330,25 @@ fn cycle_self_heads(
 ///   bound are untouched, so no program that compiled before this change is affected.
 /// - Within a rewritten predicate, the requalification visits the whole predicate (target
 ///   included, e.g. a `dyn Tr` inside it), keeping the premise self-consistent across copies.
-fn requalify_foreign_premises(
-    generics: &mut Generics,
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
-) {
-    let param_idents: std::collections::HashSet<Ident> = generics
-        .params
-        .iter()
-        .filter_map(|p| match p {
-            GenericParam::Type(t) => Some(t.ident.clone()),
-            _ => None,
-        })
-        .collect();
+fn requalify_foreign_premises(generics: &mut Generics, replacing_table: &Table) {
+    let param_idents = crate::names::type_param_idents(generics);
     let self_heads = cycle_self_heads(replacing_table);
     let Some(wc) = &mut generics.where_clause else {
         return;
     };
 
     struct Requalify<'a> {
-        table: &'a HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+        table: &'a Table,
     }
     impl syn::visit_mut::VisitMut for Requalify<'_> {
         fn visit_path_mut(&mut self, path: &mut Path) {
-            if path.leading_colon.is_none()
-                && path.segments.len() == 1
-                && self.table.contains_key(&path.segments[0].ident)
-            {
-                let seg = path.segments[0].clone();
-                *path = parse_quote!(super::#seg);
-                return;
+            if !qualify_super(path, self.table) {
+                syn::visit_mut::visit_path_mut(self, path);
             }
-            syn::visit_mut::visit_path_mut(self, path);
         }
     }
 
-    let is_bare_routed = |b: &TypeParamBound| {
-        matches!(b, TypeParamBound::Trait(TraitBound { path, .. })
-            if path.leading_colon.is_none()
-                && path.segments.len() == 1
-                && replacing_table.contains_key(&path.segments[0].ident))
-    };
+    let is_bare_routed = |b: &TypeParamBound| matches!(b, TypeParamBound::Trait(tb) if names_table_trait(&tb.path, replacing_table));
     for pred in wc.predicates.iter_mut() {
         let WherePredicate::Type(pt) = pred else {
             continue;
@@ -349,7 +357,8 @@ fn requalify_foreign_premises(
                 if path.is_ident("Self")
                     || (path.segments.len() == 1 && param_idents.contains(&path.segments[0].ident)))
             || crate::helper::type_head_ident(&pt.bounded_ty)
-                .is_some_and(|h| self_heads.contains(&h));
+                .is_some_and(|h| self_heads.contains(&h))
+            || crate::names::names_bare(&pt.bounded_ty, &self_heads);
         if target_is_participant || !pt.bounds.iter().any(is_bare_routed) {
             continue;
         }
@@ -372,52 +381,39 @@ fn requalify_foreign_premises(
 /// the literal `Self` keyword (E0411 — "cannot find type `Self` in this scope").
 fn subst_bare_self_in_generics(generics: &Generics, self_ty: &Type) -> Generics {
     let mut g = generics.clone();
-    syn::visit_mut::VisitMut::visit_generics_mut(&mut BareSelfSubst { self_ty }, &mut g);
+    syn::visit_mut::VisitMut::visit_generics_mut(&mut SelfSubst::bare(self_ty), &mut g);
     g
-}
-
-struct BareSelfSubst<'a> {
-    self_ty: &'a Type,
-}
-impl syn::visit_mut::VisitMut for BareSelfSubst<'_> {
-    fn visit_type_mut(&mut self, ty: &mut Type) {
-        if let Type::Path(TypePath { qself: None, path }) = ty {
-            if path.is_ident("Self") {
-                *ty = self.self_ty.clone();
-                return;
-            }
-        }
-        syn::visit_mut::visit_type_mut(self, ty);
-    }
 }
 
 /// [`subst_bare_self_in_generics`] for a single type: every bare `Self` occurrence anywhere
 /// inside `ty` (`Self`, `Vec<Self>`, `(Self, u8)`) becomes `self_ty`.
 fn subst_bare_self_in_type(ty: &Type, self_ty: &Type) -> Type {
     let mut t = ty.clone();
-    syn::visit_mut::VisitMut::visit_type_mut(&mut BareSelfSubst { self_ty }, &mut t);
+    syn::visit_mut::VisitMut::visit_type_mut(&mut SelfSubst::bare(self_ty), &mut t);
     t
+}
+
+/// What the methods of a leaf impl (`impl XxxRanked<rank> for T`, [`emit_impl_items_leaf`]) do.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LeafBody {
+    /// The floor with `support_infinite_cycle`: re-enter the original impl at full height through
+    /// the fn pointer the registry holds.
+    Reentry,
+    /// The floor without it: `unimplemented!("decycle: cycle limit reached")`.
+    Limit,
+    /// The twin of a floor at [`decoy_rank`], which no call resolves to: `unreachable!`.
+    Decoy,
 }
 
 fn emit_impl_items_leaf(
     impl_: &ItemImpl,
     trait_: &ItemTrait,
-    support_infinite_cycle: bool,
+    body: LeafBody,
     decycle: &Path,
 ) -> TokenStream {
     let mut output = TokenStream::new();
     let trait_ident = &trait_.ident;
-    let self_targs = nonlifetime_path_args(
-        &impl_
-            .trait_
-            .as_ref()
-            .unwrap()
-            .1
-            .segments
-            .last()
-            .unwrap()
-            .arguments,
-    );
+    let self_targs = impl_trait_args(impl_);
 
     for item in impl_.items.iter() {
         match item {
@@ -434,10 +430,7 @@ fn emit_impl_items_leaf(
                 // method just rides along, still cfg-gated, in the inductive impl copy, so skip it
                 // here (validating it against the trait would wrongly reject a to-be-stripped item).
                 if !crate::extract_cfg_attrs(attrs).is_empty() {
-                    let is_member = trait_
-                        .items
-                        .iter()
-                        .any(|it| matches!(it, TraitItem::Fn(tf) if tf.sig.ident == sig.ident));
+                    let is_member = trait_fns(trait_).any(|tf| tf.sig.ident == sig.ident);
                     if is_member {
                         abort!(
                             &sig.ident,
@@ -450,83 +443,75 @@ fn emit_impl_items_leaf(
                 let mut sig = sig.clone();
                 // Don't replace Self — the leaf impl is for Wrapper<SelfTy>,
                 // so Self should resolve to Wrapper<SelfTy> to match the ranked trait.
-                // Only desugar impl Trait (pass Self as replacement = no-op for Self).
-                replace_self_and_desugar_impl_trait(&mut sig, &parse_quote!(Self));
+                // Only desugar impl Trait; the user's `Self` keeps its span.
+                desugar_impl_trait_inputs(&mut sig);
 
                 for (param_ix, input) in sig.inputs.iter_mut().enumerate() {
                     input.reduce_pat(param_ix);
                 }
 
-                if support_infinite_cycle {
-                    // Call-argument position: `variable()` emits only the bare ident for a
-                    // `Pat::Ident` (dropping `mut`/`by_ref`/subpatterns, which aren't valid
-                    // expression syntax), matching the delegate path's `FnArgScheme::variable`
-                    // usage. A raw `quote!(#pat)` here would reproduce `mut`-qualified idents
-                    // as `f(mut n)` — invalid expression syntax.
-                    let fn_call_args: Vec<TokenStream> =
-                        sig.inputs.iter().map(|p| p.variable()).collect();
-                    let margs = type_const_idents(&sig.generics);
-                    let mk = name!("__Mk_{}_{}", trait_ident, &sig.ident);
-                    let fa = name!("__Fp_{}_{}", trait_ident, &sig.ident);
-
-                    // The alias declares only the params its fn-pointer type uses (E0091);
-                    // recompute the same mask here (positional, so impl-side renames of
-                    // trait/method generics don't matter). Marker keys stay unfiltered.
-                    let (s_used, tmask, mmask) = {
-                        let tf = trait_
-                            .items
-                            .iter()
-                            .find_map(|it| match it {
-                                TraitItem::Fn(tf) if tf.sig.ident == sig.ident => Some(tf),
-                                _ => None,
-                            })
-                            .unwrap_or_else(|| {
-                                abort!(
-                                    &sig.ident,
-                                    "method `{}` not found on #[decycle] trait `{}`",
-                                    &sig.ident,
-                                    trait_ident
-                                )
-                            });
-                        let s_ident = name!("DclSelf");
-                        let s_ty: Type = parse_quote!(#s_ident);
-                        let trait_path_full = original_trait_path(trait_);
-                        let norm = normalize_reentry_sig(tf, &s_ty, &trait_path_full);
-                        reentry_used_mask(trait_, &norm, &s_ident)
-                    };
-                    let mut inst: Vec<TokenStream> = Vec::new();
-                    if s_used {
-                        inst.push(quote!(Self));
+                let tokens = match body {
+                    LeafBody::Limit => {
+                        quote!(::core::unimplemented!("decycle: cycle limit reached"))
                     }
-                    inst.extend(
-                        self_targs
-                            .iter()
-                            .zip(tmask.iter())
-                            .filter(|(_, k)| **k)
-                            .map(|(a, _)| quote!(#a)),
-                    );
-                    inst.extend(
-                        margs
-                            .iter()
-                            .zip(mmask.iter())
-                            .filter(|(_, k)| **k)
-                            .map(|(i, _)| quote!(#i)),
-                    );
+                    LeafBody::Decoy => {
+                        quote!(::core::unreachable!(
+                            "decycle: the decoy rank is never selected"
+                        ))
+                    }
+                    LeafBody::Reentry => {
+                        // Call-argument position: `variable()` emits only the bare ident for a
+                        // `Pat::Ident` (dropping `mut`/`by_ref`/subpatterns, which aren't valid
+                        // expression syntax), matching the delegate path's
+                        // `FnArgScheme::variable` usage. A raw `quote!(#pat)` here would reproduce
+                        // `mut`-qualified idents as `f(mut n)` — invalid expression syntax.
+                        let fn_call_args: Vec<TokenStream> =
+                            sig.inputs.iter().map(|p| p.variable()).collect();
+                        let margs = type_const_idents(&sig.generics);
+                        let mk = name!("__Mk_{}_{}", trait_ident, &sig.ident);
+                        let fa = name!("__Fp_{}_{}", trait_ident, &sig.ident);
 
-                    let fp = fingerprint_expr(
-                        decycle,
-                        &quote!(Self),
-                        impl_self_may_be_unsized(impl_),
-                        &trait_.generics,
-                        &self_targs,
-                        Some(&sig.generics),
-                    );
+                        // The alias declares only the params its fn-pointer type uses (E0091);
+                        // recompute the same mask here (positional, so impl-side renames of
+                        // trait/method generics don't matter). Marker keys stay unfiltered.
+                        let (s_used, tmask, mmask) = {
+                            let tf = trait_fns(trait_)
+                                .find(|tf| tf.sig.ident == sig.ident)
+                                .unwrap_or_else(|| {
+                                    abort!(
+                                        &sig.ident,
+                                        "method `{}` not found on #[decycle] trait `{}`",
+                                        &sig.ident,
+                                        trait_ident
+                                    )
+                                });
+                            let s_ident = name!("DclSelf");
+                            let s_ty: Type = parse_quote!(#s_ident);
+                            let trait_path_full = original_trait_path(trait_);
+                            let norm = normalize_reentry_sig(tf, &s_ty, &trait_path_full);
+                            reentry_used_mask(trait_, &norm, &s_ident)
+                        };
+                        let inst: Vec<TokenStream> = s_used
+                            .then(|| quote!(Self))
+                            .into_iter()
+                            .chain(masked(&self_targs, &tmask).map(|a| quote!(#a)))
+                            .chain(masked(&margs, &mmask).map(|i| quote!(#i)))
+                            .collect();
 
-                    // The transmute names BOTH types: the `*const ()` source (the registry hands
-                    // the fn pointer out by value, WITH its provenance — a `usize` here would
-                    // strip it and make this call UB) and the declared alias target — never `_`.
-                    output.extend(quote! {
-                        #defaultness #sig {
+                        let fp = fingerprint_expr(
+                            decycle,
+                            &quote!(Self),
+                            impl_self_may_be_unsized(impl_),
+                            &trait_.generics,
+                            &self_targs,
+                            Some(&sig.generics),
+                        );
+
+                        // The transmute names BOTH types: the `*const ()` source (the registry
+                        // hands the fn pointer out by value, WITH its provenance — a `usize` here
+                        // would strip it and make this call UB) and the declared alias target —
+                        // never `_`.
+                        quote! {
                             let __dcl_f = unsafe {
                                 ::core::mem::transmute::<
                                     *const (),
@@ -535,26 +520,17 @@ fn emit_impl_items_leaf(
                                     #mk<Self #(for a in &self_targs) {, #a} #(for i in &margs) {, #i}>
                                 >(#fp))
                             };
-                            // A bare `{ __dcl_f(...) }` nested directly as this fn body's
-                            // tail statement (no `unsafe` to scope) would just be a redundant
-                            // brace pair (`unused_braces` in a plain, non-macro-generated
-                            // shape); emit the call unwrapped in that case instead of
-                            // conditionally prefixing an otherwise-pointless block.
-                            #(if sig.unsafety.is_some()) {
-                                unsafe { __dcl_f(#(#fn_call_args),*) }
-                            }
-                            #(if sig.unsafety.is_none()) {
-                                __dcl_f(#(#fn_call_args),*)
-                            }
+                            // A bare `{ __dcl_f(...) }` nested directly as this fn body's tail
+                            // statement (no `unsafe` to scope) would just be a redundant brace
+                            // pair (`unused_braces` in a plain, non-macro-generated shape); emit
+                            // the call unwrapped in that case instead of conditionally prefixing
+                            // an otherwise-pointless block.
+                            #(if sig.unsafety.is_some()) { unsafe { __dcl_f(#(#fn_call_args),*) } }
+                            #(else) { __dcl_f(#(#fn_call_args),*) }
                         }
-                    });
-                } else {
-                    output.extend(quote! {
-                        #defaultness #sig {
-                            ::core::unimplemented!("decycle: cycle limit reached")
-                        }
-                    });
-                }
+                    }
+                };
+                output.extend(quote!(#defaultness #sig { #tokens }));
             }
             o => output.extend(quote!(#o)),
         }
@@ -566,7 +542,7 @@ fn emit_impl_items_delegate(
     impl_: &ItemImpl,
     path: TokenStream,
     // C4: `Some((trait_, decycle))` for a bare-param impl's Final delegating impl ⇒ prepend
-    // `build_bareparam_registrations`'s prologue to each delegated method body. `None` for
+    // its own `Self: T` registrations (below) to each delegated method body. `None` for
     // every other Final impl ⇒ empty prologue, byte-identical to before C4.
     bareparam: Option<(&ItemTrait, &Path)>,
 ) -> TokenStream {
@@ -596,13 +572,29 @@ fn emit_impl_items_delegate(
                 let do_turbofish = !margs.is_empty() && !sig_has_impl_trait_input(&sig);
                 // This delegating body is what calls into the rank chain, so its registrations
                 // must stay live for the whole descent — hence a scope opened here rather than
-                // inside `build_bareparam_registrations`. The scope also bounds the undo log:
+                // inside `build_self_registrations`. The scope also bounds the undo log:
                 // a `register` made outside any scope would log a record nothing ever reclaims.
                 // Priming still survives, because a registration that CREATES its key is left in
                 // place when the scope closes (only displacement is rolled back).
                 let prologue = match bareparam {
                     Some((trait_, decycle)) => {
-                        let regs = build_bareparam_registrations(trait_, impl_, &sig, decycle);
+                        // C4: the bare-param impl's own `Self: T` re-entry registrations,
+                        // emitted from the FINAL delegating impl (a sibling of
+                        // `shadowing_module`), where `Self: Ca` is an assumed environment bound
+                        // and the user's real, un-ranked `T: Cb` is in scope — the registrations
+                        // rule 1 SKIPS for a bare-param impl (`impl_has_bare_param_cyclic_bound`,
+                        // because the rank-rewritten inductive frame cannot prove `Wrap<T>: Ca`).
+                        // At monomorphization `T = Concrete` the key `Mk_Ca<Wrap<Concrete>>`
+                        // equals the wrapper floor's `lookup::<Mk_Ca<Wrap<Concrete>>>`, so the
+                        // wrapper's own floor — and every subsequent runtime re-entry, which
+                        // re-calls THIS Final impl — is covered. Same `Self`/`self_targs`/method-
+                        // generics fingerprint as the floor and rule 1, so keys agree by
+                        // construction. Shares `build_self_registrations` with rule 1, but with
+                        // NO `rule1_ok` gate (the caller gates on the bare-param predicate
+                        // instead) and the `shadowing_module::ranked_traits::` prefix (this runs
+                        // OUTSIDE `shadowing_module`).
+                        let rt = quote!(#{name!("shadowing_module")}::#{name!("ranked_traits")});
+                        let regs = build_self_registrations(trait_, impl_, &sig, &rt, decycle);
                         let scope_guard = name!("__dcl_reentry_scope");
                         quote! {
                             let #scope_guard = #decycle::__reentry::scope();
@@ -646,40 +638,20 @@ fn emit_impl_items_delegate(
             ImplItem::Const(ImplItemConst { ident, ty, .. }) => output.extend(quote! {
                 const #ident: #ty = #path::#ident;
             }),
-            other => abort!(
-                other,
-                "unsupported item in an impl of a #[decycle] trait"
-            ),
+            other => abort!(other, "unsupported item in an impl of a #[decycle] trait"),
         }
     }
     output
 }
 
+/// Every bare `Self` in `sig` replaced by `base_self_ty`, except in the receiver, which keeps its
+/// `Self` (`self: Box<Self>`).
 fn replace_self(sig: &mut Signature, base_self_ty: &Type) {
-    use syn::visit_mut::VisitMut;
-
-    struct SelfReplacer<'a> {
-        base_self_ty: &'a Type,
-    }
-
-    impl<'a> VisitMut for SelfReplacer<'a> {
-        fn visit_receiver_mut(&mut self, _receiver: &mut Receiver) {
-            // Skip visiting receiver to avoid replacing Self in receiver types
-        }
-
-        fn visit_type_mut(&mut self, ty: &mut Type) {
-            if let Type::Path(TypePath { qself: None, path }) = ty {
-                if path.is_ident("Self") {
-                    *ty = self.base_self_ty.clone();
-                    return;
-                }
-            }
-            syn::visit_mut::visit_type_mut(self, ty);
-        }
-    }
-
-    let mut replacer = SelfReplacer { base_self_ty };
-    replacer.visit_signature_mut(sig);
+    let mut replacer = SelfSubst {
+        skip_receivers: true,
+        ..SelfSubst::bare(base_self_ty)
+    };
+    syn::visit_mut::VisitMut::visit_signature_mut(&mut replacer, sig);
 }
 
 /// Desugars every input-position `impl Trait` into a fresh method-level type parameter
@@ -695,40 +667,23 @@ fn replace_self(sig: &mut Signature, base_self_ty: &Type) {
 /// passes have run — see the call site.
 fn desugar_impl_trait_inputs(sig: &mut Signature) {
     let mut param_counter = 0usize;
-
-    // Replace input-position impl Trait with type parameters
     for input in &mut sig.inputs {
-        if let FnArg::Typed(PatType { ty, .. }) = input {
-            if let Type::ImplTrait(impl_trait) = &**ty {
-                let param_name = name!("ImplTrait{}", param_counter);
-                param_counter += 1;
-
-                let bounds = impl_trait.bounds.clone();
-                sig.generics.params.push(GenericParam::Type(TypeParam {
-                    attrs: Vec::new(),
-                    ident: param_name.clone(),
-                    colon_token: if bounds.is_empty() {
-                        None
-                    } else {
-                        Some(Default::default())
-                    },
-                    bounds,
-                    eq_token: None,
-                    default: None,
-                }));
-
-                **ty = Type::Path(TypePath {
-                    qself: None,
-                    path: param_name.into(),
-                });
-            }
-        }
+        let FnArg::Typed(PatType { ty, .. }) = input else {
+            continue;
+        };
+        let Type::ImplTrait(impl_trait) = &**ty else {
+            continue;
+        };
+        let param_name = name!("ImplTrait{}", param_counter);
+        param_counter += 1;
+        let bounds = impl_trait.bounds.clone();
+        sig.generics.params.push(GenericParam::Type(TypeParam {
+            colon_token: (!bounds.is_empty()).then(Default::default),
+            bounds,
+            ..TypeParam::from(param_name.clone())
+        }));
+        **ty = parse_quote!(#param_name);
     }
-}
-
-fn replace_self_and_desugar_impl_trait(sig: &mut Signature, base_self_ty: &Type) {
-    replace_self(sig, base_self_ty);
-    desugar_impl_trait_inputs(sig);
 }
 
 /// Within input-position `impl Trait` bounds only, qualify a bare bound naming a `#[decycle]`
@@ -744,28 +699,18 @@ fn replace_self_and_desugar_impl_trait(sig: &mut Signature, base_self_ty: &Type)
 /// The bound is left on the PUBLIC trait (never rank-lowered): an `impl Trait` argument is a
 /// value from outside the cycle, so its bound must hold at the public boundary — where the
 /// public→ranked delegation only knows `T: Trait`, not the (irreversible) `T: TraitRanked<Init>`.
-fn qualify_apit_cyclic_bounds_super(
-    sig: &mut Signature,
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
-) {
+fn qualify_apit_cyclic_bounds_super(sig: &mut Signature, replacing_table: &Table) {
     use syn::visit_mut::VisitMut;
 
     struct Qualifier<'a> {
-        table: &'a HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+        table: &'a Table,
     }
 
     impl VisitMut for Qualifier<'_> {
         fn visit_type_impl_trait_mut(&mut self, it: &mut syn::TypeImplTrait) {
             for bound in it.bounds.iter_mut() {
                 if let syn::TypeParamBound::Trait(tb) = bound {
-                    let path = &mut tb.path;
-                    if path.leading_colon.is_none()
-                        && path.segments.len() == 1
-                        && self.table.contains_key(&path.segments[0].ident)
-                    {
-                        let seg = path.segments[0].clone();
-                        *path = parse_quote!(super::#seg);
-                    }
+                    qualify_super(&mut tb.path, self.table);
                 }
             }
             // A cyclic bound only appears at top level of the `impl Trait`; no need to recurse
@@ -788,48 +733,58 @@ fn process_trait_item_for_ranked(item: &TraitItem) -> TraitItem {
         // like an impl of the original trait would — stripping it here made every
         // defaulted method abstract on the ranked trait, so an impl omitting it hit
         // E0046 even though the original trait supplies a default.
-        replace_self_and_desugar_impl_trait(sig, &parse_quote!(Self));
+        desugar_impl_trait_inputs(sig);
     }
     item
 }
 
-/// Replaces `Self` with a concrete type in a type tree, including `Self::Assoc`
-/// projections (which become `<S as Trait<...>>::Assoc` — a bare `S::Assoc` would not
-/// resolve on a generic `S`).
+/// Replaces `Self` with a concrete type in a type tree. With a `trait_path`, also a `Self::Assoc`
+/// projection, which becomes `<S as Trait<...>>::Assoc` (a bare `S::Assoc` would not resolve on a
+/// generic `S`); without one, it substitutes only a bare `Self` (`Self`, `Vec<Self>`).
 struct SelfSubst<'a> {
     s_ty: &'a Type,
-    trait_path: &'a Path,
+    trait_path: Option<&'a Path>,
+    /// Leave a receiver's type (`self: Box<Self>`) as written ([`replace_self`]).
+    skip_receivers: bool,
+}
+
+impl<'a> SelfSubst<'a> {
+    fn new(s_ty: &'a Type, trait_path: &'a Path) -> Self {
+        SelfSubst {
+            trait_path: Some(trait_path),
+            ..SelfSubst::bare(s_ty)
+        }
+    }
+
+    fn bare(s_ty: &'a Type) -> Self {
+        SelfSubst {
+            s_ty,
+            trait_path: None,
+            skip_receivers: false,
+        }
+    }
 }
 
 impl syn::visit_mut::VisitMut for SelfSubst<'_> {
+    fn visit_receiver_mut(&mut self, receiver: &mut Receiver) {
+        if !self.skip_receivers {
+            syn::visit_mut::visit_receiver_mut(self, receiver);
+        }
+    }
+
     fn visit_type_mut(&mut self, ty: &mut Type) {
         if let Type::Path(TypePath { qself: None, path }) = ty {
             if path.is_ident("Self") {
                 *ty = self.s_ty.clone();
                 return;
             }
-            if path.leading_colon.is_none()
-                && path.segments.len() > 1
-                && path.segments[0].ident == "Self"
-            {
-                let mut segments: Punctuated<PathSegment, Token![::]> =
-                    self.trait_path.segments.clone();
-                for seg in path.segments.iter().skip(1) {
-                    segments.push(seg.clone());
-                }
-                *ty = Type::Path(TypePath {
-                    qself: Some(QSelf {
-                        lt_token: Default::default(),
-                        ty: Box::new(self.s_ty.clone()),
-                        position: self.trait_path.segments.len(),
-                        as_token: Some(Default::default()),
-                        gt_token: Default::default(),
-                    }),
-                    path: Path {
-                        leading_colon: self.trait_path.leading_colon,
-                        segments,
-                    },
-                });
+            if let Some(trait_path) = self.trait_path.filter(|_| {
+                path.leading_colon.is_none()
+                    && path.segments.len() > 1
+                    && path.segments[0].ident == "Self"
+            }) {
+                let rest = path.segments.iter().skip(1);
+                *ty = parse_quote!(<#{self.s_ty} as #trait_path> #(for seg in rest) { :: #seg });
                 return;
             }
         }
@@ -837,88 +792,33 @@ impl syn::visit_mut::VisitMut for SelfSubst<'_> {
     }
 }
 
-/// Gives every elided lifetime (`&T`, `'_`) a fresh name. Fn-pointer types and free fns
-/// have no `self` elision rule, so the re-entry fn / floor alias signatures must be fully
-/// named before output elision can be resolved against the receiver.
-struct LtNamer {
-    fresh: Vec<Lifetime>,
-    counter: usize,
-}
-
-impl LtNamer {
-    fn fresh_lt(&mut self) -> Lifetime {
-        let lt = Lifetime::new(&format!("'__dcl{}", self.counter), Span::call_site());
-        self.counter += 1;
-        self.fresh.push(lt.clone());
-        lt
-    }
-}
-
-impl syn::visit_mut::VisitMut for LtNamer {
-    fn visit_type_reference_mut(&mut self, tr: &mut TypeReference) {
-        match &tr.lifetime {
-            None => tr.lifetime = Some(self.fresh_lt()),
-            Some(l) if l.ident == "_" => tr.lifetime = Some(self.fresh_lt()),
-            _ => {}
-        }
-        self.visit_type_mut(&mut tr.elem);
-    }
-
-    fn visit_lifetime_mut(&mut self, l: &mut Lifetime) {
-        if l.ident == "_" {
-            *l = self.fresh_lt();
-        }
-    }
-}
-
-fn count_elided_lifetimes(ty: &Type) -> usize {
-    struct Counter(usize);
-    impl<'ast> syn::visit::Visit<'ast> for Counter {
-        fn visit_type_reference(&mut self, tr: &'ast TypeReference) {
-            match &tr.lifetime {
-                None => self.0 += 1,
-                Some(l) if l.ident == "_" => self.0 += 1,
-                _ => {}
-            }
-            self.visit_type(&tr.elem);
-        }
-        fn visit_lifetime(&mut self, l: &'ast Lifetime) {
-            if l.ident == "_" {
-                self.0 += 1;
-            }
-        }
-    }
-    let mut c = Counter(0);
-    syn::visit::Visit::visit_type(&mut c, ty);
-    c.0
-}
-
-fn subst_elided_lifetimes(ty: &mut Type, subst: &Lifetime) {
-    struct Subst(Lifetime);
-    impl syn::visit_mut::VisitMut for Subst {
+/// Give every elided lifetime in `ty` (`&T`, `'_`) the lifetime `next` returns. Fn-pointer types
+/// and free fns have no `self` elision rule, so the re-entry fn / floor alias signatures must be
+/// fully named before output elision can be resolved against the receiver.
+fn fill_elided_lifetimes(ty: &mut Type, next: &mut dyn FnMut() -> Lifetime) {
+    struct Fill<'a>(&'a mut dyn FnMut() -> Lifetime);
+    impl syn::visit_mut::VisitMut for Fill<'_> {
         fn visit_type_reference_mut(&mut self, tr: &mut TypeReference) {
-            match &tr.lifetime {
-                None => tr.lifetime = Some(self.0.clone()),
-                Some(l) if l.ident == "_" => tr.lifetime = Some(self.0.clone()),
-                _ => {}
+            if tr.lifetime.as_ref().map_or(true, |l| l.ident == "_") {
+                tr.lifetime = Some((self.0)());
             }
             self.visit_type_mut(&mut tr.elem);
         }
+
         fn visit_lifetime_mut(&mut self, l: &mut Lifetime) {
             if l.ident == "_" {
-                *l = self.0.clone();
+                *l = (self.0)();
             }
         }
     }
-    syn::visit_mut::VisitMut::visit_type_mut(&mut Subst(subst.clone()), ty);
+    syn::visit_mut::VisitMut::visit_type_mut(&mut Fill(next), ty);
 }
 
 fn distinct_lifetimes_in(tys: impl Iterator<Item = Type>) -> Vec<Lifetime> {
     struct Collector(Vec<Lifetime>);
     impl<'ast> syn::visit::Visit<'ast> for Collector {
         fn visit_lifetime(&mut self, l: &'ast Lifetime) {
-            if l.ident != "_" && l.ident != "static" && !self.0.iter().any(|s| s.ident == l.ident)
-            {
+            if l.ident != "_" && l.ident != "static" && !self.0.iter().any(|s| s.ident == l.ident) {
                 self.0.push(l.clone());
             }
         }
@@ -928,6 +828,16 @@ fn distinct_lifetimes_in(tys: impl Iterator<Item = Type>) -> Vec<Lifetime> {
         syn::visit::Visit::visit_type(&mut c, &ty);
     }
     c.0
+}
+
+/// The type/const generic args of `impl_`'s trait, as [`nonlifetime_path_args`] has them (none for
+/// an inherent impl): `impl Cast<i64> for A` gives `[i64]`.
+fn impl_trait_args(impl_: &ItemImpl) -> Vec<GenericArgument> {
+    impl_
+        .trait_
+        .as_ref()
+        .map(|(_, path, _)| nonlifetime_path_args(&path.segments.last().unwrap().arguments))
+        .unwrap_or_default()
 }
 
 /// The type/const generic args of a path's last segment (lifetimes and associated-type
@@ -944,18 +854,6 @@ fn nonlifetime_path_args(args: &PathArguments) -> Vec<GenericArgument> {
     }
 }
 
-fn type_const_idents(generics: &Generics) -> Vec<Ident> {
-    generics
-        .params
-        .iter()
-        .filter_map(|p| match p {
-            GenericParam::Type(t) => Some(t.ident.clone()),
-            GenericParam::Const(c) => Some(c.ident.clone()),
-            _ => None,
-        })
-        .collect()
-}
-
 fn sig_has_impl_trait_input(sig: &Signature) -> bool {
     sig.inputs.iter().any(
         |i| matches!(i, FnArg::Typed(PatType { ty, .. }) if matches!(&**ty, Type::ImplTrait(_))),
@@ -966,20 +864,8 @@ fn sig_has_impl_trait_input(sig: &Signature) -> bool {
 /// erased fn-pointer type (`fn(...) -> impl Trait` is E0562), so it can't be threaded through
 /// re-entry — used to reject return-position `impl Trait` up-front with a clear error.
 pub(crate) fn sig_has_impl_trait_output(sig: &Signature) -> bool {
-    struct Find(bool);
-    impl<'ast> syn::visit::Visit<'ast> for Find {
-        fn visit_type_impl_trait(&mut self, _: &'ast TypeImplTrait) {
-            self.0 = true;
-        }
-    }
-    match &sig.output {
-        ReturnType::Type(_, t) => {
-            let mut f = Find(false);
-            syn::visit::Visit::visit_type(&mut f, t);
-            f.0
-        }
-        ReturnType::Default => false,
-    }
+    matches!(&sig.output, ReturnType::Type(_, t)
+        if type_has(t, &|t| matches!(t, Type::ImplTrait(_))))
 }
 
 /// True iff the method has its own type/const generics or an argument-position `impl Trait`.
@@ -1076,6 +962,7 @@ fn generics_mention_self(generics: &Generics) -> bool {
 /// lifetimes that scope names inside `target`; empty for an ordinary bound. C1 splices `binder`
 /// as generics of the register-once fn so `target`'s lifetimes are declared where the
 /// `register`/`Re` statement lands.
+#[derive(Clone)]
 struct CyclicBound {
     binder: Vec<GenericParam>,
     target: Type,
@@ -1091,43 +978,31 @@ struct CyclicBound {
 fn fresh_binder_lifetimes<'a>(
     binders: impl IntoIterator<Item = &'a BoundLifetimes>,
     counter: &mut usize,
-) -> (Vec<GenericParam>, HashMap<Ident, Lifetime>) {
+) -> (Vec<GenericParam>, HashMap<String, Lifetime>) {
     let mut params = Vec::new();
-    let mut rename: HashMap<Ident, Lifetime> = HashMap::new();
+    let mut rename = HashMap::new();
     for bl in binders {
         for gp in &bl.lifetimes {
             if let GenericParam::Lifetime(l) = gp {
                 let fresh = Lifetime::new(&format!("'__dcl_hr_{}", *counter), l.lifetime.span());
                 *counter += 1;
-                rename.insert(l.lifetime.ident.clone(), fresh.clone());
-                params.push(GenericParam::Lifetime(LifetimeParam {
-                    attrs: Vec::new(),
-                    lifetime: fresh,
-                    colon_token: None,
-                    bounds: Punctuated::new(),
-                }));
+                rename.insert(l.lifetime.to_string(), fresh.clone());
+                params.push(GenericParam::Lifetime(LifetimeParam::new(fresh)));
             }
         }
     }
     (params, rename)
 }
 
-/// Apply an HRTB binder rename to every `Lifetime` occurrence inside a target type.
-struct RenameLifetimes<'a> {
-    rename: &'a HashMap<Ident, Lifetime>,
-}
-impl syn::visit_mut::VisitMut for RenameLifetimes<'_> {
-    fn visit_lifetime_mut(&mut self, lt: &mut Lifetime) {
-        if let Some(fresh) = self.rename.get(&lt.ident) {
-            *lt = fresh.clone();
-        }
-    }
-}
-
 /// The impl's cyclic `where`-predicates for every single-segment decycle-trait bound whose
 /// target is not a bare type parameter of the impl (a bare-param target's *original*-trait
 /// obligation is not provable inside the rank-rewritten impl, so such bounds are skipped —
-/// their non-generic-method coverage then relies on rule 1 of the callee's own frames). C1: a
+/// their non-generic-method coverage then relies on rule 1 of the callee's own frames). A bound
+/// whose target is no participant at all (`crate::other::Leaf: Cb`, `u8: Cb` — no impl taken over
+/// has that head) is skipped too: it is a premise on the original trait, which
+/// `remove_cyclic_bounds` keeps as a side bound, not an edge. Walked as an edge, it found no impl
+/// to descend into, so `reachable_side_bounds_ok` failed for every impl reaching it, their
+/// re-entry fns went unregistered, and a recursion past the floor panicked at run time. C1: a
 /// `for<'a> B<'a>: Cb` (or `B: for<'a> Cb<'a>`) HRTB binder is fresh-renamed and carried on the
 /// returned `CyclicBound` so `build_shared_registrations` can declare it at the register-once
 /// fn instead of silently dropping it (which previously left `'a` undeclared → E0261).
@@ -1136,38 +1011,22 @@ impl syn::visit_mut::VisitMut for RenameLifetimes<'_> {
 /// the impl the two spell the same type, but every consumer of a `CyclicBound` lives OUTSIDE it:
 ///
 /// * `reachable_side_bounds_ok` unifies the target against candidate impls' self types
-///   (`unify_impl_against_obligation`), and nothing ever unifies with the path `Self` — so a
+///   (`crate::unify::unify_obligation`), and nothing ever unifies with the path `Self` — so a
 ///   cyclic bound spelled `where Self: OtherTrait` failed the reachability check every time and
 ///   `build_shared_registrations` silently dropped its cross-edge registration, leaving the
 ///   callee's floor to hit the fail-closed "re-entry fn not registered" panic. The very same
 ///   cycle spelled with the concrete type worked.
-/// * `emit_registration` splices the target into the FREE `__dcl_register_once_*` fn, which has
+/// * `emit_registrations` splices the target into the FREE `__dcl_register_once_*` fn, which has
 ///   no `Self` at all — so had the walk ever matched a `Self`-rooted target, the emitted
 ///   `Mk<Self, ..>` / `Re::<Self, ..>` would have been E0411 ("cannot find type `Self` in this
 ///   scope"). Substituting here fixes the reachability walk and that latent emission bug at
 ///   once, since both read this one field.
-fn cyclic_where_bounds(
-    impl_: &ItemImpl,
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
-) -> Vec<CyclicBound> {
-    let param_idents: std::collections::HashSet<Ident> = impl_
-        .generics
-        .params
-        .iter()
-        .filter_map(|p| match p {
-            GenericParam::Type(t) => Some(t.ident.clone()),
-            _ => None,
-        })
-        .collect();
+fn cyclic_where_bounds(impl_: &ItemImpl, replacing_table: &Table) -> Vec<CyclicBound> {
+    let param_idents = crate::names::type_param_idents(&impl_.generics);
     let mut out = Vec::new();
-    let Some(wc) = &impl_.generics.where_clause else {
-        return out;
-    };
+    let self_heads = cycle_self_heads(replacing_table);
     let mut hr_counter = 0usize; // distinct fresh names across all HRTB bounds of this impl
-    for pred in &wc.predicates {
-        let WherePredicate::Type(pt) = pred else {
-            continue;
-        };
+    for pt in crate::names::type_predicates(&impl_.generics) {
         if let Type::Path(TypePath { qself: None, path }) = &pt.bounded_ty {
             if path.segments.len() == 1 && param_idents.contains(&path.segments[0].ident) {
                 continue;
@@ -1177,33 +1036,39 @@ fn cyclic_where_bounds(
             let TypeParamBound::Trait(tb) = b else {
                 continue;
             };
-            if tb.path.segments.len() == 1 {
-                let seg = &tb.path.segments[0];
-                if replacing_table.contains_key(&seg.ident) {
-                    // C1: fresh-rename the union of the predicate binder (`for<'a> B<'a>: Cb`)
-                    // and the bound binder (`B: for<'a> Cb<'a>`), then rewrite the target so its
-                    // lifetimes match the fresh names the register-once fn will declare.
-                    let (binder, rename) = fresh_binder_lifetimes(
-                        pt.lifetimes.iter().chain(tb.lifetimes.iter()),
-                        &mut hr_counter,
-                    );
-                    // `Self` means "this impl's self type" only INSIDE the impl; every consumer
-                    // of the returned target reads it from outside (see the doc comment).
-                    let mut target = subst_bare_self_in_type(&pt.bounded_ty, &impl_.self_ty);
-                    if !rename.is_empty() {
-                        syn::visit_mut::VisitMut::visit_type_mut(
-                            &mut RenameLifetimes { rename: &rename },
-                            &mut target,
-                        );
-                    }
-                    out.push(CyclicBound {
-                        binder,
-                        target,
-                        trait_ident: seg.ident.clone(),
-                        targs: nonlifetime_path_args(&seg.arguments),
-                    });
-                }
+            if !names_table_trait(&tb.path, replacing_table) {
+                continue;
             }
+            let seg = &tb.path.segments[0];
+            // C1: fresh-rename the union of the predicate binder (`for<'a> B<'a>: Cb`)
+            // and the bound binder (`B: for<'a> Cb<'a>`), then rewrite the target so its
+            // lifetimes match the fresh names the register-once fn will declare.
+            let (binder, rename) = fresh_binder_lifetimes(
+                pt.lifetimes.iter().chain(tb.lifetimes.iter()),
+                &mut hr_counter,
+            );
+            // `Self` means "this impl's self type" only INSIDE the impl; every consumer
+            // of the returned target reads it from outside (see the doc comment).
+            let mut target = subst_bare_self_in_type(&pt.bounded_ty, &impl_.self_ty);
+            // A premise, not an edge: see the doc comment. (A wrapper `peel` kept whole is an
+            // edge: see `wrapper`.)
+            if !crate::helper::type_head_ident(&target).is_some_and(|h| self_heads.contains(&h))
+                && !crate::names::names_bare(&target, &self_heads)
+            {
+                continue;
+            }
+            if !rename.is_empty() {
+                syn::visit_mut::VisitMut::visit_type_mut(
+                    &mut crate::premise_flow::RenameLifetimes(&rename),
+                    &mut target,
+                );
+            }
+            out.push(CyclicBound {
+                binder,
+                target,
+                trait_ident: seg.ident.clone(),
+                targs: nonlifetime_path_args(&seg.arguments),
+            });
         }
     }
     out
@@ -1222,16 +1087,14 @@ fn type_param_is_maybe_unsized(tp: &TypeParam, where_clause: Option<&WhereClause
         })
     };
     is_maybe(&tp.bounds)
-        || where_clause.is_some_and(|wc| {
-            wc.predicates.iter().any(|pred| match pred {
-                WherePredicate::Type(pt) => {
-                    matches!(&pt.bounded_ty, Type::Path(TypePath { qself: None, path })
-                        if path.is_ident(&tp.ident))
-                        && is_maybe(&pt.bounds)
-                }
-                _ => false,
+        || where_clause
+            .into_iter()
+            .flat_map(|wc| &wc.predicates)
+            .any(|pred| {
+                matches!(pred, WherePredicate::Type(pt) if is_maybe(&pt.bounds)
+                    && matches!(&pt.bounded_ty, Type::Path(TypePath { qself: None, path })
+                        if path.is_ident(&tp.ident)))
             })
-        })
 }
 
 /// A const-generic value is folded into the fingerprint only when its declared type is a
@@ -1261,7 +1124,7 @@ fn is_syntactically_unsized(ty: &Type) -> bool {
 
 /// The idents of `generics`' type params that are declared `?Sized` (inline or in the
 /// where-clause).
-fn maybe_unsized_type_params(generics: &Generics) -> std::collections::HashSet<Ident> {
+fn maybe_unsized_type_params(generics: &Generics) -> HashSet<Ident> {
     generics
         .params
         .iter()
@@ -1291,7 +1154,7 @@ fn maybe_unsized_type_params(generics: &Generics) -> std::collections::HashSet<I
 /// layout fold from the key — which stays sound because EVERY site that keys the same floor
 /// computes the flag the same way (see `impl_self_may_be_unsized` /
 /// `bound_target_floor_is_unsized`) — whereas being wrong the other way is a hard compile error.
-fn type_may_be_unsized(ty: &Type, maybe_unsized: &std::collections::HashSet<Ident>) -> bool {
+fn type_may_be_unsized(ty: &Type, maybe_unsized: &HashSet<Ident>) -> bool {
     if is_syntactically_unsized(ty) {
         return true;
     }
@@ -1344,35 +1207,17 @@ fn bound_target_floor_is_unsized(
     target: &Type,
     trait_ident: &Ident,
     targs: &[GenericArgument],
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+    replacing_table: &Table,
 ) -> bool {
     let Some((_, _, impls)) = replacing_table.get(trait_ident) else {
         return is_syntactically_unsized(target);
     };
     let mut decision: Option<bool> = None;
     for cand in impls {
-        let pattern_vars: std::collections::HashSet<Ident> = cand
-            .generics
-            .params
-            .iter()
-            .filter_map(|p| match p {
-                GenericParam::Type(t) => Some(t.ident.clone()),
-                _ => None,
-            })
-            .collect();
-        let cand_targs = cand
-            .trait_
-            .as_ref()
-            .map(|(_, path, _)| nonlifetime_path_args(&path.segments.last().unwrap().arguments))
-            .unwrap_or_default();
-        if unify_impl_against_obligation(
-            &pattern_vars,
-            &cand.self_ty,
-            &cand_targs,
-            target,
-            targs,
-        )
-        .is_none()
+        let pattern_vars = crate::names::type_param_idents(&cand.generics);
+        let cand_targs = impl_trait_args(cand);
+        if crate::unify::unify_obligation(&pattern_vars, &cand.self_ty, &cand_targs, target, targs)
+            .is_none()
         {
             continue;
         }
@@ -1431,21 +1276,8 @@ fn s_ident_only_behind_ref<'a>(tys: impl Iterator<Item = &'a Type>, s_ident: &Id
 /// str`) may leave a trait-level param like `T` entirely unmasked out of the alias's generic
 /// list, so unconditionally emitting the bound (regardless of whether anything needs it) is an
 /// E0412 "cannot find type" waiting to happen.
-fn any_type_has_projection<'a>(tys: impl Iterator<Item = &'a Type>) -> bool {
-    struct Check(bool);
-    impl<'ast> syn::visit::Visit<'ast> for Check {
-        fn visit_type_path(&mut self, tp: &'ast TypePath) {
-            if tp.qself.is_some() {
-                self.0 = true;
-            }
-            syn::visit::visit_type_path(self, tp);
-        }
-    }
-    let mut c = Check(false);
-    for ty in tys {
-        syn::visit::Visit::visit_type(&mut c, ty);
-    }
-    c.0
+fn any_type_has_projection<'a>(mut tys: impl Iterator<Item = &'a Type>) -> bool {
+    tys.any(|ty| type_has(ty, &|t| matches!(t, Type::Path(tp) if tp.qself.is_some())))
 }
 
 /// Build the layout-fingerprint expression for one registry key: a deterministic fold over the
@@ -1529,43 +1361,18 @@ pub fn fingerprint_expr(
 /// at concrete ranks — but the rank-rewritten frame only has `T: CbRanked<Rank>` in scope,
 /// so the registration would not compile (E0277). Rule 1 skips such impls; their floors
 /// fail closed via the actionable lookup panic.
-fn impl_has_bare_param_cyclic_bound(
-    impl_: &ItemImpl,
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
-) -> bool {
+fn impl_has_bare_param_cyclic_bound(impl_: &ItemImpl, replacing_table: &Table) -> bool {
     let is_cyclic = |bounds: &Punctuated<TypeParamBound, Token![+]>| {
-        bounds.iter().any(|b| match b {
-            TypeParamBound::Trait(tb) => {
-                tb.path.segments.len() == 1
-                    && replacing_table.contains_key(&tb.path.segments[0].ident)
-            }
-            _ => false,
+        bounds.iter().any(|b| {
+            matches!(b, TypeParamBound::Trait(tb) if names_table_trait(&tb.path, replacing_table))
         })
     };
-    let param_idents: std::collections::HashSet<&Ident> = impl_
-        .generics
-        .params
-        .iter()
-        .filter_map(|p| match p {
-            GenericParam::Type(t) => Some(&t.ident),
-            _ => None,
-        })
-        .collect();
-    impl_
-        .generics
-        .params
-        .iter()
-        .any(|p| matches!(p, GenericParam::Type(tp) if is_cyclic(&tp.bounds)))
-        || impl_.generics.where_clause.as_ref().is_some_and(|wc| {
-            wc.predicates.iter().any(|pred| match pred {
-                WherePredicate::Type(pt) => {
-                    matches!(&pt.bounded_ty, Type::Path(TypePath { qself: None, path })
-                        if path.segments.len() == 1
-                            && param_idents.contains(&path.segments[0].ident))
-                        && is_cyclic(&pt.bounds)
-                }
-                _ => false,
-            })
+    let param_idents = crate::names::type_param_idents(&impl_.generics);
+    impl_.generics.type_params().any(|tp| is_cyclic(&tp.bounds))
+        || crate::names::type_predicates(&impl_.generics).any(|pt| {
+            matches!(&pt.bounded_ty, Type::Path(TypePath { qself: None, path })
+                if path.segments.len() == 1 && param_idents.contains(&path.segments[0].ident))
+                && is_cyclic(&pt.bounds)
         })
 }
 
@@ -1581,188 +1388,12 @@ fn impl_has_bare_param_cyclic_bound(
 // macro expansion.
 // ---------------------------------------------------------------------------------------------
 
-/// Unifies `pattern` (with `pattern_vars` free) against the ground type `concrete`, returning
-/// the induced substitution on success. Used to match a candidate impl's own `self_ty` pattern
-/// against a cyclic bound's concrete target type. Bails (`None`) on any structural mismatch —
-/// the caller fails closed on that.
-fn unify_type_pattern(
-    pattern_vars: &std::collections::HashSet<Ident>,
-    pattern: &Type,
-    concrete: &Type,
-) -> Option<HashMap<Ident, Type>> {
-    if let Type::Path(TypePath { qself: None, path }) = pattern {
-        if path.leading_colon.is_none()
-            && path.segments.len() == 1
-            && path.segments[0].arguments == PathArguments::None
-            && pattern_vars.contains(&path.segments[0].ident)
-        {
-            let mut m = HashMap::new();
-            m.insert(path.segments[0].ident.clone(), concrete.clone());
-            return Some(m);
-        }
-    }
-    match (pattern, concrete) {
-        (
-            Type::Path(TypePath { qself: None, path: pp }),
-            Type::Path(TypePath { qself: None, path: cp }),
-        ) => {
-            if pp.leading_colon.is_some() != cp.leading_colon.is_some()
-                || pp.segments.len() != cp.segments.len()
-            {
-                return None;
-            }
-            let mut out = HashMap::new();
-            for (ps, cs) in pp.segments.iter().zip(cp.segments.iter()) {
-                if ps.ident != cs.ident {
-                    return None;
-                }
-                match (&ps.arguments, &cs.arguments) {
-                    (PathArguments::None, PathArguments::None) => {}
-                    (PathArguments::AngleBracketed(pa), PathArguments::AngleBracketed(ca)) => {
-                        if pa.args.len() != ca.args.len() {
-                            return None;
-                        }
-                        for (pg, cg) in pa.args.iter().zip(ca.args.iter()) {
-                            match (pg, cg) {
-                                (GenericArgument::Type(pt), GenericArgument::Type(ct)) => {
-                                    merge_subst(&mut out, unify_type_pattern(pattern_vars, pt, ct)?)?;
-                                }
-                                (GenericArgument::Lifetime(_), GenericArgument::Lifetime(_)) => {}
-                                (GenericArgument::Const(pe), GenericArgument::Const(ce)) => {
-                                    if quote!(#pe).to_string() != quote!(#ce).to_string() {
-                                        return None;
-                                    }
-                                }
-                                _ => return None,
-                            }
-                        }
-                    }
-                    _ => return None,
-                }
-            }
-            Some(out)
-        }
-        (Type::Tuple(pt), Type::Tuple(ct)) => {
-            if pt.elems.len() != ct.elems.len() {
-                return None;
-            }
-            let mut out = HashMap::new();
-            for (p, c) in pt.elems.iter().zip(ct.elems.iter()) {
-                merge_subst(&mut out, unify_type_pattern(pattern_vars, p, c)?)?;
-            }
-            Some(out)
-        }
-        (Type::Reference(pr), Type::Reference(cr)) => {
-            if pr.mutability.is_some() != cr.mutability.is_some() {
-                return None;
-            }
-            unify_type_pattern(pattern_vars, &pr.elem, &cr.elem)
-        }
-        (Type::Paren(p), _) => unify_type_pattern(pattern_vars, &p.elem, concrete),
-        (_, Type::Paren(c)) => unify_type_pattern(pattern_vars, pattern, &c.elem),
-        // C2 (defensive): a `<Recv as Trait>::Assoc` projection self. Normally unreachable —
-        // C2's `normalize_obligation_targets` pre-pass rewrites the projections a caller emits
-        // to concrete types first — but if an un-normalized one survives (a rule miss), a
-        // structural match here keeps it off the string-eq catch-all below, which fails on any
-        // lifetime/whitespace skew.
-        (
-            Type::Path(TypePath {
-                qself: Some(pq),
-                path: pp,
-            }),
-            Type::Path(TypePath {
-                qself: Some(cq),
-                path: cp,
-            }),
-        ) => {
-            if pq.position != cq.position {
-                return None;
-            }
-            let mut out = unify_type_pattern(pattern_vars, &pq.ty, &cq.ty)?;
-            if pp.leading_colon.is_some() != cp.leading_colon.is_some()
-                || pp.segments.len() != cp.segments.len()
-            {
-                return None;
-            }
-            for (ps, cs) in pp.segments.iter().zip(cp.segments.iter()) {
-                if ps.ident != cs.ident {
-                    return None;
-                }
-                match (&ps.arguments, &cs.arguments) {
-                    (PathArguments::None, PathArguments::None) => {}
-                    (PathArguments::AngleBracketed(pa), PathArguments::AngleBracketed(ca)) => {
-                        if pa.args.len() != ca.args.len() {
-                            return None;
-                        }
-                        for (pg, cg) in pa.args.iter().zip(ca.args.iter()) {
-                            match (pg, cg) {
-                                (GenericArgument::Type(pt), GenericArgument::Type(ct)) => {
-                                    merge_subst(&mut out, unify_type_pattern(pattern_vars, pt, ct)?)?;
-                                }
-                                (GenericArgument::Lifetime(_), GenericArgument::Lifetime(_)) => {}
-                                (GenericArgument::Const(pe), GenericArgument::Const(ce)) => {
-                                    if quote!(#pe).to_string() != quote!(#ce).to_string() {
-                                        return None;
-                                    }
-                                }
-                                _ => return None,
-                            }
-                        }
-                    }
-                    _ => return None,
-                }
-            }
-            Some(out)
-        }
-        _ => (quote!(#pattern).to_string() == quote!(#concrete).to_string()).then(HashMap::new),
-    }
-}
-
-/// Merges `add` into `base`, failing if a variable would be bound to two syntactically
-/// different types (a genuine ambiguity — the caller fails closed on that too).
-fn merge_subst(base: &mut HashMap<Ident, Type>, add: HashMap<Ident, Type>) -> Option<()> {
-    for (k, v) in add {
-        match base.get(&k) {
-            Some(existing) if quote!(#existing).to_string() != quote!(#v).to_string() => {
-                return None
-            }
-            _ => {
-                base.insert(k, v);
-            }
-        }
-    }
-    Some(())
-}
-
-/// Replaces every bare single-segment type in `subst`'s domain with its mapped type.
-fn apply_type_subst(ty: &Type, subst: &HashMap<Ident, Type>) -> Type {
-    struct Sub<'a>(&'a HashMap<Ident, Type>);
-    impl syn::visit_mut::VisitMut for Sub<'_> {
-        fn visit_type_mut(&mut self, ty: &mut Type) {
-            if let Type::Path(TypePath { qself: None, path }) = ty {
-                if path.leading_colon.is_none()
-                    && path.segments.len() == 1
-                    && path.segments[0].arguments == PathArguments::None
-                {
-                    if let Some(rep) = self.0.get(&path.segments[0].ident) {
-                        *ty = rep.clone();
-                        return;
-                    }
-                }
-            }
-            syn::visit_mut::visit_type_mut(self, ty);
-        }
-    }
-    let mut t = ty.clone();
-    syn::visit_mut::VisitMut::visit_type_mut(&mut Sub(subst), &mut t);
-    t
-}
-
 /// C2: rewrite projection obligation targets to their concrete form per the caller's
 /// `also_rank` normalize rules, BEFORE ranking. A cross-edge whose bounded type (or a bound's
 /// generic-arg subterm) is a projection like `<G as EmptyGroup>::Fill<Substruct>` is invisible
-/// to `unify_type_pattern` and untouched by `TraitReplacer`; the caller knows the concrete
-/// equal (`Group<Substruct,O,C>`) at emission time and passes the pair. Applied to every impl's
+/// to the registration check's unifier (`crate::unify`) and untouched by `TraitReplacer`; the
+/// caller knows the concrete equal (`Group<Substruct,O,C>`) at emission time and passes the pair.
+/// Applied to every impl's
 /// `Generics` (where-clause + param bounds) so every downstream stage sees a plain concrete
 /// member. Matched by canonical-string structural equality (both sides are ground, concrete
 /// types the caller fully controls the spelling of — no pattern variables, no unifier needed
@@ -1787,16 +1418,10 @@ fn normalize_obligation_targets(impl_: &mut ItemImpl, rules: &[(Type, Type)]) {
     if rules.is_empty() {
         return;
     }
-    syn::visit_mut::VisitMut::visit_generics_mut(&mut NormalizeTargets { rules }, &mut impl_.generics);
-}
-
-/// Strips a leading `::` (global-path) marker so `::core::fmt::Debug` and `core::fmt::Debug`
-/// render identically (F1b: same-spelling paths must compare equal). Deliberately shallow —
-/// only the top-level `leading_colon` token is cleared, not any nested path (e.g. inside a
-/// generic argument); a genuinely different path (different segments, or a different crate
-/// root reached via `self::`/`crate::`) must keep comparing unequal.
-fn strip_leading_colon(path: &mut Path) {
-    path.leading_colon = None;
+    syn::visit_mut::VisitMut::visit_generics_mut(
+        &mut NormalizeTargets { rules },
+        &mut impl_.generics,
+    );
 }
 
 /// Renders one `Bounded : Bound` side predicate, substituting `bt` (already substituted by the
@@ -1806,20 +1431,25 @@ fn strip_leading_colon(path: &mut Path) {
 /// impl's side (`u8: Fixed<Y>` with a DIFFERENT, registering-impl-local `Y`) after substitution
 /// makes both bounded types read `u8`. The registering impl's own side (`own_side`, called with
 /// `subst = None`) is intentionally left unsubstituted — it already reads in its own terms.
-fn format_side_bound(bt: &Type, tb: &TraitBound, subst: Option<&HashMap<Ident, Type>>) -> String {
+fn format_side_bound(bt: &Type, tb: &TraitBound, subst: Option<&Subst>) -> String {
     let mut tb = tb.clone();
     if let Some(s) = subst {
         for seg in tb.path.segments.iter_mut() {
             if let PathArguments::AngleBracketed(ab) = &mut seg.arguments {
                 for arg in ab.args.iter_mut() {
                     if let GenericArgument::Type(t) = arg {
-                        *t = apply_type_subst(t, s);
+                        *t = crate::unify::substitute(t, s);
                     }
                 }
             }
         }
     }
-    strip_leading_colon(&mut tb.path);
+    // Strip a leading `::` (global-path) marker so `::core::fmt::Debug` and `core::fmt::Debug`
+    // render identically (F1b: same-spelling paths must compare equal). Deliberately shallow —
+    // only the top-level `leading_colon` token is cleared, not any nested path (e.g. inside a
+    // generic argument); a genuinely different path (different segments, or a different crate
+    // root reached via `self::`/`crate::`) must keep comparing unequal.
+    tb.path.leading_colon = None;
     format!("{} : {}", quote!(#bt), quote!(#tb))
 }
 
@@ -1835,43 +1465,21 @@ fn format_side_bound(bt: &Type, tb: &TraitBound, subst: Option<&HashMap<Ident, T
 /// silently lost all of its registrations.
 fn side_predicate_strings(
     generics: &Generics,
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
-    subst: Option<&HashMap<Ident, Type>>,
+    replacing_table: &Table,
+    subst: Option<&Subst>,
 ) -> Vec<String> {
     let g = remove_cyclic_bounds(generics, replacing_table, false);
-    let sub = |ty: &Type| match subst {
-        Some(s) => apply_type_subst(ty, s),
-        None => ty.clone(),
-    };
-    let is_relaxed = |tb: &TraitBound| matches!(tb.modifier, TraitBoundModifier::Maybe(_));
     let mut out = Vec::new();
-    for p in &g.params {
-        if let GenericParam::Type(tp) = p {
-            let bt = sub(&Type::Path(TypePath {
-                qself: None,
-                path: Path::from(tp.ident.clone()),
-            }));
-            for b in &tp.bounds {
-                if let TypeParamBound::Trait(tb) = b {
-                    if is_relaxed(tb) {
-                        continue;
-                    }
+    for (ty, bounds) in g
+        .type_params()
+        .map(|tp| (parse_quote!(#{&tp.ident}), &tp.bounds))
+        .chain(crate::names::type_predicates(&g).map(|pt| (pt.bounded_ty.clone(), &pt.bounds)))
+    {
+        let bt = subst.map_or_else(|| ty.clone(), |s| crate::unify::substitute(&ty, s));
+        for b in bounds {
+            if let TypeParamBound::Trait(tb) = b {
+                if !matches!(tb.modifier, TraitBoundModifier::Maybe(_)) {
                     out.push(format_side_bound(&bt, tb, subst));
-                }
-            }
-        }
-    }
-    if let Some(wc) = &g.where_clause {
-        for pred in &wc.predicates {
-            if let WherePredicate::Type(pt) = pred {
-                let bt = sub(&pt.bounded_ty);
-                for b in &pt.bounds {
-                    if let TypeParamBound::Trait(tb) = b {
-                        if is_relaxed(tb) {
-                            continue;
-                        }
-                        out.push(format_side_bound(&bt, tb, subst));
-                    }
                 }
             }
         }
@@ -1879,57 +1487,14 @@ fn side_predicate_strings(
     out
 }
 
-/// Is every non-cyclic bound reachable through `target_ty: target_trait`'s cyclic-bound graph
-/// already among `registering_impl`'s own bounds? Walks the graph breadth-first: at each
-/// `(trait, ty)` node, finds every impl of `trait` whose `self_ty` structurally matches `ty`
-/// (`unify_type_pattern`), collects that impl's own side bounds (substituted into
-/// `registering_impl`'s terms), and continues through that impl's own cyclic bounds
-/// (substituted the same way). Fails closed — returns `false` — the moment anything can't be
-/// established syntactically: an unknown trait, no matching impl, more than one matching impl
-/// (ambiguous — treated as needing the union, but an actual mismatch between them still fails
-/// via `merge_subst`/string comparison), or an impl type param left unresolved by unification.
-/// Unify a candidate impl against a concrete obligation, matching BOTH the impl's self type and
-/// its trait own-arguments (`impl<T> Cast<T> for A` against the obligation `A: Cast<i64>` binds
-/// `T = i64`). A trait's own type-generic is determined by the trait argument, NOT the self type,
-/// so unifying the self type alone (as this used to) leaves such a `T` forever unbound and wrongly
-/// rejects the whole registration. Const/lifetime trait args match by the same rules
-/// `unify_type_pattern` uses inside a path's argument list.
-fn unify_impl_against_obligation(
-    pattern_vars: &std::collections::HashSet<Ident>,
-    cand_self: &Type,
-    cand_targs: &[GenericArgument],
-    obl_self: &Type,
-    obl_targs: &[GenericArgument],
-) -> Option<HashMap<Ident, Type>> {
-    let mut subst = unify_type_pattern(pattern_vars, cand_self, obl_self)?;
-    if cand_targs.len() != obl_targs.len() {
-        return None;
-    }
-    for (pg, cg) in cand_targs.iter().zip(obl_targs.iter()) {
-        match (pg, cg) {
-            (GenericArgument::Type(pt), GenericArgument::Type(ct)) => {
-                merge_subst(&mut subst, unify_type_pattern(pattern_vars, pt, ct)?)?;
-            }
-            (GenericArgument::Lifetime(_), GenericArgument::Lifetime(_)) => {}
-            (GenericArgument::Const(pe), GenericArgument::Const(ce)) => {
-                if quote!(#pe).to_string() != quote!(#ce).to_string() {
-                    return None;
-                }
-            }
-            _ => return None,
-        }
-    }
-    Some(subst)
-}
-
 /// Apply a type substitution to every `GenericArgument::Type` in a trait arg list (const/lifetime
 /// args pass through), so a reachable-bound's trait args carry the same substitution its target
 /// type does when the reachability walk descends through a cross-edge.
-fn apply_targs_subst(targs: &[GenericArgument], subst: &HashMap<Ident, Type>) -> Vec<GenericArgument> {
+fn apply_targs_subst(targs: &[GenericArgument], subst: &Subst) -> Vec<GenericArgument> {
     targs
         .iter()
         .map(|g| match g {
-            GenericArgument::Type(t) => GenericArgument::Type(apply_type_subst(t, subst)),
+            GenericArgument::Type(t) => GenericArgument::Type(crate::unify::substitute(t, subst)),
             other => other.clone(),
         })
         .collect()
@@ -1945,19 +1510,29 @@ fn apply_targs_subst(targs: &[GenericArgument], subst: &HashMap<Ident, Type>) ->
 /// instead: no input in this class is compilable anyway (see the comment at the cap check).
 const REACHABLE_OBLIGATIONS_CAP: usize = 1000;
 
+/// Is every non-cyclic bound reachable through `target_ty: target_trait`'s cyclic-bound graph
+/// already among `registering_impl`'s own bounds? Walks the graph breadth-first: at each
+/// `(trait, ty)` node, finds every impl of `trait` whose `self_ty` structurally matches `ty`
+/// (`crate::unify::unify_obligation`, the registration reading), collects that impl's own side
+/// bounds (substituted into
+/// `registering_impl`'s terms), and continues through that impl's own cyclic bounds
+/// (substituted the same way). Fails closed — returns `false` — the moment anything can't be
+/// established syntactically: an unknown trait, no matching impl, more than one matching impl
+/// (ambiguous — treated as needing the union, but an actual mismatch between them still fails
+/// by spelling), or an impl type param left unresolved by unification.
 fn reachable_side_bounds_ok(
     registering_impl: &ItemImpl,
     target_ty: &Type,
     target_trait: &Ident,
     target_targs: &[GenericArgument],
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+    replacing_table: &Table,
 ) -> bool {
-    let own_side: std::collections::HashSet<String> =
+    let own_side: HashSet<String> =
         side_predicate_strings(&registering_impl.generics, replacing_table, None)
             .into_iter()
             .collect();
 
-    let mut visited: std::collections::HashSet<(Ident, String)> = Default::default();
+    let mut visited: HashSet<(Ident, String)> = Default::default();
     let mut queue: std::collections::VecDeque<(Ident, Type, Vec<GenericArgument>)> =
         Default::default();
     queue.push_back((
@@ -2004,28 +1579,21 @@ fn reachable_side_bounds_ok(
         };
         let mut matched_any = false;
         for cand in impls {
-            let pattern_vars: std::collections::HashSet<Ident> = cand
-                .generics
-                .params
-                .iter()
-                .filter_map(|p| match p {
-                    GenericParam::Type(t) => Some(t.ident.clone()),
-                    _ => None,
-                })
-                .collect();
-            let cand_targs = cand
-                .trait_
-                .as_ref()
-                .map(|(_, path, _)| {
-                    nonlifetime_path_args(&path.segments.last().unwrap().arguments)
-                })
-                .unwrap_or_default();
-            let Some(subst) =
-                unify_impl_against_obligation(&pattern_vars, &cand.self_ty, &cand_targs, &ty, &targs)
-            else {
+            let pattern_vars = crate::names::type_param_idents(&cand.generics);
+            let cand_targs = impl_trait_args(cand);
+            let Some(subst) = crate::unify::unify_obligation(
+                &pattern_vars,
+                &cand.self_ty,
+                &cand_targs,
+                &ty,
+                &targs,
+            ) else {
                 continue;
             };
-            if pattern_vars.iter().any(|v| !subst.contains_key(v)) {
+            if pattern_vars
+                .iter()
+                .any(|v| !subst.contains_key(&v.to_string()))
+            {
                 return false;
             }
             matched_any = true;
@@ -2037,7 +1605,7 @@ fn reachable_side_bounds_ok(
             for cb in cyclic_where_bounds(cand, replacing_table) {
                 queue.push_back((
                     cb.trait_ident,
-                    apply_type_subst(&cb.target, &subst),
+                    crate::unify::substitute(&cb.target, &subst),
                     apply_targs_subst(&cb.targs, &subst),
                 ));
             }
@@ -2070,7 +1638,8 @@ struct NormSig {
 fn normalize_reentry_sig(tf: &TraitItemFn, s_ty: &Type, trait_path_full: &Path) -> NormSig {
     let orig_sig = &tf.sig;
     let mut sig = orig_sig.clone();
-    replace_self_and_desugar_impl_trait(&mut sig, s_ty);
+    replace_self(&mut sig, s_ty);
+    desugar_impl_trait_inputs(&mut sig);
     for (ix, input) in sig.inputs.iter_mut().enumerate() {
         input.reduce_pat(ix);
     }
@@ -2098,58 +1667,53 @@ fn normalize_reentry_sig(tf: &TraitItemFn, s_ty: &Type, trait_path_full: &Path) 
             }
         }
     }
-    let mut namer = LtNamer {
-        fresh: Vec::new(),
-        counter: 0,
-    };
+    let mut self_subst = SelfSubst::new(s_ty, trait_path_full);
+    let mut fresh = Vec::new();
     for (_, ty) in params.iter_mut() {
-        syn::visit_mut::VisitMut::visit_type_mut(
-            &mut SelfSubst {
-                s_ty,
-                trait_path: trait_path_full,
-            },
-            ty,
-        );
-        syn::visit_mut::VisitMut::visit_type_mut(&mut namer, ty);
+        syn::visit_mut::VisitMut::visit_type_mut(&mut self_subst, ty);
+        fill_elided_lifetimes(ty, &mut || {
+            let lt = Lifetime::new(&format!("'__dcl{}", fresh.len()), Span::call_site());
+            fresh.push(lt.clone());
+            lt
+        });
     }
     let mut output_ty: Option<Type> = match &sig.output {
         ReturnType::Type(_, t) => Some((**t).clone()),
         ReturnType::Default => None,
     };
     if let Some(t) = output_ty.as_mut() {
-        syn::visit_mut::VisitMut::visit_type_mut(
-            &mut SelfSubst {
-                s_ty,
-                trait_path: trait_path_full,
-            },
-            t,
-        );
-        if count_elided_lifetimes(t) > 0 {
-            let subst = if let Some(ix) = recv_ref_slot {
-                match &params[ix].1 {
-                    Type::Reference(tr) => tr.lifetime.clone().unwrap(),
-                    _ => unreachable!("reference receiver flattens to a reference type"),
-                }
-            } else {
-                let named = distinct_lifetimes_in(params.iter().map(|(_, t)| t.clone()));
-                if named.len() == 1 {
-                    named.into_iter().next().unwrap()
-                } else {
-                    abort!(
-                        orig_sig,
-                        "cannot resolve the elided output lifetime for #[decycle] unbounded \
-                         re-entry; name the lifetime explicitly"
-                    )
-                }
-            };
-            subst_elided_lifetimes(t, &subst);
-        }
+        syn::visit_mut::VisitMut::visit_type_mut(&mut self_subst, t);
+        // The output's elided lifetimes are the reference receiver's, or else the one lifetime the
+        // parameters name (resolved only when the output elides one).
+        let mut resolved: Option<Lifetime> = None;
+        fill_elided_lifetimes(t, &mut || {
+            resolved
+                .get_or_insert_with(|| match recv_ref_slot {
+                    Some(ix) => match &params[ix].1 {
+                        Type::Reference(tr) => tr.lifetime.clone().unwrap(),
+                        _ => unreachable!("reference receiver flattens to a reference type"),
+                    },
+                    None => {
+                        let named = distinct_lifetimes_in(params.iter().map(|(_, t)| t.clone()));
+                        if named.len() == 1 {
+                            named.into_iter().next().unwrap()
+                        } else {
+                            abort!(
+                                orig_sig,
+                                "cannot resolve the elided output lifetime for #[decycle] \
+                                 unbounded re-entry; name the lifetime explicitly"
+                            )
+                        }
+                    }
+                })
+                .clone()
+        });
     }
     NormSig {
         params,
         arg_idents,
         output_ty,
-        fresh: namer.fresh,
+        fresh,
         sig,
     }
 }
@@ -2157,54 +1721,44 @@ fn normalize_reentry_sig(tf: &TraitItemFn, s_ty: &Type, trait_path_full: &Path) 
 /// Which of the trait's / method's type+const params (and `S`) the normalized fn-pointer
 /// type actually mentions. A type alias rejects unused generics (E0091), so the alias
 /// declares — and the floor instantiates — exactly this subset, in declaration order.
-fn reentry_used_mask(trait_: &ItemTrait, norm: &NormSig, s_ident: &Ident) -> (bool, Vec<bool>, Vec<bool>) {
-    struct Used(std::collections::HashSet<String>);
-    impl<'ast> syn::visit::Visit<'ast> for Used {
-        fn visit_ident(&mut self, i: &'ast Ident) {
-            self.0.insert(i.to_string());
-        }
-    }
-    let mut used = Used(Default::default());
-    for (_, ty) in &norm.params {
-        syn::visit::Visit::visit_type(&mut used, ty);
-    }
-    if let Some(t) = &norm.output_ty {
-        syn::visit::Visit::visit_type(&mut used, t);
-    }
-    let mask = |params: &Generics| -> Vec<bool> {
-        params
-            .params
+fn reentry_used_mask(
+    trait_: &ItemTrait,
+    norm: &NormSig,
+    s_ident: &Ident,
+) -> (bool, Vec<bool>, Vec<bool>) {
+    let (used, _) = used_names(norm);
+    let mask = |g: &Generics| -> Vec<bool> {
+        type_const_idents(g)
             .iter()
-            .filter(|p| !matches!(p, GenericParam::Lifetime(_)))
-            .map(|p| match p {
-                GenericParam::Type(t) => used.0.contains(&t.ident.to_string()),
-                GenericParam::Const(c) => used.0.contains(&c.ident.to_string()),
-                GenericParam::Lifetime(_) => unreachable!(),
-            })
+            .map(|i| used.contains(&i.to_string()))
             .collect()
     };
     (
-        used.0.contains(&s_ident.to_string()),
+        used.contains(&s_ident.to_string()),
         mask(&trait_.generics),
         mask(&norm.sig.generics),
     )
 }
 
-fn used_lifetime_idents(norm: &NormSig) -> std::collections::HashSet<String> {
-    struct Used(std::collections::HashSet<String>);
+/// The idents, and the lifetime names, that the parameter and output types of `norm` use (a
+/// lifetime's ident counts as an ident too).
+fn used_names(norm: &NormSig) -> (HashSet<String>, HashSet<String>) {
+    #[derive(Default)]
+    struct Used(HashSet<String>, HashSet<String>);
     impl<'ast> syn::visit::Visit<'ast> for Used {
+        fn visit_ident(&mut self, i: &'ast Ident) {
+            self.0.insert(i.to_string());
+        }
         fn visit_lifetime(&mut self, l: &'ast Lifetime) {
-            self.0.insert(l.ident.to_string());
+            self.1.insert(l.ident.to_string());
+            syn::visit::visit_lifetime(self, l);
         }
     }
-    let mut used = Used(Default::default());
-    for (_, ty) in &norm.params {
+    let mut used = Used::default();
+    for ty in norm.params.iter().map(|(_, t)| t).chain(&norm.output_ty) {
         syn::visit::Visit::visit_type(&mut used, ty);
     }
-    if let Some(t) = &norm.output_ty {
-        syn::visit::Visit::visit_type(&mut used, t);
-    }
-    used.0
+    (used.0, used.1)
 }
 
 /// How the re-entry machinery (inside `ranked_traits`) names the ORIGINAL trait: through the
@@ -2224,7 +1778,7 @@ fn original_trait_path(trait_: &ItemTrait) -> Path {
 /// fn whose body calls the *original* trait method. Emitted inside `ranked_traits`, where
 /// `super::super::T` resolves to the real trait (the dummy shadows live one module up and
 /// are not in child scope).
-fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize, _decycle: &Path) -> TokenStream {
+fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize) -> TokenStream {
     let mut out = TokenStream::new();
     let trait_ident = &trait_.ident;
     let s_ident = name!("DclSelf");
@@ -2244,37 +1798,19 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize, _decycle: &Path) -> T
     // `super::super::` prefix), which is exactly what that surrounding impl already provides
     // (including its own `type Assoc = ...;`, copied verbatim from the user's impl).
     let ranked_trait_ident = name!("{}Ranked", trait_ident);
-    let ranked_args_at_leaf = trait_.generics.ty_generics().insert(rank_loc, parse_quote!(()));
+    let ranked_args_at_leaf = trait_
+        .generics
+        .ty_generics()
+        .insert(rank_loc, parse_quote!(()));
     let ranked_trait_path_leaf: Path = parse_quote!(#ranked_trait_ident #ranked_args_at_leaf);
 
+    let mut self_subst = SelfSubst::new(&s_ty, &trait_path_full);
     let mut tg = trait_.generics.clone();
-    syn::visit_mut::VisitMut::visit_generics_mut(
-        &mut SelfSubst {
-            s_ty: &s_ty,
-            trait_path: &trait_path_full,
-        },
-        &mut tg,
-    );
-    let trait_lts: Vec<GenericParam> = tg
-        .params
-        .iter()
-        .filter(|p| matches!(p, GenericParam::Lifetime(_)))
-        .cloned()
-        .collect();
-    let trait_tycon: Vec<GenericParam> = tg
-        .params
-        .iter()
-        .filter(|p| !matches!(p, GenericParam::Lifetime(_)))
-        .cloned()
-        .collect();
-    let trait_where: Vec<WherePredicate> = tg
-        .where_clause
-        .as_ref()
-        .map(|w| w.predicates.iter().cloned().collect())
-        .unwrap_or_default();
+    syn::visit_mut::VisitMut::visit_generics_mut(&mut self_subst, &mut tg);
+    let (trait_lts, trait_tycon) = split_lifetimes(&tg.params);
+    let trait_where: Vec<&WherePredicate> = crate::names::where_predicates(&tg).collect();
 
-    for item in &trait_.items {
-        let TraitItem::Fn(tf) = item else { continue };
+    for tf in trait_fns(trait_) {
         let orig_sig = &tf.sig;
         // D4: unbounded re-entry needs a nameable fn-pointer type for this method. A
         // return-position `impl Trait` makes `fn(...) -> impl Trait` (E0562); abort with an
@@ -2305,24 +1841,9 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize, _decycle: &Path) -> T
                 .chain(norm.output_ty.as_ref()),
             &s_ident,
         );
-        let used_lts = used_lifetime_idents(&norm);
+        let (_, used_lts) = used_names(&norm);
 
-        let m_lts: Vec<GenericParam> = norm
-            .sig
-            .generics
-            .params
-            .iter()
-            .filter(|p| matches!(p, GenericParam::Lifetime(_)))
-            .cloned()
-            .collect();
-        let m_tycon: Vec<GenericParam> = norm
-            .sig
-            .generics
-            .params
-            .iter()
-            .filter(|p| !matches!(p, GenericParam::Lifetime(_)))
-            .cloned()
-            .collect();
+        let (m_lts, m_tycon) = split_lifetimes(&norm.sig.generics.params);
         // C3: `normalize_reentry_sig` only bare-`Self`-substitutes the signature (params +
         // output type) — a `Self::Assoc` PROJECTION surviving in the copied method
         // where-clause (e.g. a span-tying surface `A: Spanned<Span = Self::SpanParam>`)
@@ -2333,46 +1854,26 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize, _decycle: &Path) -> T
         // #trait_ident #trait_args` is already in `#re`'s own where-clause below, so the
         // projection resolves; the Final impl's `type SpanParam = S;` bottoms it out in one
         // hop. A no-op for any where-clause with no `Self`-prefixed multi-segment path.
-        let m_where: Vec<WherePredicate> = norm
-            .sig
-            .generics
-            .where_clause
-            .as_ref()
-            .map(|w| w.predicates.iter().cloned().collect::<Vec<_>>())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|mut w| {
-                syn::visit_mut::VisitMut::visit_where_predicate_mut(
-                    &mut SelfSubst {
-                        s_ty: &s_ty,
-                        trait_path: &trait_path_full,
-                    },
-                    &mut w,
-                );
+        let m_where: Vec<WherePredicate> = crate::names::where_predicates(&norm.sig.generics)
+            .map(|w| {
+                let mut w = w.clone();
+                syn::visit_mut::VisitMut::visit_where_predicate_mut(&mut self_subst, &mut w);
                 w
             })
             .collect();
         // Alias generics: used lifetimes, then S (if used), then used type/const params.
         let alias_lts: Vec<&GenericParam> = trait_lts
             .iter()
-            .chain(m_lts.iter())
+            .chain(&m_lts)
+            .copied()
             .filter(|p| match p {
                 GenericParam::Lifetime(l) => used_lts.contains(&l.lifetime.ident.to_string()),
                 _ => false,
             })
             .collect();
-        let alias_tycon: Vec<&GenericParam> = trait_tycon
-            .iter()
-            .zip(tmask.iter())
-            .filter(|(_, k)| **k)
-            .map(|(p, _)| p)
-            .chain(
-                m_tycon
-                    .iter()
-                    .zip(mmask.iter())
-                    .filter(|(_, k)| **k)
-                    .map(|(p, _)| p),
-            )
+        let alias_tycon: Vec<&GenericParam> = masked(&trait_tycon, &tmask)
+            .chain(masked(&m_tycon, &mmask))
+            .copied()
             .collect();
         let fresh = &norm.fresh;
         let m_ident = &norm.sig.ident;
@@ -2393,17 +1894,11 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize, _decycle: &Path) -> T
         // signature-position patterns — those may carry `mut` (valid in the `#re` fn's own
         // param list at its declaration below, invalid as a call-argument expression).
         let param_pats: Vec<&TokenStream> = norm.arg_idents.iter().collect();
-        let out_tokens = match &norm.output_ty {
-            Some(t) => quote!(-> #t),
-            None => quote!(),
-        };
+        let out_tokens = norm.output_ty.as_ref().map(|t| quote!(-> #t));
         // The alias's own body types — projecting any `Self::Assoc` through the ranked trait
         // at the leaf instead of the real one (see the comment above `ranked_trait_path_leaf`).
         let alias_param_tys: Vec<&Type> = norm_alias.params.iter().map(|(_, t)| t).collect();
-        let alias_out_tokens = match &norm_alias.output_ty {
-            Some(t) => quote!(-> #t),
-            None => quote!(),
-        };
+        let alias_out_tokens = norm_alias.output_ty.as_ref().map(|t| quote!(-> #t));
         // Only emit the alias's `where` clause when its body actually contains an
         // associated-type projection needing it — see `any_type_has_projection`'s doc comment.
         let alias_needs_bound = any_type_has_projection(
@@ -2419,14 +1914,7 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize, _decycle: &Path) -> T
         // `Self`), naming that projection at the floor needs `A: Spanned` in scope — the plain
         // `S: <ranked trait>` bound above doesn't provide it. Harmless when unneeded: a
         // satisfiable bound on a concrete, masked-in `A` at the floor.
-        let m_tycon_alias: Vec<GenericParam> = norm_alias
-            .sig
-            .generics
-            .params
-            .iter()
-            .filter(|p| !matches!(p, GenericParam::Lifetime(_)))
-            .cloned()
-            .collect();
+        let (_, m_tycon_alias) = split_lifetimes(&norm_alias.sig.generics.params);
         // The alias declares BOTH the trait's type params (`alias_tycon`) and the method's
         // (`m_tycon_alias`) with `DeclBounds::Unsized` — every bound stripped. That is fine while the
         // signature merely NAMES those params, but not when a bound PROJECTS through one. A
@@ -2439,53 +1927,45 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize, _decycle: &Path) -> T
         // copies a user signature must carry the premises that signature projects through. Restating
         // a method-level `where Atom: Spanned` on the trait does NOT help — those are dropped here
         // too — so this is the only place it can be fixed.
-        let alias_method_bounds: Vec<WherePredicate> = alias_tycon
-            .iter()
-            .copied()
-            .cloned()
-            .chain(
-                m_tycon_alias
-                    .iter()
-                    .zip(mmask.iter())
-                    .filter(|(_, k)| **k)
-                    .map(|(p, _)| p.clone()),
-            )
+        let mut alias_method_bounds: Vec<WherePredicate> = Vec::new();
+        for p in alias_tycon.iter().chain(masked(&m_tycon_alias, &mmask)) {
+            let GenericParam::Type(t) = p else { continue };
+            // Drop a user-written `?Sized`. The param is DECLARED with `DeclBounds::Unsized`
+            // below, which already emits `T: ?::core::marker::Sized`; repeating the relaxation
+            // here is a *second* relaxed bound on the same param, which rustc rejects with E0203
+            // ("duplicate relaxed `Sized` bounds"). Nothing is lost — the declaration makes
+            // exactly the same statement. If the relaxation was the param's only bound, the
+            // predicate disappears entirely.
+            let bounds: Punctuated<TypeParamBound, Token![+]> = t
+                .bounds
+                .iter()
+                .filter(|b| {
+                    !matches!(b, TypeParamBound::Trait(tb)
+                        if matches!(tb.modifier, TraitBoundModifier::Maybe(_)))
+                })
+                .cloned()
+                .collect();
+            if bounds.is_empty() {
+                continue;
+            }
+            let ident = &t.ident;
+            let w: WherePredicate = parse_quote!(#ident: #bounds);
             // `alias_tycon` と `m_tycon_alias` は重なりうるので、同じ述語を二度書かない。
             // rustc は重複を受け入れるが、生成物を読む人には無駄なノイズになる。
-            .filter_map(|p| match &p {
-                GenericParam::Type(t) if !t.bounds.is_empty() => {
-                    // Drop a user-written `?Sized`. The param is DECLARED with
-                    // `DeclBounds::Unsized` below, which already emits
-                    // `T: ?::core::marker::Sized`; repeating the relaxation here is a *second*
-                    // relaxed bound on the same param, which rustc rejects with E0203
-                    // ("duplicate relaxed `Sized` bounds"). Nothing is lost — the declaration
-                    // makes exactly the same statement. If the relaxation was the param's only
-                    // bound, the predicate disappears entirely.
-                    let bounds: Punctuated<TypeParamBound, Token![+]> = t
-                        .bounds
-                        .iter()
-                        .filter(|b| {
-                            !matches!(b, TypeParamBound::Trait(tb)
-                                if matches!(tb.modifier, TraitBoundModifier::Maybe(_)))
-                        })
-                        .cloned()
-                        .collect();
-                    if bounds.is_empty() {
-                        return None;
-                    }
-                    let ident = &t.ident;
-                    Some(parse_quote!(#ident: #bounds))
-                }
-                _ => None,
-            })
-            .fold(Vec::new(), |mut acc: Vec<WherePredicate>, w| {
-                if !acc.iter().any(|x| quote!(#x).to_string() == quote!(#w).to_string()) {
-                    acc.push(w);
-                }
-                acc
-            });
+            if !alias_method_bounds
+                .iter()
+                .any(|x| quote!(#x).to_string() == quote!(#w).to_string())
+            {
+                alias_method_bounds.push(w);
+            }
+        }
         let orig_margs = type_const_idents(&orig_sig.generics);
         let do_turbofish = !orig_margs.is_empty() && !sig_has_impl_trait_input(orig_sig);
+        let call = quote! {
+            <#s_ident as #trait_path_full>::#m_ident
+            #(if do_turbofish) { ::<#(#orig_margs),*> }
+            (#(#param_pats),*)
+        };
 
         out.extend(quote! {
             #[allow(dead_code, non_camel_case_types)]
@@ -2545,18 +2025,8 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize, _decycle: &Path) -> T
             {
                 // As in the floor (`emit_impl_items_leaf`): don't nest a redundant, always-
                 // present `{ ... }` when there's no `unsafe` to scope it for.
-                #(if unsafety.is_some()) {
-                    unsafe {
-                        <#s_ident as #trait_path_full>::#m_ident
-                        #(if do_turbofish) { ::<#(#orig_margs),*> }
-                        (#(#param_pats),*)
-                    }
-                }
-                #(if unsafety.is_none()) {
-                    <#s_ident as #trait_path_full>::#m_ident
-                    #(if do_turbofish) { ::<#(#orig_margs),*> }
-                    (#(#param_pats),*)
-                }
+                #(if unsafety.is_some()) { unsafe { #call } }
+                #(else) { #call }
             }
         });
     }
@@ -2568,19 +2038,11 @@ fn emit_reentry_items(trait_: &ItemTrait, rank_loc: usize, _decycle: &Path) -> T
 /// undischargeable inside the rank-rewritten frame) and F-C1's side-bound reachability check
 /// passes (naming the re-entry fn's `Self: T` obligation must be provable from `impl_`'s own
 /// bounds alone).
-fn rule1_registration_ok(
-    trait_: &ItemTrait,
-    impl_: &ItemImpl,
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
-) -> bool {
+fn rule1_registration_ok(trait_: &ItemTrait, impl_: &ItemImpl, replacing_table: &Table) -> bool {
     // The impl's own trait own-args (`impl<T> Cast<T> for A` -> `[T]`) are part of the obligation
     // its rule-1 registration proves — the reachability walk must bind them (they may not appear
     // in the self type at all), so thread them in rather than starting the walk arg-blind.
-    let self_targs = impl_
-        .trait_
-        .as_ref()
-        .map(|(_, path, _)| nonlifetime_path_args(&path.segments.last().unwrap().arguments))
-        .unwrap_or_default();
+    let self_targs = impl_trait_args(impl_);
     !impl_has_bare_param_cyclic_bound(impl_, replacing_table)
         && reachable_side_bounds_ok(
             impl_,
@@ -2591,37 +2053,48 @@ fn rule1_registration_ok(
         )
 }
 
-/// Emit one re-entry registration statement (`register::<Mk<...>>(fp, Re::<...> as usize);`).
+/// Emit the re-entry registration statements (`register::<Mk<...>>(fp, Re::<...> as *const ());`)
+/// of `target: trait_<targs>`, one per method in `methods`, each keyed by [`fingerprint_expr`]
+/// with the method's own generics, as the floor looks it up. (The generics of a non-generic method
+/// fold nothing, so they key it as `None` would.)
 ///
 /// `rt_path` is the path prefix to the generated `ranked_traits` module as seen from wherever the
-/// statement is emitted. A programmatic caller splicing registrations alongside [`finalize`]'s
-/// output passes the full path to that module. Semver-committed.
-// The parameter list is the committed bridge signature; bundling it into a struct would be a
-// breaking change, so the arity is intentional.
-#[allow(clippy::too_many_arguments)]
-fn emit_registration(
+/// statements are emitted.
+fn emit_registrations<'a>(
     decycle: &Path,
     rt_path: &TokenStream,
-    trait_ident: &Ident,
-    m_ident: &Ident,
+    trait_: &ItemTrait,
     target: &TokenStream,
+    target_unsized: bool,
     targs: &[GenericArgument],
-    margs: &[Ident],
-    fp: TokenStream,
+    methods: impl IntoIterator<Item = &'a Signature>,
 ) -> TokenStream {
-    let mk = reentry_marker_name(trait_ident, m_ident);
-    let re = reentry_fn_name(trait_ident, m_ident);
-    // `as *const ()` (never `as usize`): laundering a fn pointer through an integer strips its
-    // provenance, and calling the transmuted result is UB.
-    //
-    // Rollback is handled by the enclosing `__reentry::scope()` guard the prologue opens, not
-    // per registration — see `Registration` in the runtime facade.
-    quote! {
-        #decycle::__reentry::register::<#rt_path::#mk<#target #(for a in targs) {, #a} #(for i in margs) {, #i}>>(
-            #fp,
-            #rt_path::#re::<#target #(for a in targs) {, #a} #(for i in margs) {, #i}> as *const ()
+    let mut out = TokenStream::new();
+    for sig in methods {
+        let margs = type_const_idents(&sig.generics);
+        let fp = fingerprint_expr(
+            decycle,
+            target,
+            target_unsized,
+            &trait_.generics,
+            targs,
+            Some(&sig.generics),
         );
+        let mk = reentry_marker_name(&trait_.ident, &sig.ident);
+        let re = reentry_fn_name(&trait_.ident, &sig.ident);
+        // `as *const ()` (never `as usize`): laundering a fn pointer through an integer strips its
+        // provenance, and calling the transmuted result is UB.
+        //
+        // Rollback is handled by the enclosing `__reentry::scope()` guard the prologue opens, not
+        // per registration — see `Registration` in the runtime facade.
+        out.extend(quote! {
+            #decycle::__reentry::register::<#rt_path::#mk<#target #(for a in targs) {, #a} #(for i in &margs) {, #i}>>(
+                #fp,
+                #rt_path::#re::<#target #(for a in targs) {, #a} #(for i in &margs) {, #i}> as *const ()
+            );
+        });
     }
+    out
 }
 
 /// Rule 1's registrations for THIS method's prologue: its own instantiation plus every
@@ -2632,8 +2105,9 @@ fn emit_registration(
 /// the same method hits a real, if obscure, rustc region-inference pitfall around late-bound
 /// lifetimes in an under-determined fn-item-to-integer cast, `bug2.rs`'s spurious `'b: 'a`
 /// demand — emitting it exactly once, inline, sidesteps it entirely).
-/// Shared body of the `Self: T` re-entry registrations (rule 1 and the bare-param C4 case):
-/// registers the current method (keyed with its own method-generics fingerprint) plus every
+///
+/// Also the bare-param C4 case's registrations (see its call site in `emit_impl_items_leaf`'s
+/// caller): the current method (keyed with its own method-generics fingerprint) plus every
 /// non-generic sibling method of `trait_`, all on target `Self`. The two callers differ ONLY in
 /// `rt` — the path prefix to the `ranked_traits` module — because rule 1 runs INSIDE
 /// `shadowing_module` while the bare-param case runs outside it.
@@ -2644,111 +2118,102 @@ fn build_self_registrations(
     rt: &TokenStream,
     decycle: &Path,
 ) -> TokenStream {
-    let self_targs = nonlifetime_path_args(
-        &impl_
-            .trait_
-            .as_ref()
-            .unwrap()
-            .1
-            .segments
-            .last()
-            .unwrap()
-            .arguments,
-    );
-    let self_unsized = impl_self_may_be_unsized(impl_);
-    let mut out = TokenStream::new();
-    let current_margs = type_const_idents(&current_sig.generics);
-    let fp = fingerprint_expr(
-        decycle,
-        &quote!(Self),
-        self_unsized,
-        &trait_.generics,
-        &self_targs,
-        Some(&current_sig.generics),
-    );
-    out.extend(emit_registration(
+    // A generic sibling is registered when — and only when — this method's own generics name its
+    // (`sibling_method_generics_nameable`); otherwise there is nothing in scope to instantiate
+    // `Mk`/`Re` at and the sibling keeps the fail-closed lookup panic.
+    let siblings = trait_fns(trait_).map(|tf| &tf.sig).filter(|sig| {
+        sig.ident != current_sig.ident
+            && (!method_is_generic(sig) || sibling_method_generics_nameable(current_sig, sig))
+    });
+    emit_registrations(
         decycle,
         rt,
-        &trait_.ident,
-        &current_sig.ident,
+        trait_,
         &quote!(Self),
-        &self_targs,
-        &current_margs,
-        fp,
-    ));
-    for item in &trait_.items {
-        let TraitItem::Fn(tf) = item else { continue };
-        if tf.sig.ident == current_sig.ident {
-            continue;
+        impl_self_may_be_unsized(impl_),
+        &impl_trait_args(impl_),
+        std::iter::once(current_sig).chain(siblings),
+    )
+}
+
+/// The targets rule 2 registers for `impl_`, each already past its gate: every cyclic bound whose
+/// side bounds are reachable (`reachable_side_bounds_ok`), as always; and, for a bound whose ranked
+/// chain goes through a wrapper (`wrapper`), the wrapper itself and every type of that chain an
+/// impl taken over implements, which `impl_` may name (`wrapper::registration_ok`).
+///
+/// A chain through a wrapper reaches floors that no other frame registers: the wrapper's own (its
+/// frames are bare-param ones, which register nothing — `impl_has_bare_param_cyclic_bound`), and a
+/// member's that `impl_` reaches only through it. Registered here, in the frame that names the
+/// wrapper, they are live for the whole descent below it.
+fn rule2_targets(
+    impl_: &ItemImpl,
+    replacing_table: &Table,
+    settled: &wrapper::Settled,
+) -> Vec<CyclicBound> {
+    let heads = cycle_self_heads(replacing_table);
+    let key = |tr: &Ident, ty: &Type, targs: &[GenericArgument]| {
+        format!("{}|{}|{}", tr, quote!(#ty), quote!(#(#targs),*))
+    };
+    let cbs = cyclic_where_bounds(impl_, replacing_table);
+    let mut seen: HashSet<String> = cbs
+        .iter()
+        .map(|cb| key(&cb.trait_ident, &cb.target, &cb.targs))
+        .collect();
+    let mut out = Vec::new();
+    for cb in cbs {
+        let headed = crate::helper::type_head_ident(&cb.target).is_some_and(|h| heads.contains(&h));
+        let is_wrapper = !headed && crate::names::names_bare(&cb.target, &heads);
+        let plan = cb
+            .binder
+            .is_empty()
+            .then(|| {
+                wrapper::Planner::plan(
+                    replacing_table,
+                    impl_,
+                    &cb.target,
+                    &cb.trait_ident,
+                    &cb.targs,
+                )
+            })
+            .flatten()
+            .filter(|p| settled.admits(p));
+        let ok = if is_wrapper {
+            plan.as_ref()
+                .is_some_and(|p| wrapper::registration_ok(impl_, p, 0, replacing_table))
+        } else {
+            reachable_side_bounds_ok(
+                impl_,
+                &cb.target,
+                &cb.trait_ident,
+                &cb.targs,
+                replacing_table,
+            )
+        };
+        if ok {
+            out.push(cb);
         }
-        // A generic sibling is registered when — and only when — this method's own generics
-        // name its (`sibling_method_generics_nameable`); otherwise there is nothing in scope to
-        // instantiate `Mk`/`Re` at and the sibling keeps the fail-closed lookup panic.
-        let sibling_generics = if method_is_generic(&tf.sig) {
-            if !sibling_method_generics_nameable(current_sig, &tf.sig) {
+        let Some(plan) = plan else {
+            continue;
+        };
+        for ix in wrapper::reached(&plan) {
+            let e = &plan.entries[ix];
+            if !matches!(e.kind, wrapper::Kind::Node { .. }) {
                 continue;
             }
-            Some(&tf.sig.generics)
-        } else {
-            None
-        };
-        let margs = sibling_generics.map(type_const_idents).unwrap_or_default();
-        let fp = fingerprint_expr(
-            decycle,
-            &quote!(Self),
-            self_unsized,
-            &trait_.generics,
-            &self_targs,
-            sibling_generics,
-        );
-        out.extend(emit_registration(
-            decycle,
-            rt,
-            &trait_.ident,
-            &tf.sig.ident,
-            &quote!(Self),
-            &self_targs,
-            &margs,
-            fp,
-        ));
+            if !seen.insert(key(&e.trait_ident, &e.ty, &e.targs)) {
+                continue;
+            }
+            if wrapper::registration_ok(impl_, &plan, ix, replacing_table) {
+                out.push(CyclicBound {
+                    binder: Vec::new(),
+                    target: e.ty.clone(),
+                    trait_ident: e.trait_ident.clone(),
+                    targs: e.targs.clone(),
+                });
+            }
+        }
     }
     out
-}
-
-fn build_rule1_registrations(
-    trait_: &ItemTrait,
-    impl_: &ItemImpl,
-    current_sig: &Signature,
-    rule1_ok: bool,
-    decycle: &Path,
-) -> TokenStream {
-    if !rule1_ok {
-        return TokenStream::new();
-    }
-    let rt = quote!(#{name!("ranked_traits")});
-    build_self_registrations(trait_, impl_, current_sig, &rt, decycle)
-}
-
-/// C4: the bare-param impl's own `Self: T` re-entry registrations, emitted from the FINAL
-/// delegating impl (a sibling of `shadowing_module`), where `Self: Ca` is an assumed
-/// environment bound and the user's real, un-ranked `T: Cb` is in scope — the registrations
-/// `build_rule1_registrations` SKIPS for a bare-param impl (`impl_has_bare_param_cyclic_bound`,
-/// because the rank-rewritten inductive frame cannot prove `Wrap<T>: Ca`). At monomorphization
-/// `T = Concrete` the key `Mk_Ca<Wrap<Concrete>>` equals the wrapper floor's
-/// `lookup::<Mk_Ca<Wrap<Concrete>>>`, so the wrapper's own floor — and every subsequent runtime
-/// re-entry, which re-calls THIS Final impl — is covered. Same `Self`/`self_targs`/method-
-/// generics fingerprint as the floor and rule 1, so keys agree by construction. Shares
-/// `build_self_registrations` with rule 1, but with NO `rule1_ok` early return (the caller gates
-/// on the bare-param predicate instead) and the `shadowing_module::ranked_traits::` prefix (this
-/// runs OUTSIDE `shadowing_module`).
-fn build_bareparam_registrations(
-    trait_: &ItemTrait,
-    impl_: &ItemImpl,
-    current_sig: &Signature,
-    decycle: &Path,
-) -> TokenStream {
-    let rt = quote!(#{name!("shadowing_module")}::#{name!("ranked_traits")});
-    build_self_registrations(trait_, impl_, current_sig, &rt, decycle)
 }
 
 /// Rule 2's cyclic-bound-sibling registrations for one impl (`X: T'` provable at the
@@ -2757,7 +2222,7 @@ fn build_bareparam_registrations(
 /// be independently provable). Identical regardless of which method is currently descending,
 /// so emitted ONCE per impl (F-M3: the released version duplicated this into every method
 /// body) into a shared `#[doc(hidden)]` fn, called from every method's prologue. Unlike rule 1
-/// (`build_rule1_registrations`, kept inline — see its doc comment), rule 2 targets a type
+/// (`build_self_registrations`, kept inline — see its doc comment), rule 2 targets a type
 /// OTHER than `Self`, so hoisting it doesn't hit the same-method-twice cast pitfall.
 ///
 /// C1: also returns the union of fresh HRTB binder lifetimes (`for<'a> B<'a>: Cb`) needed by
@@ -2767,52 +2232,37 @@ fn build_bareparam_registrations(
 /// so the byte-identical no-op case is preserved.
 fn build_shared_registrations(
     impl_: &ItemImpl,
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+    replacing_table: &Table,
     decycle: &Path,
+    settled: &wrapper::Settled,
 ) -> (TokenStream, Vec<GenericParam>) {
     let rt = quote!(#{name!("ranked_traits")});
     let mut out = TokenStream::new();
     let mut binders: Vec<GenericParam> = Vec::new();
-    for cb in cyclic_where_bounds(impl_, replacing_table) {
+    // Each target is past its gate already (a skipped bound does NOT declare its binder: it would be
+    // unused-but-harmless, but keeping the sets aligned avoids a stray param on a no-op fn).
+    for cb in rule2_targets(impl_, replacing_table, settled) {
         let Some((sibling_trait, _, _)) = replacing_table.get(&cb.trait_ident) else {
             continue;
         };
-        if !reachable_side_bounds_ok(impl_, &cb.target, &cb.trait_ident, &cb.targs, replacing_table) {
-            continue; // skipped bound => do NOT declare its binder (would be unused-but-harmless,
-                       // but keeping the sets aligned avoids a stray param on a no-op fn)
-        }
         binders.extend(cb.binder.iter().cloned());
         let target_unsized =
             bound_target_floor_is_unsized(&cb.target, &cb.trait_ident, &cb.targs, replacing_table);
-        let target_tokens = quote!(#{&cb.target});
-        for item in &sibling_trait.items {
-            let TraitItem::Fn(tf) = item else { continue };
-            // A GENERIC sibling cannot be instantiated here: this fn is shared by every method
-            // of the impl and declares only the impl's own generics, so it has no way to spell
-            // the callee's method type arguments. It is registered instead from the prologue of
-            // whichever method DOES name them — `build_cross_edge_generic_registrations`.
-            if method_is_generic(&tf.sig) {
-                continue;
-            }
-            let fp = fingerprint_expr(
-                decycle,
-                &target_tokens,
-                target_unsized,
-                &sibling_trait.generics,
-                &cb.targs,
-                None,
-            );
-            out.extend(emit_registration(
-                decycle,
-                &rt,
-                &cb.trait_ident,
-                &tf.sig.ident,
-                &target_tokens,
-                &cb.targs,
-                &[],
-                fp,
-            ));
-        }
+        // A GENERIC sibling cannot be instantiated here: this fn is shared by every method of the
+        // impl and declares only the impl's own generics, so it has no way to spell the callee's
+        // method type arguments. It is registered instead from the prologue of whichever method
+        // DOES name them — `build_cross_edge_generic_registrations`.
+        out.extend(emit_registrations(
+            decycle,
+            &rt,
+            sibling_trait,
+            &quote!(#{&cb.target}),
+            target_unsized,
+            &cb.targs,
+            trait_fns(sibling_trait)
+                .map(|tf| &tf.sig)
+                .filter(|sig| !method_is_generic(sig)),
+        ));
     }
     (out, binders)
 }
@@ -2835,74 +2285,49 @@ fn build_shared_registrations(
 /// on the register-once fn's own generics (C1), which a method body has no equivalent of.
 fn build_cross_edge_generic_registrations(
     impl_: &ItemImpl,
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
+    replacing_table: &Table,
     current_sig: &Signature,
     decycle: &Path,
+    settled: &wrapper::Settled,
 ) -> TokenStream {
     let mut out = TokenStream::new();
     if !method_is_generic(current_sig) {
         return out; // nothing in scope names a callee's method generics
     }
     let rt = quote!(#{name!("ranked_traits")});
-    for cb in cyclic_where_bounds(impl_, replacing_table) {
+    // Each target is past its gate already (`rule2_targets`).
+    for cb in rule2_targets(impl_, replacing_table, settled) {
         let Some((sibling_trait, _, _)) = replacing_table.get(&cb.trait_ident) else {
             continue;
         };
         if !cb.binder.is_empty() {
             continue;
         }
-        let generic_siblings: Vec<&TraitItemFn> = sibling_trait
-            .items
-            .iter()
-            .filter_map(|it| match it {
-                TraitItem::Fn(tf)
-                    if method_is_generic(&tf.sig)
-                        && sibling_method_generics_nameable(current_sig, &tf.sig) =>
-                {
-                    Some(tf)
-                }
-                _ => None,
-            })
-            .collect();
-        if generic_siblings.is_empty() {
-            continue; // don't pay for the reachability walk when nothing would be emitted
-        }
-        if !reachable_side_bounds_ok(impl_, &cb.target, &cb.trait_ident, &cb.targs, replacing_table)
-        {
-            continue;
-        }
         let target_unsized =
             bound_target_floor_is_unsized(&cb.target, &cb.trait_ident, &cb.targs, replacing_table);
-        let target_tokens = quote!(#{&cb.target});
-        for tf in generic_siblings {
-            let margs = type_const_idents(&tf.sig.generics);
-            let fp = fingerprint_expr(
-                decycle,
-                &target_tokens,
-                target_unsized,
-                &sibling_trait.generics,
-                &cb.targs,
-                Some(&tf.sig.generics),
-            );
-            out.extend(emit_registration(
-                decycle,
-                &rt,
-                &cb.trait_ident,
-                &tf.sig.ident,
-                &target_tokens,
-                &cb.targs,
-                &margs,
-                fp,
-            ));
-        }
+        out.extend(emit_registrations(
+            decycle,
+            &rt,
+            sibling_trait,
+            &quote!(#{&cb.target}),
+            target_unsized,
+            &cb.targs,
+            trait_fns(sibling_trait).map(|tf| &tf.sig).filter(|sig| {
+                method_is_generic(sig) && sibling_method_generics_nameable(current_sig, sig)
+            }),
+        ));
     }
     out
 }
 
-fn parse_comma_separated<T: Parse>(input: ParseStream) -> Result<Vec<T>> {
+/// `item, item, ..` (a trailing comma allowed) up to the end of `input`.
+fn parse_comma_separated<T>(
+    input: ParseStream,
+    item: fn(ParseStream) -> Result<T>,
+) -> Result<Vec<T>> {
     let mut items = Vec::new();
     while !input.is_empty() {
-        items.push(input.parse()?);
+        items.push(item(input)?);
         if !input.is_empty() {
             input.parse::<Token![,]>()?;
         }
@@ -2910,31 +2335,13 @@ fn parse_comma_separated<T: Parse>(input: ParseStream) -> Result<Vec<T>> {
     Ok(items)
 }
 
-/// One `#[decycle] use original::path::T as R;` in the consuming module: `finalize`
-/// needs this to reconcile a trait definition arriving through the macro ping-pong
-/// (which always carries the trait's ORIGINAL ident) with local impls/bounds that only
-/// ever spell it as the local alias `R` (see `finalize`'s use of `renames`, and L-C1).
-struct TraitRename {
-    original: Ident,
-    local: Ident,
-}
-
-impl Parse for TraitRename {
-    fn parse(input: ParseStream) -> Result<Self> {
-        let content;
-        parenthesized!(content in input);
-        let original: Ident = content.parse()?;
-        content.parse::<Token![,]>()?;
-        let local: Ident = content.parse()?;
-        Ok(TraitRename { original, local })
-    }
-}
-
-impl template_quote::ToTokens for TraitRename {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-        let (original, local) = (&self.original, &self.local);
-        tokens.extend(quote!((#original, #local)));
-    }
+/// `(a, b)`.
+fn parse_pair<A: Parse, B: Parse>(input: ParseStream) -> Result<(A, B)> {
+    let content;
+    parenthesized!(content in input);
+    let a = content.parse()?;
+    content.parse::<Token![,]>()?;
+    Ok((a, content.parse()?))
 }
 
 /// The ident decycle mints for a `#[decycle]` trait's generated "ranked" counterpart
@@ -2982,9 +2389,7 @@ fn ranked_trait_path(trait_ident: &Ident) -> Path {
 
 /// Where decycle inserts the synthesized rank parameter in a `#[decycle]` trait's own generics: the
 /// index of the first non-lifetime generic, or the end if the trait declares none (so a trait with
-/// no generics gets `XxxRanked<Rank>`). Exposed so a caller whose trait carries its own generics
-/// need not reverse-engineer the insertion rule. Semver-committed.
-#[cfg(test)]
+/// no generics gets `XxxRanked<Rank>`).
 fn ranked_trait_rank_loc(trait_: &ItemTrait) -> usize {
     trait_
         .generics
@@ -2995,13 +2400,13 @@ fn ranked_trait_rank_loc(trait_: &ItemTrait) -> usize {
 }
 
 /// The marker-type ident decycle mints per (trait, method) — `__Mk_<Trait>_<method><suffix>` — used
-/// as the registry key. [`emit_registration`] names it for you; exposed for diagnostics/tests.
+/// as the registry key. [`emit_registrations`] names it for you; exposed for diagnostics/tests.
 fn reentry_marker_name(trait_ident: &Ident, method_ident: &Ident) -> Ident {
     name!("__Mk_{}_{}", trait_ident, method_ident)
 }
 
 /// The re-entry fn ident (`__Re_<Trait>_<method><suffix>`) whose address a registration stores.
-/// [`emit_registration`] names it for you.
+/// [`emit_registrations`] names it for you.
 fn reentry_fn_name(trait_ident: &Ident, method_ident: &Ident) -> Ident {
     name!("__Re_{}_{}", trait_ident, method_ident)
 }
@@ -3036,23 +2441,12 @@ impl Parse for AlsoRank {
         // normalize: [ (From, To), (From, To), ... ]
         let norm_content;
         bracketed!(norm_content in content);
-        let mut normalize = Vec::new();
-        while !norm_content.is_empty() {
-            let pair;
-            parenthesized!(pair in norm_content);
-            let from: Type = pair.parse()?;
-            pair.parse::<Token![,]>()?;
-            let to: Type = pair.parse()?;
-            normalize.push((from, to));
-            if !norm_content.is_empty() {
-                norm_content.parse::<Token![,]>()?;
-            }
-        }
+        let normalize = parse_comma_separated(&norm_content, parse_pair)?;
 
         // foreign_impls: { impl ... for ... {}, impl ... }
         let impls_content;
         braced!(impls_content in content);
-        let foreign_impls = parse_comma_separated::<ItemImpl>(&impls_content)?;
+        let foreign_impls = parse_comma_separated(&impls_content, ItemImpl::parse)?;
 
         Ok(AlsoRank {
             normalize,
@@ -3108,10 +2502,7 @@ impl Parse for FinalizeArgs {
         let announce_input: announce::helper::Input = input.parse()?;
         let working_list: Vec<Path> = announce_input.list.0.iter().map(|c| c.path()).collect();
         let rest = announce_input.rest;
-        let mut args = syn::parse::Parser::parse2(
-            |input: ParseStream| -> Result<FinalizeArgs> { parse_rest(input) },
-            rest,
-        )?;
+        let mut args = syn::parse::Parser::parse2(parse_rest, rest)?;
         // Newest first, ahead of the module's own traits — the order the old carrier chain,
         // which prepended each definition, produced. (Read after the REST, whose `renames` name a
         // stand-in's local alias.)
@@ -3128,69 +2519,70 @@ impl Parse for FinalizeArgs {
 }
 
 fn parse_rest(input: ParseStream) -> Result<FinalizeArgs> {
-        let _crate_identity: LitStr = input.parse()?;
-        let crate_version: LitStr = input.parse()?;
-        let expected_version = env!("CARGO_PKG_VERSION");
-        if crate_version.value() != expected_version {
-            abort!(
-                Span::call_site(),
-                "version mismatch: expected '{}', got '{}'",
-                expected_version,
-                crate_version.value()
-            )
-        }
+    let _crate_identity: LitStr = input.parse()?;
+    let crate_version: LitStr = input.parse()?;
+    let expected_version = env!("CARGO_PKG_VERSION");
+    if crate_version.value() != expected_version {
+        abort!(
+            Span::call_site(),
+            "version mismatch: expected '{}', got '{}'",
+            expected_version,
+            crate_version.value()
+        )
+    }
 
-        let traits_content;
-        braced!(traits_content in input);
-        let traits = parse_comma_separated(&traits_content)?;
+    let traits_content;
+    braced!(traits_content in input);
+    let traits = parse_comma_separated(&traits_content, ItemTrait::parse)?;
 
-        let contents_content;
-        braced!(contents_content in input);
-        let contents = parse_comma_separated(&contents_content)?;
+    let contents_content;
+    braced!(contents_content in input);
+    let contents = parse_comma_separated(&contents_content, ItemImpl::parse)?;
 
-        let lit: LitInt = input.parse()?;
-        let recurse_level = lit.base10_parse()?;
+    let lit: LitInt = input.parse()?;
+    let recurse_level = lit.base10_parse()?;
 
-        let support_infinite_cycle = if input.is_empty() {
-            false
-        } else {
-            let lit: LitBool = input.parse()?;
-            lit.value
-        };
+    let support_infinite_cycle = if input.is_empty() {
+        false
+    } else {
+        let lit: LitBool = input.parse()?;
+        lit.value
+    };
 
-        let renames = if input.is_empty() {
-            Vec::new()
-        } else {
-            let renames_content;
-            bracketed!(renames_content in input);
-            parse_comma_separated::<TraitRename>(&renames_content)?
-                .into_iter()
-                .map(|r| (r.original, r.local))
-                .collect()
-        };
+    // One `(original, local)` per `#[decycle] use original::path::T as R;` in the consuming module:
+    // `finalize` needs this to reconcile a trait definition arriving through the macro ping-pong
+    // (which always carries the trait's ORIGINAL ident) with local impls/bounds that only ever
+    // spell it as the local alias `R` (see `finalize`'s use of `renames`, and L-C1).
+    let renames = if input.is_empty() {
+        Vec::new()
+    } else {
+        let renames_content;
+        bracketed!(renames_content in input);
+        parse_comma_separated(&renames_content, parse_pair)?
+    };
 
-        // C2: the carrier's `also_rank` trailing group. Backward-compatible: an old carrier
-        // simply has no trailing tokens here (`input.is_empty()` ⇒ `Vec::new()`).
-        let also_rank = if input.is_empty() {
-            Vec::new()
-        } else {
-            let content;
-            braced!(content in input);
-            parse_comma_separated::<AlsoRank>(&content)?
-        };
+    // C2: the carrier's `also_rank` trailing group. Backward-compatible: an old carrier
+    // simply has no trailing tokens here (`input.is_empty()` ⇒ `Vec::new()`).
+    let also_rank = if input.is_empty() {
+        Vec::new()
+    } else {
+        let content;
+        braced!(content in input);
+        parse_comma_separated(&content, AlsoRank::parse)?
+    };
 
-        Ok(FinalizeArgs {
-            working_list: Vec::new(),
-            traits,
-            contents,
-            recurse_level,
-            support_infinite_cycle,
-            renames,
-            also_rank,
-            // D1: the carrier grammar doesn't serialize this field — only a direct,
-            // programmatic caller of `finalize` sets it.
-            decycle_path: None,
-        })
+    Ok(FinalizeArgs {
+        working_list: Vec::new(),
+        traits,
+        contents,
+        recurse_level,
+        support_infinite_cycle,
+        renames,
+        also_rank,
+        // D1: the carrier grammar doesn't serialize this field — only a direct,
+        // programmatic caller of `finalize` sets it.
+        decycle_path: None,
+    })
 }
 
 impl FinalizeArgs {
@@ -3213,14 +2605,6 @@ impl FinalizeArgs {
 
         let recurse_level = &self.recurse_level;
         let support_infinite_cycle = &self.support_infinite_cycle;
-        let renames: Vec<TraitRename> = self
-            .renames
-            .iter()
-            .map(|(original, local)| TraitRename {
-                original: original.clone(),
-                local: local.clone(),
-            })
-            .collect();
         let also_rank = &self.also_rank;
 
         quote! {
@@ -3230,7 +2614,7 @@ impl FinalizeArgs {
             { #(#contents),* }
             #recurse_level
             #support_infinite_cycle
-            [ #(#renames),* ]
+            [ #(for (original, local) in &self.renames), { (#original, #local) } ]
             #(if !also_rank.is_empty()) {
                 { #(#also_rank),* }
             }
@@ -3253,6 +2637,34 @@ fn floor_rank() -> Type {
     parse_quote!(())
 }
 
+/// The ident of the decoy rank, an uninhabited `pub enum Decoy<suffix> {}` declared in
+/// `ranked_traits` beside the ranked traits.
+fn decoy_rank_name() -> Ident {
+    name!("Decoy")
+}
+
+/// The decoy rank, spelled from inside `ranked_traits`. Every floor impl (`impl XxxRanked<()> for
+/// T`) gets a twin at this rank with the same `#[cfg]`s, generics, where-clause and associated
+/// items, and with `unreachable!` method bodies ([`LeafBody::Decoy`]).
+///
+/// The twin keeps the floor from being selected by elimination. A call whose rank nothing pins
+/// leaves the rank to inference: `self.base()` in an impl of another trait with no `Self: Base`
+/// bound, or `(B, crate::other::Leaf).step(..)` through a pair impl of the module whose `Leaf` has
+/// no ranked impl. Where the step impl (`XxxRanked<(R,)>`) is ruled out, the floor used to be the
+/// one impl left, so the call compiled against it and failed at run time, though no frame had
+/// registered anything for it: "re-entry fn not registered", or "cycle limit reached" when bounded.
+/// Every solver rules the step impl out for the pair; for `self.base()` the old solver reports
+/// `E0283` on its own, but the next-generation one rules it out through the caller's where-bounds.
+/// With the twin, two impls are left, which every solver reports as `E0283` at the call. A rank
+/// that is pinned (by a where-bound, a supertrait, or the `Self: XxxRanked<..>` bounds decycle
+/// emits) is unaffected: no rank decycle spells, `()` or `(R,)`, unifies with the decoy, and
+/// nothing outside the generated module names it. A ranked supertrait holds at the decoy as it does
+/// at the floor, through the supertrait's own twin for the same self type.
+fn decoy_rank() -> Type {
+    let decoy = decoy_rank_name();
+    parse_quote!(#decoy)
+}
+
 /// One rank step: `rank_succ(&R) = (R,)`. Compose it to spell concrete ranks the same way decycle
 /// does. Semver-committed.
 fn rank_succ(rank: &Type) -> Type {
@@ -3264,113 +2676,59 @@ fn rank_succ(rank: &Type) -> Type {
 /// `initial_rank(2) = (((),),)`, … This is exactly what decycle splices into `Self: …Ranked<..>` on
 /// each Final impl. Semver-committed.
 fn initial_rank(recurse_level: usize) -> Type {
-    let mut rank = floor_rank();
-    for _ in 0..recurse_level {
-        rank = rank_succ(&rank);
-    }
-    rank
+    (0..recurse_level).fold(floor_rank(), |rank, _| rank_succ(&rank))
 }
 
-fn replace_constraints(
-    generics: &mut Generics,
-    mut f: impl FnMut(Type, Path) -> Option<(Type, Path)>,
-) {
+/// Drop the plain trait bounds (`T: Tr`, not `?Sized`) of `generics` that `keep` rejects, given the
+/// bounded type and the trait's path: of the type parameters (`impl<T: Tr>`) and of the
+/// `where`-predicates, a predicate left with no bound going too. The bounds and the `where`-clause
+/// are rebuilt (with a default `where` token), the bounds of a parameter left with none losing its
+/// colon.
+fn retain_trait_bounds(generics: &mut Generics, mut keep: impl FnMut(&Type, &Path) -> bool) {
+    let mut keep_bound = |ty: &Type, bound: &TypeParamBound| match bound {
+        TypeParamBound::Trait(TraitBound {
+            modifier: TraitBoundModifier::None,
+            path,
+            ..
+        }) => keep(ty, path),
+        _ => true,
+    };
+    for tp in generics.type_params_mut() {
+        let ty = Type::Path(TypePath {
+            qself: None,
+            path: tp.ident.clone().into(),
+        });
+        tp.bounds = std::mem::take(&mut tp.bounds)
+            .into_iter()
+            .filter(|b| keep_bound(&ty, b))
+            .collect();
+        if tp.bounds.is_empty() {
+            tp.colon_token = None;
+        }
+    }
     let mut where_clause = WhereClause {
         where_token: Default::default(),
         predicates: Punctuated::new(),
     };
-    let mut where_predicates_to_add = Vec::new();
-    let mut process_type_param_bound =
-        |param_type: &Type, bound: TypeParamBound| -> Option<TypeParamBound> {
-            match bound {
-                TypeParamBound::Trait(TraitBound {
-                    paren_token,
-                    modifier: TraitBoundModifier::None,
-                    lifetimes,
-                    path,
-                }) => {
-                    if let Some((new_ty, new_path)) = f(param_type.clone(), path.clone()) {
-                        if new_ty == *param_type {
-                            Some(TypeParamBound::Trait(TraitBound {
-                                paren_token,
-                                modifier: TraitBoundModifier::None,
-                                lifetimes,
-                                path,
-                            }))
-                        } else {
-                            where_predicates_to_add.push(WherePredicate::Type(PredicateType {
-                                lifetimes: None,
-                                bounded_ty: new_ty,
-                                colon_token: Default::default(),
-                                bounds: std::iter::once(TypeParamBound::Trait(TraitBound {
-                                    paren_token: None,
-                                    modifier: TraitBoundModifier::None,
-                                    lifetimes: None,
-                                    path: new_path,
-                                }))
-                                .collect(),
-                            }));
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                }
-                bound => Some(bound),
-            }
-        };
-    for param in &mut generics.params {
-        if let GenericParam::Type(ref mut type_param) = param {
-            let param_type = Type::Path(TypePath {
-                qself: None,
-                path: type_param.ident.clone().into(),
-            });
-
-            type_param.bounds = std::mem::take(&mut type_param.bounds)
-                .into_iter()
-                .filter_map(|bound| process_type_param_bound(&param_type, bound))
-                .collect();
-
-            if type_param.bounds.is_empty() {
-                type_param.colon_token = None;
-            }
-        }
-    }
-
-    for pred in std::mem::take(&mut generics.where_clause)
-        .map(|wc| wc.predicates)
+    for pred in generics
+        .where_clause
+        .take()
         .into_iter()
-        .flatten()
+        .flat_map(|wc| wc.predicates)
     {
         match pred {
-            WherePredicate::Type(PredicateType {
-                lifetimes,
-                bounded_ty,
-                colon_token,
-                mut bounds,
-            }) => {
-                bounds = bounds
+            WherePredicate::Type(mut pt) => {
+                pt.bounds = std::mem::take(&mut pt.bounds)
                     .into_iter()
-                    .filter_map(|bound| process_type_param_bound(&bounded_ty, bound))
+                    .filter(|b| keep_bound(&pt.bounded_ty, b))
                     .collect();
-
-                if !bounds.is_empty() {
-                    where_clause
-                        .predicates
-                        .push(WherePredicate::Type(PredicateType {
-                            lifetimes,
-                            bounded_ty,
-                            colon_token,
-                            bounds,
-                        }));
+                if !pt.bounds.is_empty() {
+                    where_clause.predicates.push(WherePredicate::Type(pt));
                 }
             }
-            o => where_clause.predicates.push(o),
+            other => where_clause.predicates.push(other),
         }
     }
-
-    where_clause.predicates.extend(where_predicates_to_add);
-
     generics.where_clause = (!where_clause.predicates.is_empty()).then_some(where_clause);
 }
 
@@ -3378,34 +2736,36 @@ fn is_self_type(ty: &Type) -> bool {
     matches!(ty, Type::Path(TypePath { qself: None, path }) if path.is_ident("Self"))
 }
 
-/// Whether `ty` contains `Self` ANYWHERE in its structure, not just as the whole type —
-/// `type Assoc = Box<Self>;` / `(Self,)` are just as cyclic as a bare `type Assoc = Self;`
-/// (`is_self_type` alone only catches the latter).
-fn type_contains_self(ty: &Type) -> bool {
-    struct FindSelf(bool);
-    impl<'ast> syn::visit::Visit<'ast> for FindSelf {
-        fn visit_type(&mut self, ty: &'ast Type) {
-            if is_self_type(ty) {
-                self.0 = true;
-            }
-            syn::visit::visit_type(self, ty);
-        }
-    }
-    let mut finder = FindSelf(false);
-    syn::visit::Visit::visit_type(&mut finder, ty);
-    finder.0
+/// The entries of `replacing_table` in the order the traits are declared (`traits`, the module's
+/// own order, then the `#[decycle] use`s'). Every iteration that emits tokens, or picks which of
+/// several errors is reported, goes through this rather than through the `HashMap`, whose order is
+/// randomized per process: iterating the map made the expansion of one module differ between
+/// compilations (the items of `ranked_traits` and `shadowing_module`, and the Final impls, in
+/// another order each time), which defeats reproducible builds and incremental compilation, and
+/// made two expansions of the same module within one process differ too.
+fn in_declaration_order<'a>(
+    traits: &[ItemTrait],
+    replacing_table: &'a Table,
+) -> Vec<&'a (ItemTrait, usize, Vec<ItemImpl>)> {
+    let mut seen = HashSet::new();
+    traits
+        .iter()
+        .filter(|trait_| seen.insert(trait_.ident.clone()))
+        .filter_map(|trait_| replacing_table.get(&trait_.ident))
+        .collect()
 }
 
 /// Check for `type Assoc = Self;` in impl blocks where the trait's associated type
 /// has a bound referencing a `#[decycle]` trait. This creates an infinite recursive
 /// definition because the ranked trait's associated type bound refers to the original
 /// trait, causing a cycle through the Final impl.
-fn check_assoc_type_self(
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
-) {
-    let decycle_idents: std::collections::HashSet<&Ident> = replacing_table.keys().collect();
+fn check_assoc_type_self(in_order: &[&(ItemTrait, usize, Vec<ItemImpl>)]) {
+    let decycle_idents: HashSet<&Ident> = in_order
+        .iter()
+        .map(|(trait_, _, _)| &trait_.ident)
+        .collect();
 
-    for (trait_, _, impls) in replacing_table.values() {
+    for (trait_, _, impls) in in_order.iter().copied() {
         for trait_item in &trait_.items {
             let TraitItem::Type(TraitItemType {
                 ident: assoc_ident,
@@ -3421,7 +2781,7 @@ fn check_assoc_type_self(
             // DIFFERENT item that merely shares a last segment with a decycle trait.
             let has_decycle_bound = bounds.iter().any(|bound| {
                 if let TypeParamBound::Trait(TraitBound { path, .. }) = bound {
-                    if path.segments.len() == 1 {
+                    if path.leading_colon.is_none() && path.segments.len() == 1 {
                         return decycle_idents.contains(&path.segments[0].ident);
                     }
                 }
@@ -3433,8 +2793,9 @@ fn check_assoc_type_self(
             }
 
             // Check impls for a `Self`-containing assignment (`= Self;`, `= Box<Self>;`,
-            // `= (Self,);`, …) — any of them recreate the same cycle through the Final
-            // impl, not just the bare-`Self` case.
+            // `= (Self,);`, …: `Self` ANYWHERE in its structure, not just as the whole type) —
+            // any of them recreate the same cycle through the Final impl, not just the
+            // bare-`Self` case.
             for impl_ in impls {
                 for impl_item in &impl_.items {
                     let ImplItem::Type(ImplItemType { ident, ty, .. }) = impl_item else {
@@ -3443,7 +2804,7 @@ fn check_assoc_type_self(
                     if ident != assoc_ident {
                         continue;
                     }
-                    if type_contains_self(ty) {
+                    if type_has(ty, &is_self_type) {
                         abort!(
                             ty,
                             "infinite recursive definition: `type {} = ...` referencing `Self` with #[decycle] trait bound",
@@ -3481,16 +2842,7 @@ fn check_assoc_type_self(
 /// (impl headers, where-predicates, `impl Trait` bounds, supertraits, and paths inside user
 /// bodies) — the last of which decycle deliberately never reads. Rejecting the declaration is the
 /// honest boundary; the workaround is one line (drop the default, spell the argument).
-fn check_no_defaulted_trait_generics(
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
-) {
-    for (trait_, _, _) in replacing_table.values() {
-        check_no_defaulted_generics_of(trait_);
-    }
-}
-
-/// [`check_no_defaulted_trait_generics`] for one trait.
-fn check_no_defaulted_generics_of(trait_: &ItemTrait) {
+fn check_no_defaulted_trait_generics(trait_: &ItemTrait) {
     for param in &trait_.generics.params {
         let (ident, default) = match param {
             GenericParam::Type(tp) => (&tp.ident, tp.default.as_ref().map(|d| quote!(#d))),
@@ -3519,22 +2871,20 @@ fn check_no_defaulted_generics_of(trait_: &ItemTrait) {
 /// returns exactly such an opaque `impl Future`. An associated type (or a boxed future) is the
 /// portable escape hatch — it names the return type, so both engines can carry it.
 pub(crate) fn check_no_impl_trait_output_in(trait_: &ItemTrait) {
-    for item in &trait_.items {
-        if let TraitItem::Fn(tf) = item {
-            if let Some(a) = &tf.sig.asyncness {
-                abort!(
-                    a,
-                    "decycle: `async fn` in method `{}` of #[decycle] trait `{}` is not supported — its `impl Future` return is an opaque type, like a return-position `impl Trait`", tf.sig.ident, trait_.ident;
-                    help = "return a boxed future (`-> Pin<Box<dyn Future<Output = ..>>>`), or declare an associated type on the trait and return it"
-                );
-            }
-            if sig_has_impl_trait_output(&tf.sig) {
-                abort!(
-                    &tf.sig.output,
-                    "decycle: return-position `impl Trait` in method `{}` of #[decycle] trait `{}` is not supported", tf.sig.ident, trait_.ident;
-                    help = "declare an associated type on the trait and return it instead (e.g. `type Output; fn m(&self) -> Self::Output`)"
-                );
-            }
+    for tf in trait_fns(trait_) {
+        if let Some(a) = &tf.sig.asyncness {
+            abort!(
+                a,
+                "decycle: `async fn` in method `{}` of #[decycle] trait `{}` is not supported — its `impl Future` return is an opaque type, like a return-position `impl Trait`", tf.sig.ident, trait_.ident;
+                help = "return a boxed future (`-> Pin<Box<dyn Future<Output = ..>>>`), or declare an associated type on the trait and return it"
+            );
+        }
+        if sig_has_impl_trait_output(&tf.sig) {
+            abort!(
+                &tf.sig.output,
+                "decycle: return-position `impl Trait` in method `{}` of #[decycle] trait `{}` is not supported", tf.sig.ident, trait_.ident;
+                help = "declare an associated type on the trait and return it instead (e.g. `type Output; fn m(&self) -> Self::Output`)"
+            );
         }
     }
 }
@@ -3549,7 +2899,7 @@ pub(crate) fn check_no_impl_trait_output_in(trait_: &ItemTrait) {
 ///
 /// Behind `decycle::check`, which an announced trait lists among the options of `#[announce]`.
 pub fn check_trait(trait_: &ItemTrait) {
-    check_no_defaulted_generics_of(trait_);
+    check_no_defaulted_trait_generics(trait_);
     check_no_impl_trait_output_in(trait_);
 }
 
@@ -3563,30 +2913,133 @@ pub fn check_trait_structural(trait_: &ItemTrait) {
     check_no_impl_trait_output_in(trait_);
 }
 
-/// A `#[decycle]` trait listed as a supertrait of ANOTHER `#[decycle]` trait — both in the
-/// same `replacing_table` batch — makes the ranked-trait definitions mutually referential
-/// in a way the rank-rewriting scheme can't discharge (E0283 at the use site: the
-/// supertrait bound resolves to the shadowed dummy trait, not the ranked one). Short-term:
-/// reject it outright rather than emit something that fails downstream with a confusing
-/// error.
-fn check_no_decycle_supertraits(
-    replacing_table: &HashMap<Ident, (ItemTrait, usize, Vec<ItemImpl>)>,
-) {
-    let decycle_idents: std::collections::HashSet<&Ident> = replacing_table.keys().collect();
-
-    for (trait_, _, _) in replacing_table.values() {
-        for bound in &trait_.supertraits {
-            let TypeParamBound::Trait(TraitBound { path, .. }) = bound else {
-                continue;
-            };
-            if path.segments.len() == 1 && decycle_idents.contains(&path.segments[0].ident) {
-                abort!(
-                    path,
-                    "a #[decycle] trait cannot be a supertrait of another #[decycle] trait"
-                );
+/// The supertraits of the ranked twin `XxxRanked<.., Rank, ..>`: a supertrait that is itself a
+/// trait of this batch, named bare (or `self::`), becomes ITS ranked twin at the same `Rank`
+/// (`trait EvalRanked<Rank>: BaseRanked<Rank>`); every other supertrait is kept as written.
+///
+/// Kept as written, `Base` would name the real trait (`ranked_traits` glob-imports the module), and
+/// the impls would still prove it — through `Base`'s Final impl, restarting its own rank chain. But a
+/// bound `X: EvalRanked<Rank>` would then imply only `X: Base`, which a body re-emitted inside
+/// `shadowing_module` cannot use: there the bare `Base` is the empty dummy, so `x.base()` resolves
+/// only through `BaseRanked<_>`, at no rank any bound pins (E0275/E0283). Ranked, the supertrait
+/// carries the rank down: `X: EvalRanked<Rank>` implies `X: BaseRanked<Rank>`, the inductive
+/// impl's own `Self: EvalRanked<(Rank,)>` bound implies the `Self: BaseRanked<(Rank,)>` its
+/// supertrait demands, and a bare-param bound `T: EvalRanked<Rank>` implies the `T: BaseRanked<Rank>`
+/// a generic impl's `Base` needs. The leaf `EvalRanked<()>` needs `BaseRanked<()>`, which the leaf
+/// of `Base` provides for the same self type.
+fn ranked_supertraits(
+    trait_: &ItemTrait,
+    replacing_table: &Table,
+) -> Punctuated<TypeParamBound, Token![+]> {
+    let replacer = TraitReplacer::new(
+        replacing_table,
+        &TokenStream::new(),
+        parse_quote!(#{name!("Rank")}),
+    );
+    let mut supertraits = trait_.supertraits.clone();
+    for bound in supertraits.iter_mut() {
+        if let TypeParamBound::Trait(TraitBound { path, .. }) = bound {
+            if ranked_supertrait(path, trait_, replacing_table).is_some() {
+                replacer.try_replace_path(path);
             }
         }
     }
+    supertraits
+}
+
+/// The trait of this batch a supertrait bound of `trait_` names, when [`ranked_supertraits`] ranks
+/// it: named bare (or `self::`), and implemented here for the self type of every impl of `trait_`
+/// — the ranked twin of the supertrait exists only for those. (A supertrait implemented elsewhere,
+/// outside the module or by an opt-out impl, stays the real trait, as written.)
+fn ranked_supertrait(path: &Path, trait_: &ItemTrait, replacing_table: &Table) -> Option<Ident> {
+    let mut probe = path.clone();
+    crate::names::strip_leading_self(&mut probe);
+    if probe.leading_colon.is_some() || probe.segments.len() != 1 {
+        return None;
+    }
+    let sup = &probe.segments[0].ident;
+    let (_, _, sup_impls) = replacing_table.get(sup)?;
+    let own_impls = replacing_table
+        .get(&trait_.ident)
+        .map_or(&[][..], |(_, _, impls)| &impls[..]);
+    let implemented_here = own_impls.iter().all(|im| {
+        sup_impls.iter().any(|cand| {
+            let vars = crate::names::type_param_idents(&cand.generics);
+            crate::unify::unify_type(&vars, &cand.self_ty, &im.self_ty).is_some()
+        })
+    });
+    implemented_here.then(|| sup.clone())
+}
+
+/// The re-entry registrations of `impl_`'s supertraits, for `Self`, in its inductive frame.
+///
+/// A ranked supertrait (`EvalRanked<Rank>: BaseRanked<Rank>`) lets this frame's body call a
+/// supertrait method (`self.base()`) at the frame's own rank, entering the supertrait's chain
+/// there — possibly one step above its floor, where the floor looks up the supertrait's re-entry fn
+/// for the next type. A cyclic bound `X: Base` would have registered it (rule 2); the supertrait is
+/// such an edge on `Self`, implied rather than written, so it is registered here, like rule 1 does
+/// for the impl's own trait: every non-generic method of every supertrait the ranked twin reaches
+/// (transitively), for `Self`. Under the same conditions as rule 1 — no bare-param cyclic bound
+/// (`Self: Base` is then not provable inside the frame) and every side bound reachable through the
+/// supertrait's chain among the impl's own — and only for a supertrait whose arguments do not name
+/// the trait's own parameters.
+fn build_supertrait_registrations(
+    trait_: &ItemTrait,
+    impl_: &ItemImpl,
+    replacing_table: &Table,
+    decycle: &Path,
+) -> TokenStream {
+    let mut out = TokenStream::new();
+    if impl_has_bare_param_cyclic_bound(impl_, replacing_table) {
+        return out;
+    }
+    let rt = quote!(#{name!("ranked_traits")});
+    let self_unsized = impl_self_may_be_unsized(impl_);
+    let mut seen: HashSet<Ident> = Default::default();
+    let mut queue: Vec<&ItemTrait> = vec![trait_];
+    while let Some(sub) = queue.pop() {
+        let sub_params: HashSet<String> = type_const_idents(&sub.generics)
+            .iter()
+            .map(Ident::to_string)
+            .collect();
+        for bound in &sub.supertraits {
+            let TypeParamBound::Trait(TraitBound { path, .. }) = bound else {
+                continue;
+            };
+            let Some(sup) = ranked_supertrait(path, sub, replacing_table) else {
+                continue;
+            };
+            if !seen.insert(sup.clone()) {
+                continue;
+            }
+            let (sup_trait, _, _) = &replacing_table[&sup];
+            queue.push(sup_trait);
+            let targs = nonlifetime_path_args(&path.segments.last().unwrap().arguments);
+            let names_sub_param = targs.iter().any(|a| {
+                quote!(#a)
+                    .to_string()
+                    .split_whitespace()
+                    .any(|t| sub_params.contains(t))
+            });
+            if names_sub_param
+                || !reachable_side_bounds_ok(impl_, &impl_.self_ty, &sup, &targs, replacing_table)
+            {
+                continue;
+            }
+            out.extend(emit_registrations(
+                decycle,
+                &rt,
+                sup_trait,
+                &quote!(Self),
+                self_unsized,
+                &targs,
+                trait_fns(sup_trait)
+                    .map(|tf| &tf.sig)
+                    .filter(|sig| !method_is_generic(sig)),
+            ));
+        }
+    }
+    out
 }
 
 /// Run the ranked `#[decycle]` expansion and return the rewritten module tokens.
@@ -3596,69 +3049,6 @@ fn check_no_decycle_supertraits(
 /// obligations the plain scan can't rank on its own — and call this to get the expanded output.
 /// The `#[decycle]` attribute ultimately routes here; call it directly only when building macro
 /// tooling on top of decycle. Stable and semver-committed.
-/// [`finalize`], with the caller's obligation graph.
-///
-/// The same relationship [`super::process_module_with_graph`] has to [`super::process_module`], at the
-/// lower level: `graph`'s nodes are the participants, and `emit_contracts` re-spells `args.contents`
-/// from them (see [`super::contract`]) before any of the ranking machinery reads a trait path. It also
-/// peels wrapped cyclic bounds, the other graph-dependent normalisation `process_module` would have
-/// done.
-///
-/// This is the entry point for a wrapper macro that has already split the module itself — it holds
-/// `FinalizeArgs` rather than an `ItemMod`, so it cannot go through `process_module_with_graph`, but it
-/// has the same reason to state its cycle instead of encoding it in spelling.
-///
-/// With `emit_contracts = false` this is exactly [`finalize`]: the node set is only consulted by those
-/// two passes, since everything below already works off `replacing_table`.
-pub fn finalize_with_graph(
-    mut args: FinalizeArgs,
-    graph: &crate::safegraph::VecGraph<Ident, crate::analysis::EdgeKind>,
-    emit_contracts: bool,
-) -> TokenStream {
-    if emit_contracts {
-        use crate::safegraph::graph::Graph;
-        let participants: std::collections::HashSet<Ident> = graph.nodes().cloned().collect();
-        let all_traits: std::collections::HashSet<Ident> = args
-            .traits
-            .iter()
-            .map(|t| t.ident.clone())
-            .chain(
-                args.working_list
-                    .iter()
-                    .filter_map(|p| p.segments.last().map(|s| s.ident.clone())),
-            )
-            .collect();
-        // `contract_from_graph` works over `Item`s; wrap and unwrap the impls around it.
-        let mut items: Vec<Item> = args.contents.drain(..).map(Item::Impl).collect();
-        crate::ranked::contract::contract_from_graph(&mut items, &all_traits, &participants);
-        args.contents = items
-            .into_iter()
-            .filter_map(|it| match it {
-                Item::Impl(im) => Some(im),
-                _ => None,
-            })
-            .collect();
-        // Peel too: a wrapped cyclic bound (`Box<Stmt>: Tr`) has no rankable head, and this entry
-        // point bypasses `process_module`, where that pass normally runs. Both are pre-ranking
-        // normalisations that only a participant set makes possible, so they belong together here.
-        for im in args.contents.iter_mut() {
-            let impl_type_params: std::collections::HashSet<Ident> = im
-                .generics
-                .params
-                .iter()
-                .filter_map(|p| match p {
-                    GenericParam::Type(t) => Some(t.ident.clone()),
-                    _ => None,
-                })
-                .collect();
-            crate::ranked::peel::peel_cyclic_bounds(im, &all_traits, &participants, &|ty| {
-                crate::ranked::process_module::is_local_impl_bound_target(ty, &impl_type_params)
-            });
-        }
-    }
-    finalize(args)
-}
-
 pub fn finalize(args: FinalizeArgs) -> TokenStream {
     // Apply this module's own use-site renames (`#[decycle] use path::T as R;`) BEFORE
     // indexing traits by ident: the `ItemTrait` arriving through the macro ping-pong
@@ -3678,9 +3068,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
     // (the programmatic `FinalizeArgs`) are renamed here.
     let mut traits = args.traits.clone();
     for (original, local) in &args.renames {
-        let applied = traits
-            .iter()
-            .any(|t| is_carried(t) && &t.ident == local);
+        let applied = traits.iter().any(|t| is_carried(t) && &t.ident == local);
         if applied {
             continue;
         }
@@ -3695,7 +3083,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
     // C2: flatten the normalize rules and rewrite every impl's obligation targets before
     // indexing, so a projection cross-edge (`<G as EmptyGroup>::Fill<Substruct>`) is a plain
     // concrete member bound (`Group<Substruct,O,C>`) everywhere downstream —
-    // `cyclic_where_bounds`, `unify_type_pattern`, `TraitReplacer`, and the leaf/inductive/Final
+    // `cyclic_where_bounds`, `crate::unify`, `TraitReplacer`, and the leaf/inductive/Final
     // loops all see it as an ordinary `Type::Path{qself:None}` bound. `normalize_rules.is_empty()`
     // (the default) makes `normalize_obligation_targets` an early-return no-op, so this is
     // byte-identical to today for every SCC that doesn't opt in.
@@ -3709,15 +3097,10 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
         normalize_obligation_targets(impl_, &normalize_rules);
     }
 
-    let mut replacing_table: HashMap<Ident, (ItemTrait, usize, Vec<_>)> = traits
+    let mut replacing_table: Table = traits
         .iter()
         .map(|trait_| {
-            let g = &trait_.generics;
-            let loc = g
-                .params
-                .iter()
-                .position(|param| !matches!(param, GenericParam::Lifetime(_)))
-                .unwrap_or(g.params.len());
+            let loc = ranked_trait_rank_loc(trait_);
             let impls = contents
                 .iter()
                 .filter(|item_impl| {
@@ -3740,9 +3123,10 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
         })
         .collect();
 
-    check_assoc_type_self(&replacing_table);
-    check_no_decycle_supertraits(&replacing_table);
-    check_no_defaulted_trait_generics(&replacing_table);
+    check_assoc_type_self(&in_declaration_order(&traits, &replacing_table));
+    for (trait_, _, _) in in_declaration_order(&traits, &replacing_table) {
+        check_no_defaulted_trait_generics(trait_);
+    }
 
     // C2: enroll each foreign-typed but in-module-impl'd concrete impl (e.g.
     // `impl __UnparseDyn for Group<Substruct,O,C>`) into its trait's ranked set. The
@@ -3756,7 +3140,10 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
             let mut impl_ = impl_.clone();
             normalize_obligation_targets(&mut impl_, &normalize_rules);
             let Some(seg) = impl_.trait_.as_ref().and_then(|t| t.1.segments.last()) else {
-                abort!(impl_, "decycle also_rank: a foreign impl must be a trait impl");
+                abort!(
+                    impl_,
+                    "decycle also_rank: a foreign impl must be a trait impl"
+                );
             };
             let seg_ident = seg.ident.clone();
             match replacing_table.get_mut(&seg_ident) {
@@ -3770,6 +3157,11 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
         }
     }
 
+    // Calls through a wrapper whose parts are partly outside the cycle: plan every edge's ranked
+    // chain, decide the bridges, and drop each wrapper bound `peel` kept whose chain cannot be
+    // ranked (it then reads exactly as `peel` alone would have left it). See `wrapper`.
+    let settled = wrapper::settle(&traits, &mut replacing_table);
+
     // F2: a renamed trait's ORIGINAL name (`#[decycle] use super::T as R;`) still leaks into
     // `shadowing_module`'s scope via `use super::super::*;` (reaching whatever contains the
     // `#[decycle] mod`, where the un-renamed `T` lives) even though the LOCAL alias `R` is
@@ -3778,17 +3170,13 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
     // Shadow every renamed trait's ORIGINAL name too, deduplicated and skipping any name
     // already covered (a no-op rename, or a collision with another listed trait's own name —
     // either would otherwise double-define the same dummy ident).
-    let renamed_original_dummies: Vec<Ident> = {
-        let mut seen: std::collections::HashSet<String> =
-            replacing_table.keys().map(|i| i.to_string()).collect();
-        let mut out = Vec::new();
-        for (original, local) in &args.renames {
-            if original != local && seen.insert(original.to_string()) {
-                out.push(original.clone());
-            }
-        }
-        out
-    };
+    let mut dummied: HashSet<String> = replacing_table.keys().map(|i| i.to_string()).collect();
+    let renamed_original_dummies: Vec<Ident> = args
+        .renames
+        .iter()
+        .filter(|(original, local)| original != local && dummied.insert(original.to_string()))
+        .map(|(original, _)| original.clone())
+        .collect();
 
     // The decycle crate path. D1: an explicit programmatic override (`args.decycle_path`)
     // wins; otherwise recover it from the working list exactly as before: `process_module`
@@ -3805,23 +3193,27 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
         let n = last.segments.len();
         Path {
             leading_colon: last.leading_colon,
-            segments: last.segments.into_iter().take(n.saturating_sub(1)).collect(),
+            segments: last
+                .segments
+                .into_iter()
+                .take(n.saturating_sub(1))
+                .collect(),
         }
     });
 
-    let _output = TokenStream::new();
     let initial_rank = initial_rank(args.recurse_level);
+    // What the floor's methods do; its decoy twin's are `LeafBody::Decoy` either way.
+    let floor_body = if args.support_infinite_cycle {
+        LeafBody::Reentry
+    } else {
+        LeafBody::Limit
+    };
 
     // Build the TraitReplacer table: maps trait ident → (rank_loc, ranked_path)
-    let trait_replacer_table: HashMap<Ident, (usize, Path)> = replacing_table
-        .iter()
-        .map(|(ident, (_, rank_loc, _))| {
-            let ranked_path: Path = parse_quote!(
-                #{name!("ranked_traits")}::#{name!("{}Ranked", ident)}
-            );
-            (ident.clone(), (*rank_loc, ranked_path))
-        })
-        .collect();
+    // Every iteration below that emits tokens goes through `in_order`, never the `HashMap`.
+    let in_order = in_declaration_order(&traits, &replacing_table);
+
+    let rt_prefix = quote!(#{name!("ranked_traits")}::);
 
     quote! {
         // this module is to prevent confliction of trait method call between ranked and non-ranked
@@ -3837,7 +3229,12 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                 #[allow(unused)]
                 use super::super::*;
 
-                #(for (trait_, rank_loc, impls) in replacing_table.values()) {
+                // The rank of each floor's twin (see `decoy_rank`).
+                #[allow(unused)]
+                #[doc(hidden)]
+                pub enum #{decoy_rank_name()} {}
+
+                #(for (trait_, rank_loc, impls) in in_order.iter().copied()) {
 
                     // pub trait MyTraitRanked<'a, Rank, T>
                     //
@@ -3856,7 +3253,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                     #(if !ranked_generics.params.is_empty()) {
                         < #(for p in &ranked_generics.params), { #{param_decl(p, DeclBounds::Keep)} } >
                     }
-                    #{trait_.colon_token} #{&trait_.supertraits} {
+                    #{trait_.colon_token} #{ranked_supertraits(trait_, &replacing_table)} {
                         #(for item in &trait_.items) { #{process_trait_item_for_ranked(item)} }
                     }
                     }
@@ -3864,27 +3261,47 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                     // Per trait × method: type_name key marker, explicit fn-pointer alias,
                     // and the full-height re-entry fn (unbounded mode only).
                     #(if args.support_infinite_cycle) {
-                        #{emit_reentry_items(trait_, *rank_loc, &decycle_path)}
+                        #{emit_reentry_items(trait_, *rank_loc)}
                     }
 
-                    #(for impl_ in impls) {
+                    #(for (impl_ix, impl_) in impls.iter().enumerate()) {
 
-                        #(let g = remove_cyclic_bounds(&impl_.generics, &replacing_table, false)) {
+                        #(let g = wrapper::floor_generics(
+                            impl_,
+                            &replacing_table,
+                            settled.ranked_floor(&trait_.ident, impl_ix),
+                        )) {
                             // Leaf: impl<'a, T> MyTraitRanked<'a, (), T> for ImplSelfTy
                             // (`unused_mut`: the floor only forwards/diverges, so a `mut` param is
                             // unused in this copy — self-allow for downstream `#![deny(warnings)]`.)
                             // Replicate the source impl's `#[cfg]`s so a cfg-gated impl's leaf strips
                             // with it instead of referencing a removed self type (E0412).
-                            #(for a in &crate::extract_cfg_attrs(&impl_.attrs)) { #a }
-                            #[allow(unused_variables, unused_mut)]
-                            impl #{impl_.generics.impl_generics()}
-                            #{name!("{}Ranked", &trait_.ident)}
-                            #{impl_.trait_.as_ref().unwrap().1.ty_generics().insert(*rank_loc, parse_quote![()])}
-                            for #{&impl_.self_ty} #{&g.where_clause} {
-                                #{emit_impl_items_leaf(impl_, trait_, args.support_infinite_cycle, &decycle_path)}
+                            // Emitted twice: the floor at `()`, then its twin at the decoy rank
+                            // (`decoy_rank`), identical but for the rank and the method bodies.
+                            // The generics: the impl's own, its where-clause without the cyclic
+                            // bounds; inline cyclic bounds ranked at the floor for a wrapper a
+                            // planned chain goes through (`wrapper::floor_generics`), in both.
+                            #(for (rank, body) in [
+                                (floor_rank(), floor_body),
+                                (decoy_rank(), LeafBody::Decoy),
+                            ]) {
+                                #(for a in &crate::extract_cfg_attrs(&impl_.attrs)) { #a }
+                                #[allow(unused_variables, unused_mut)]
+                                impl #{g.impl_generics()}
+                                #{name!("{}Ranked", &trait_.ident)}
+                                #{impl_.trait_.as_ref().unwrap().1.segments.last().unwrap().arguments.insert(*rank_loc, rank)}
+                                for #{&impl_.self_ty} #{&g.where_clause} {
+                                    #{emit_impl_items_leaf(impl_, trait_, body, &decycle_path)}
+                                }
                             }
                         }
 
+                    }
+
+                    // Bridges: the types outside the cycle that a wrapper's ranked chain reaches
+                    // (`wrapper::emit_bridge`). Generic over the rank, the decoy's included.
+                    #(for b in settled.bridges.iter().filter(|b| b.trait_ident == trait_.ident)) {
+                        #{wrapper::emit_bridge(trait_, *rank_loc, b)}
                     }
                 }
             }
@@ -3896,9 +3313,9 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
             // This prevents method calls in the inductive step body from resolving
             // to the Final impls (which would reset rank to InitialRank).
             // Local definitions shadow glob imports in Rust.
-            #(for trait_ in replacing_table.keys()) {
+            #(for (trait_, _, _) in in_order.iter().copied()) {
                 #[allow(non_camel_case_types)]
-                trait #trait_ {}
+                trait #{&trait_.ident} {}
             }
 
             // F2: also shadow a renamed trait's ORIGINAL name (see `renamed_original_dummies`
@@ -3914,7 +3331,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
             #[allow(unused)]
             use #{name!("ranked_traits")}::*;
 
-            #(for (trait_, rank_loc, impls) in replacing_table.values()) {
+            #(for (trait_, rank_loc, impls) in in_order.iter().copied()) {
                 #(for (impl_ix, impl_) in impls.iter().enumerate()) {
 
                     #[allow(unused)]
@@ -3940,16 +3357,13 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                         requalify_foreign_premises(&mut modified_impl.generics, &replacing_table);
 
                         // Step 1: Rewrite the impl's trait path with rank=(Rank,)
-                        TraitReplacer {
-                            table: trait_replacer_table.clone(),
-                            rank_type: parse_quote!((#{name!("Rank")},)),
-                        }.visit_path_mut(&mut modified_impl.trait_.as_mut().unwrap().1);
+                        let rank: Type = parse_quote!(#{name!("Rank")});
+                        TraitReplacer::new(&replacing_table, &rt_prefix, parse_quote!((#rank,)))
+                            .visit_path_mut(&mut modified_impl.trait_.as_mut().unwrap().1);
 
                         // Step 2: Rewrite all trait paths in body + where clause with rank=Rank
-                        TraitReplacer {
-                            table: trait_replacer_table.clone(),
-                            rank_type: parse_quote!(#{name!("Rank")}),
-                        }.visit_item_impl_mut(&mut modified_impl);
+                        TraitReplacer::new(&replacing_table, &rt_prefix, rank)
+                            .visit_item_impl_mut(&mut modified_impl);
 
                         // Desugar input-position `impl Trait` into method generics AFTER the
                         // ranking passes: TraitReplacer skips `impl Trait` bounds
@@ -3985,18 +3399,14 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                                 .insert(*rank_loc, parse_quote!(#{name!("Rank")}))}
                         );
                         modified_impl.generics
-                            .where_clause
-                            .get_or_insert(WhereClause {
-                                where_token: Default::default(),
-                                predicates: Default::default(),
-                            })
+                            .make_where_clause()
                             .predicates
                             .push(self_ranked_bound);
 
                         // If support_infinite_cycle, prepend the re-entry registration
                         // prologue to each method body: rule 1 (this method's own
                         // instantiation + every non-generic sibling — see
-                        // `build_rule1_registrations`'s doc comment for why this stays
+                        // `build_self_registrations`'s doc comment for why this stays
                         // INLINE, unlike rule 2) plus a call into a shared per-impl fn
                         // holding rule 2 (F-M3: identical across every method of this impl,
                         // so hoisted into ONE fn — emitted once — instead of duplicated into
@@ -4015,7 +3425,12 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                         if args.support_infinite_cycle {
                             let rule1_ok = rule1_registration_ok(trait_, impl_, &replacing_table);
                             let (shared_regs, binder_lts) =
-                                build_shared_registrations(impl_, &replacing_table, &decycle_path);
+                                build_shared_registrations(
+                                    impl_,
+                                    &replacing_table,
+                                    &decycle_path,
+                                    &settled,
+                                );
                             let register_once_fn =
                                 name!("__dcl_register_once_{}_{}", &trait_.ident, impl_ix);
                             // A preserved non-cyclic bound may still mention bare `Self`
@@ -4082,11 +3497,22 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                                     // statements, so flattening changes nothing observable
                                     // (same order, same scope end).
                                     let old_stmts = block.stmts.clone();
-                                    let rule1_regs = build_rule1_registrations(
+                                    let rule1_regs = if rule1_ok {
+                                        let rt = quote!(#{name!("ranked_traits")});
+                                        build_self_registrations(
+                                            trait_,
+                                            impl_,
+                                            sig,
+                                            &rt,
+                                            &decycle_path,
+                                        )
+                                    } else {
+                                        TokenStream::new()
+                                    };
+                                    let super_regs = build_supertrait_registrations(
                                         trait_,
                                         impl_,
-                                        sig,
-                                        rule1_ok,
+                                        &replacing_table,
                                         &decycle_path,
                                     );
                                     // Rule 2 for GENERIC cyclic methods: the shared
@@ -4099,6 +3525,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                                             &replacing_table,
                                             sig,
                                             &decycle_path,
+                                            &settled,
                                         );
                                     // Open a registration scope FIRST and hold it for the rest
                                     // of the body: everything registered below is rolled back
@@ -4112,6 +3539,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                                         {
                                             let #scope_guard = #decycle_path::__reentry::scope();
                                             #rule1_regs
+                                            #super_regs
                                             #rule2_generic_regs
                                             #register_once_fn
                                             #(if !call_targs.is_empty()) { ::<#(#call_targs),*> }
@@ -4140,7 +3568,7 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
 
         // Final impls: implement original traits by delegating to ranked traits.
         // These are outside shadowing_module so original trait names are visible.
-        #(for (trait_, rank_loc, impls) in replacing_table.values()) {
+        #(for (trait_, rank_loc, impls) in in_order.iter().copied()) {
             #(for impl_ in impls) {
                 // C4: the Final header PRESERVES a bare-param cyclic bound (`impl<T: Cb> …`)
                 // instead of stripping it — the real, un-ranked `T: Cb` is what lets C4's
@@ -4167,14 +3595,14 @@ pub fn finalize(args: FinalizeArgs) -> TokenStream {
                     #{&impl_.trait_.as_ref().unwrap().1.segments.last().unwrap().arguments}
                     for #{&impl_.self_ty} #{g.push_predicate(parse_quote!(
                         Self: #{name!("shadowing_module")}::#{name!("ranked_traits")}::#{name!("{}Ranked", &trait_.ident)}
-                        #{impl_.trait_.as_ref().unwrap().1.ty_generics().insert(*rank_loc, initial_rank.clone())}
+                        #{impl_.trait_.as_ref().unwrap().1.segments.last().unwrap().arguments.insert(*rank_loc, initial_rank.clone())}
                     )).where_clause}
                     {
                         #{emit_impl_items_delegate(
                             impl_,
                             quote!(
                                 <Self as #{name!("shadowing_module")}::#{name!("ranked_traits")}::#{name!("{}Ranked", &trait_.ident)}
-                                #{impl_.trait_.as_ref().unwrap().1.ty_generics().insert(*rank_loc, initial_rank.clone())} >
+                                #{impl_.trait_.as_ref().unwrap().1.segments.last().unwrap().arguments.insert(*rank_loc, initial_rank.clone())} >
                             ),
                             bareparam,
                         )}
@@ -4221,7 +3649,13 @@ fn carried_name(
     renames: &[(Ident, Ident)],
 ) -> Ident {
     let mock = entry.mock();
-    let Some(used) = entry.key.path().segments.last().map(|seg| seg.ident.clone()) else {
+    let Some(used) = entry
+        .key
+        .path()
+        .segments
+        .last()
+        .map(|seg| seg.ident.clone())
+    else {
         return item_ident.clone();
     };
     let Some(path) = mock else {
@@ -4375,14 +3809,67 @@ mod tests {
         // Leaf: `impl CaRanked<()> for A` — rank_loc 0 on a generics-free trait, rank spelled
         // exactly `floor_rank()`.
         let leaf = squish(&quote!(#ranked_ca<()> for A).to_string());
-        assert!(hay.contains(&leaf), "leaf floor rank is not spelled `()`:\n{}", out);
+        assert!(
+            hay.contains(&leaf),
+            "leaf floor rank is not spelled `()`:\n{}",
+            out
+        );
         // Final: `Self: shadowing_module::ranked_traits::CaRanked<((),)>` — exactly
         // `initial_rank(1)`.
         let fin = squish(&quote!(#sm::#rm::#ranked_ca<((),)>).to_string());
-        assert!(hay.contains(&fin), "Final initial rank is not spelled `((),)`:\n{}", out);
+        assert!(
+            hay.contains(&fin),
+            "Final initial rank is not spelled `((),)`:\n{}",
+            out
+        );
     }
 
-    /// A hand-emitted registration (via `fingerprint_expr` + `emit_registration`/`reentry_*_name`)
+    /// Every floor has its decoy twin (`decoy_rank`) in both modes: the same header at the decoy
+    /// rank, with the where-clause the floor keeps (a non-cyclic side bound here), and the decoy
+    /// rank is declared once.
+    #[test]
+    fn floor_has_decoy_twin() {
+        for support_infinite_cycle in [true, false] {
+            let (mut args, ca_trait, cb_trait) = d1_cycle_args(support_infinite_cycle);
+            args.contents[0] = parse_quote! {
+                impl Ca for A where B: Cb, A: ::core::fmt::Debug {
+                    fn ca(&self, n: usize) -> usize {
+                        if n == 0 { 0 } else { B.cb(n - 1) + 1 }
+                    }
+                }
+            };
+            let out = finalize(args).to_string();
+            let hay = squish(&out);
+            let decoy = super::decoy_rank_name();
+            let decl = squish(&quote!(pub enum #decoy {}).to_string());
+            assert_eq!(
+                hay.matches(&decl).count(),
+                1,
+                "decoy rank not declared once:\n{}",
+                out
+            );
+            let ranked_ca = super::ranked_trait_name(&ca_trait.ident);
+            let ranked_cb = super::ranked_trait_name(&cb_trait.ident);
+            for (floor, twin) in [
+                (
+                    quote!(#ranked_ca<()> for A where A: ::core::fmt::Debug),
+                    quote!(#ranked_ca<#decoy> for A where A: ::core::fmt::Debug),
+                ),
+                (
+                    quote!(#ranked_cb<()> for B),
+                    quote!(#ranked_cb<#decoy> for B),
+                ),
+            ] {
+                let (floor, twin) = (squish(&floor.to_string()), squish(&twin.to_string()));
+                assert!(hay.contains(&floor), "no floor `{}`:\n{}", floor, out);
+                assert!(hay.contains(&twin), "no decoy twin `{}`:\n{}", twin, out);
+            }
+            let body = squish("\"decycle: the decoy rank is never selected\"");
+            assert_eq!(hay.matches(&body).count(), 2, "decoy bodies:\n{}", out);
+        }
+    }
+
+    /// A hand-emitted registration (via `fingerprint_expr` + `emit_registrations`/`reentry_*_name`)
     /// must byte-agree with `finalize`'s own registration prologue and the floor's `lookup` key for
     /// the same (trait, method, target). Agreement is by construction; this locks it at the token
     /// level, including the sibling-scope spelling a wrapper macro's registration prelude emits.
@@ -4394,44 +3881,63 @@ mod tests {
 
         let decycle_path: Path = parse_quote!(::decycle);
         let ca_ident = &ca_trait.ident;
-        let m_ident: syn::Ident = parse_quote!(ca);
-        let m_generics = syn::Generics::default(); // `fn ca(&self, n: usize)` is non-generic
+        let m_sig: syn::Signature = parse_quote!(fn ca(&self, n: usize) -> usize);
+        let (m_ident, m_generics) = (&m_sig.ident, &m_sig.generics); // non-generic
 
         // The ONE fp recipe (target = Self, sized; no trait targs; empty method generics —
-        // the same argument shape `build_rule1_registrations` and the floor use):
+        // the same argument shape rule 1 (`build_self_registrations`) and the floor use):
         let fp = super::fingerprint_expr(
-            &decycle_path, &quote!(Self), false, &ca_trait.generics, &[], Some(&m_generics),
+            &decycle_path,
+            &quote!(Self),
+            false,
+            &ca_trait.generics,
+            &[],
+            Some(m_generics),
         );
 
         // (1) finalize's rule-1 registration (emitted INSIDE shadowing_module ⇒ bare
         // `ranked_traits` prefix) appears verbatim in the output:
         let rm = super::ranked_traits_module_name();
-        let rule1 = super::emit_registration(
-            &decycle_path, &quote!(#rm), ca_ident, &m_ident,
-            &quote!(Self), &[], &[], fp.clone(),
+        let rule1 = super::emit_registrations(
+            &decycle_path,
+            &quote!(#rm),
+            &ca_trait,
+            &quote!(Self),
+            false,
+            &[],
+            [&m_sig],
         );
         assert!(
             hay.contains(&squish(&rule1.to_string())),
-            "hand-built registration does not byte-agree with rule 1's prologue:\n{}", out
+            "hand-built registration does not byte-agree with rule 1's prologue:\n{}",
+            out
         );
 
         // (2) the sibling-scope (C4 / wrapper-macro) spelling — identical statement modulo the
         // `shadowing_module::` prefix; the KEY (marker type_name + fp) is the same type either
         // way. Pin the exact emitted shape:
         let sm = super::shadowing_module_name();
-        let hand = super::emit_registration(
-            &decycle_path, &quote!(#sm::#rm), ca_ident, &m_ident,
-            &quote!(Self), &[], &[], fp.clone(),
+        let hand = super::emit_registrations(
+            &decycle_path,
+            &quote!(#sm::#rm),
+            &ca_trait,
+            &quote!(Self),
+            false,
+            &[],
+            [&m_sig],
         );
-        let mk = super::reentry_marker_name(ca_ident, &m_ident);
-        let re = super::reentry_fn_name(ca_ident, &m_ident);
+        let mk = super::reentry_marker_name(ca_ident, m_ident);
+        let re = super::reentry_fn_name(ca_ident, m_ident);
         let expected_hand = quote! {
             #decycle_path::__reentry::register::<#sm::#rm::#mk<Self>>(
                 #fp,
                 #sm::#rm::#re::<Self> as *const ()
             );
         };
-        assert_eq!(squish(&hand.to_string()), squish(&expected_hand.to_string()));
+        assert_eq!(
+            squish(&hand.to_string()),
+            squish(&expected_hand.to_string())
+        );
 
         // (3) the floor's lookup names the SAME marker instantiation and the SAME fp
         // expression (emit_impl_items_leaf; bare `#mk` — the floor lives inside
@@ -4441,7 +3947,8 @@ mod tests {
         );
         assert!(
             hay.contains(&squish(&floor_lookup.to_string())),
-            "floor lookup key does not byte-agree with the registration recipe:\n{}", out
+            "floor lookup key does not byte-agree with the registration recipe:\n{}",
+            out
         );
     }
 

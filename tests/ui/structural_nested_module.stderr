@@ -1,0 +1,5 @@
+error: #[decycle] is not supported in nested modules
+ --> tests/ui/structural_nested_module.rs:5:5
+  |
+5 |     #[decycle::decycle]
+  |     ^^^^^^^^^^^^^^^^^^^

@@ -1,0 +1,116 @@
+error[E0275]: overflow evaluating the requirement `A: ranked_traits8909385c15d27adc::LoopRanked8909385c15d27adc<((((((...,),),),),),)>`
+  --> tests/ui/peel_wrapped_path_member.rs:18:13
+   |
+18 |         (B, crate::m::C): Loop,
+   |             ^^^^^^^^^^^^^^^^^^
+   |
+note: required for `C` to implement `ranked_traits8909385c15d27adc::LoopRanked8909385c15d27adc<(((((((((((),),),),),),),),),),)>`
+  --> tests/ui/peel_wrapped_path_member.rs:5:1
+   |
+ 5 | #[decycle::decycle]
+   | ^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound introduced here
+...
+34 |     impl Loop for C
+   |                   ^
+note: required for `C` to implement `m::Loop`
+  --> tests/ui/peel_wrapped_path_member.rs:8:15
+   |
+ 5 | #[decycle::decycle]
+   | ------------------- unsatisfied trait bound introduced here
+...
+ 8 |     pub trait Loop {
+   |               ^^^^
+...
+34 |     impl Loop for C
+   |                   ^
+   = note: this error originates in the attribute macro `decycle::decycle` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0275]: overflow evaluating the requirement `A: ranked_traits8909385c15d27adc::LoopRanked8909385c15d27adc<((((((...,),),),),),)>`
+  --> tests/ui/peel_wrapped_path_member.rs:5:1
+   |
+ 5 | #[decycle::decycle]
+   | ^^^^^^^^^^^^^^^^^^^
+   |
+note: required for `C` to implement `ranked_traits8909385c15d27adc::LoopRanked8909385c15d27adc<(((((((((((),),),),),),),),),),)>`
+  --> tests/ui/peel_wrapped_path_member.rs:5:1
+   |
+ 5 | #[decycle::decycle]
+   | ^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound introduced here
+...
+34 |     impl Loop for C
+   |                   ^
+note: required for `C` to implement `m::Loop`
+  --> tests/ui/peel_wrapped_path_member.rs:8:15
+   |
+ 5 | #[decycle::decycle]
+   | ------------------- unsatisfied trait bound introduced here
+...
+ 8 |     pub trait Loop {
+   |               ^^^^
+...
+34 |     impl Loop for C
+   |                   ^
+   = note: this error originates in the attribute macro `decycle::decycle` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0275]: overflow evaluating the requirement `C: ranked_traits8909385c15d27adc::LoopRanked8909385c15d27adc<((((((...,),),),),),)>`
+  --> tests/ui/peel_wrapped_path_member.rs:18:13
+   |
+18 |         (B, crate::m::C): Loop,
+   |             ^^^^^^^^^^^^^^^^^^
+   |
+note: required for `C` to implement `m::Loop`
+  --> tests/ui/peel_wrapped_path_member.rs:8:15
+   |
+ 5 | #[decycle::decycle]
+   | ------------------- unsatisfied trait bound introduced here
+...
+ 8 |     pub trait Loop {
+   |               ^^^^
+...
+34 |     impl Loop for C
+   |                   ^
+
+error[E0275]: overflow evaluating the requirement `C: ranked_traits8909385c15d27adc::LoopRanked8909385c15d27adc<((((((...,),),),),),)>`
+  --> tests/ui/peel_wrapped_path_member.rs:5:1
+   |
+ 5 | #[decycle::decycle]
+   | ^^^^^^^^^^^^^^^^^^^
+   |
+note: required for `C` to implement `m::Loop`
+  --> tests/ui/peel_wrapped_path_member.rs:8:15
+   |
+ 5 | #[decycle::decycle]
+   | ------------------- unsatisfied trait bound introduced here
+...
+ 8 |     pub trait Loop {
+   |               ^^^^
+...
+34 |     impl Loop for C
+   |                   ^
+note: required for `A` to implement `ranked_traits8909385c15d27adc::LoopRanked8909385c15d27adc<((((((((((),),),),),),),),),)>`
+  --> tests/ui/peel_wrapped_path_member.rs:5:1
+   |
+ 5 | #[decycle::decycle]
+   | ^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound introduced here
+...
+16 |     impl Loop for A
+   |                   ^
+   = note: 1 redundant requirement hidden
+   = note: required for `B` to implement `ranked_traits8909385c15d27adc::LoopRanked8909385c15d27adc<(((((((((((),),),),),),),),),),)>`
+   = note: this error originates in the attribute macro `decycle::decycle` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0275]: overflow evaluating the requirement `A: ranked_traits8909385c15d27adc::LoopRanked8909385c15d27adc<((((((...,),),),),),)>`
+  --> tests/ui/peel_wrapped_path_member.rs:5:1
+   |
+ 5 | #[decycle::decycle]
+   | ^^^^^^^^^^^^^^^^^^^
+   |
+note: required for `C` to implement `ranked_traits8909385c15d27adc::LoopRanked8909385c15d27adc<(((((((((((),),),),),),),),),),)>`
+  --> tests/ui/peel_wrapped_path_member.rs:5:1
+   |
+ 5 | #[decycle::decycle]
+   | ^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound introduced here
+...
+34 |     impl Loop for C
+   |                   ^
+   = note: this error originates in the attribute macro `decycle::decycle` (in Nightly builds, run with -Z macro-backtrace for more info)

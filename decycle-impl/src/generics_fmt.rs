@@ -10,8 +10,8 @@
 //! lifetime param to the bare lifetime.
 
 use proc_macro2::TokenStream;
+use syn::{GenericParam, Generics, Ident};
 use template_quote::quote;
-use syn::{GenericParam, Generics};
 
 /// How a *type* parameter's bounds are rendered when the param appears in a declaration.
 #[derive(Clone, Copy)]
@@ -96,4 +96,32 @@ pub(crate) fn wrap_angle(inner: &TokenStream) -> TokenStream {
     } else {
         quote!( < #inner > )
     }
+}
+
+/// `params` split into its lifetimes and the rest (its type and const parameters), each in order.
+pub(crate) fn split_lifetimes<'a>(
+    params: impl IntoIterator<Item = &'a GenericParam>,
+) -> (Vec<&'a GenericParam>, Vec<&'a GenericParam>) {
+    params
+        .into_iter()
+        .partition(|p| matches!(p, GenericParam::Lifetime(_)))
+}
+
+/// The items of `items` whose `mask` entry is set, in order.
+pub(crate) fn masked<'a, T>(items: &'a [T], mask: &'a [bool]) -> impl Iterator<Item = &'a T> {
+    items.iter().zip(mask).filter(|(_, k)| **k).map(|(t, _)| t)
+}
+
+/// The idents of `generics`' type and const parameters, in order — the arguments a turbofish names
+/// (lifetimes are left to inference).
+pub(crate) fn type_const_idents(generics: &Generics) -> Vec<Ident> {
+    generics
+        .params
+        .iter()
+        .filter_map(|p| match p {
+            GenericParam::Type(t) => Some(t.ident.clone()),
+            GenericParam::Const(c) => Some(c.ident.clone()),
+            _ => None,
+        })
+        .collect()
 }

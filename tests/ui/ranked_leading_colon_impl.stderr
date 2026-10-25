@@ -1,0 +1,48 @@
+error[E0405]: cannot find crate `Ca` in the list of imported crates
+  --> tests/ui/ranked_leading_colon_impl.rs:25:12
+   |
+25 |     impl ::Ca for B
+   |            ^^ not found in the list of imported crates
+   |
+note: trait `crate::m::shadowing_module8909385c15d27adc::Ca` exists but is inaccessible
+  --> tests/ui/ranked_leading_colon_impl.rs:6:1
+   |
+ 6 | #[decycle]
+   | ^^^^^^^^^^ not accessible
+   = note: this error originates in the attribute macro `decycle` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the trait bound `m::B: m::Ca` is not satisfied
+  --> tests/ui/ranked_leading_colon_impl.rs:18:9
+   |
+18 |         B: Ca,
+   |         ^^^^^ unsatisfied trait bound
+   |
+help: the trait `m::Ca` is not implemented for `m::B`
+  --> tests/ui/ranked_leading_colon_impl.rs:14:5
+   |
+14 |     pub struct B;
+   |     ^^^^^^^^^^^^
+help: the trait `m::Ca` is implemented for `A`
+  --> tests/ui/ranked_leading_colon_impl.rs:6:1
+   |
+ 6 | #[decycle]
+   | ^^^^^^^^^^
+   = note: this error originates in the attribute macro `decycle` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the trait bound `m::B: m::Ca` is not satisfied
+  --> tests/ui/ranked_leading_colon_impl.rs:6:1
+   |
+ 6 | #[decycle]
+   | ^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `m::Ca` is not implemented for `m::B`
+  --> tests/ui/ranked_leading_colon_impl.rs:14:5
+   |
+14 |     pub struct B;
+   |     ^^^^^^^^^^^^
+help: the trait `m::Ca` is implemented for `A`
+  --> tests/ui/ranked_leading_colon_impl.rs:6:1
+   |
+ 6 | #[decycle]
+   | ^^^^^^^^^^
+   = note: this error originates in the attribute macro `decycle` (in Nightly builds, run with -Z macro-backtrace for more info)

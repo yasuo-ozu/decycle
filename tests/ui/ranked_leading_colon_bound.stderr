@@ -1,0 +1,31 @@
+error[E0405]: cannot find crate `Ca` in the list of imported crates
+  --> tests/ui/ranked_leading_colon_bound.rs:27:14
+   |
+27 |         A: ::Ca,
+   |              ^^ not found in the list of imported crates
+   |
+   = help: consider importing one of these traits:
+           crate::m::Ca
+           crate::m::shadowing_module8909385c15d27adc::Ca
+
+error[E0405]: cannot find crate `Ca` in the list of imported crates
+  --> tests/ui/ranked_leading_colon_bound.rs:27:14
+   |
+27 |         A: ::Ca,
+   |              ^^ not found in the list of imported crates
+   |
+   = help: consider importing this trait:
+           crate::m::Ca
+
+error[E0405]: cannot find crate `Ca` in the list of imported crates
+  --> tests/ui/ranked_leading_colon_bound.rs:27:14
+   |
+27 |         A: ::Ca,
+   |              ^^ not found in the list of imported crates
+   |
+note: trait `crate::m::shadowing_module8909385c15d27adc::Ca` exists but is inaccessible
+  --> tests/ui/ranked_leading_colon_bound.rs:6:1
+   |
+ 6 | #[decycle]
+   | ^^^^^^^^^^ not accessible
+   = note: this error originates in the attribute macro `decycle` (in Nightly builds, run with -Z macro-backtrace for more info)

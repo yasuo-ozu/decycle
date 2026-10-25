@@ -1,0 +1,8 @@
+error: `module` must be the absolute path of this module
+
+         = help: start it at the crate root: `module = crate::..::m`
+
+ --> tests/ui/module_not_absolute.rs:4:29
+  |
+4 | #[decycle::decycle(module = self::m)]
+  |                             ^^^^^^^

@@ -3,6 +3,334 @@
 Notable changes, following [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+The changes below break existing code (see **Changed** and **Removed**), so they are to be released
+as **0.8.0**, not as a 0.7 patch.
+
+### Added
+
+- **`module = path` on a `#[decycle]` module** (`#[decycle::decycle(module = crate::m)] mod m { .. }`,
+  combinable with `structural`, `recurse_level`, ..): the module's own absolute path. It must start
+  with `crate` (or `$crate`, as a `macro_rules!` passes it, or a leading `::`), carry no generic
+  arguments and end in the module's name (a leading `::` needs `extern crate self as ..`); anything
+  else is an error with a help line, reported after the module is expanded without it (an
+  `#[announce]`d item in it then reports its relative paths as well). On a trait it is rejected like
+  the other module options. The cycle is still solved on the module as written, where only a bare
+  (or `self::`) name is the module's (a type or trait named by a path, `crate::m::Term: Eval`, stays
+  the opt-out). Once it is solved:
+  - the items emitted as written — structs, enums, unions, type aliases, traits, fns, consts,
+    statics, and every impl the engine does not take over (inherent impls, impls of other traits,
+    path-spelled opt-outs) — have each bare or `self::` name of a type or trait declared directly in
+    the module spelled `path::X`, in type and bound positions (fields, the types of consts and
+    statics, generics, where clauses, supertraits, signatures, impl headers, associated types). This
+    happens before the attributes on those items expand, so a struct or enum inside the module can
+    be `#[announce]`d (announce requires absolute paths) with bare fields such as `Box<Term>` or
+    `Box<self::Term>`. Bare names shadowed by a generic parameter, `Self`, other multi-segment
+    paths, fn bodies and other expressions, macro invocations, nested modules and imported names
+    are left as written. The impls of the `#[decycle]` traits are generated anew by the engines and
+    keep the bare spelling. The rewrite is syntactic: a type declared under an inactive `#[cfg]`
+    still counts as declared (so its name is qualified), and a type a macro invocation declares
+    does not.
+  - the path is checked against the module: a hidden marker item is declared in the module and named
+    through the path, so a path that is well-formed but not this module's (`crate::m` on
+    `crate::outer::m`, which would otherwise quietly retarget a name to another module's item of
+    the same name) fails with an error at the `module` argument (``cannot find type
+    `__DecycleModule_..` in module `crate::m` ``), as does a path that names no module at all.
+
+  Without `module` nothing changes, except for the spelling rules below. The programmatic forms are
+  `ranked::process_module_at` and `structural::process_module_at`.
+
+- **With `module = path`, the ranked engine reports an opt-out bound on a cycle itself**, in the
+  module's terms, where rustc would report `E0275` on the engine's internals (``overflow evaluating
+  the requirement `A: ranked_traits…::LoopRanked…<((((((_,),),),),),)>` ``). A bound that names one
+  of the module's own structs, enums or unions by its path, `<module>::C` or a `super::m::C` that is
+  the same path once `super` is resolved against the module path, directly
+  (`where crate::m::C: Loop`) or as a part a peeled wrapper keeps (`(B, crate::m::C): Loop`), is
+  checked as if it were bare. When `C`'s impl leads back to the impl carrying the bound, the error
+  is at the bound, with the cycle:
+
+  ```text
+  error: decycle: `crate::m::C` names `C` of this module by its path, so this bound is left as written, but `C`'s impl of `Loop` leads back to this impl (`A` → `C` → `A`): rustc cannot prove that cycle (E0275)
+           = help: write `C` to make the bound part of the cycle decycle breaks
+  ```
+
+  Every such bound of the module is reported, and nothing else: the module emitted after the errors
+  drops the bounds of the `#[decycle]` traits that name no generic parameter, which rustc would
+  otherwise report as overflowing on their own. Only a certain overflow is reported, and only one
+  that the module states: the chain must run through impls without generic parameters, for types
+  declared in the module and named without arguments, each the only impl of the trait for its type
+  and carrying no attribute but lint levels and docs (no `#[cfg]`, no attribute macro), along
+  bounds that name the same trait bare. Anything else on the way (a generic impl such as
+  `impl<T> Loop for Wrap<T> where T: Loop`, whose answer depends on `T`, a type with arguments,
+  another trait, an associated-type constraint, a `for<..>` binder), a module under an attribute
+  that is not inert, and every module without `module` are left to rustc as before. The rank chain
+  is taken into account: a chain back with more bare bounds than `recurse_level` reaches the rank
+  floor first and compiles, so it is not reported (a call that reaches the floor on it fails
+  closed at run time, "re-entry fn not registered"). The structural engine is unchanged: its
+  `E0275` already names the module's types (`A: m::Loop`), and it does not peel a wrapped bound
+  into parts.
+
+- **A `#[decycle]` trait may have another `#[decycle]` trait of the module as a supertrait**
+  (`trait Eval: Base`, or `self::Base`) with the ranked engine, which used to reject it ("a
+  #[decycle] trait cannot be a supertrait of another #[decycle] trait"; a path-spelled supertrait
+  slipped past the check). The ranked twin of the trait takes the supertrait's ranked twin at the
+  same rank (`EvalRanked<Rank>: BaseRanked<Rank>`), so a subtrait impl's body can call the
+  supertrait's methods on `Self` and on cycle members at any depth, chains (`A: B`, `B: C`) and
+  several supertraits (`Eval: Base + Other`) included, and generic impls (`impl<T> Eval for Wrap<T>
+  where T: Eval`) get the `T: Base` they need from `T: Eval`. The supertrait's re-entry fns are
+  registered for `Self` in the subtrait's frames, so a recursion past the floor that enters the
+  supertrait's chain finds them. A supertrait implemented outside the module for some type of the
+  subtrait, and one named by a path (`crate::m::Base`, the opt-out), stay the real trait as written:
+  the impls work, but a subtrait impl's body can call that supertrait's methods only through its
+  path (by method syntax the call does not compile: `E0283`/`E0275` on `BaseRanked…`). One case
+  still fails closed past the
+  floor with the documented "re-entry fn not registered" panic: a generic supertrait method called
+  from a subtrait impl's body on a type whose supertrait impl is generic over its cyclic parameter
+  (`impl<T: Base> Base for Wrap<T>`), as any generic method first reached from a non-generic
+  caller does. The structural engine is unchanged: its terminators implement only the pairs of
+  their own cycle, so a supertrait outside the cycle (acyclic, implemented elsewhere, or reached
+  through a cross-trait bound only) is `E0277` on the terminator.
+
+### Changed
+
+- **Breaking: both engines read a cycle participant only by the name the module gives it**, bare
+  or `self::`-qualified: the trait of an impl, the trait and the types of a bound, and the self type
+  of an impl. Anything the module writes as another path (`crate::m::X`, `super::X`,
+  `crate::other::X`, `::krate::m::X`) names the item itself, the opt-out: it is left as written, so
+  a cycle through it fails to compile, not at run time (but for a ranked chain back longer than
+  `recurse_level`, see **Added**). With the structural engine that is rustc's own overflow
+  (`E0275`) on the impls as written; with the ranked engine it is `E0275` too, which can name the
+  engine's `…Ranked` traits (and, in a module with several `#[decycle]` traits, an `E0277` on
+  internal names), unless `module = path` lets decycle report it first (see **Added**). In detail:
+  - **structural**: the trait of an impl (`impl crate::m::Eval for X`, `impl super::Eval for X`),
+    the trait and the types of a bound (`where Y: super::Eval`, `where crate::m::Term: Eval`) and
+    the self type of an impl (`impl Eval for crate::m::Term`) used to be matched by their last
+    segment. They are now the opt-out and are emitted as written; `impl Loop for crate::other::B`
+    beside a cycle member `B` is no longer `E0119`, and a bound on a foreign wrapper sharing a
+    member's name (`where crate::other::B<B>: Loop`) is a wrapper around the member (forwarded,
+    with its assertion), no longer `E0107`. Reading bound types through `syn`'s visitor also
+    changes two classifications: a member inside an associated-type binding is seen
+    (`P<dyn Kind<Out = Term>>: Eval` is now forwarded as a wrapped bound), and a projection is no
+    longer misread as the ADT that shares its name (`<U as Tr>::Term` is not `Term`).
+  - **ranked**: an impl whose self type is spelled by a path (`impl Eval for crate::m::Term`) is no
+    longer taken over — it used to be, and then missed by the rest of the engine (an `E0275` wall
+    naming `EvalRanked…`). It is the opt-out now, emitted as written.
+  - **`self::`**: a `self::` self type (`impl Eval for self::Term`) or bound type
+    (`where self::Term: Eval`) is the bare member in both engines. The ranked engine used to drop it
+    out of the cycle (an `E0275` wall naming `EvalRanked…`).
+  - **ranked, wrapped bounds**: a cyclic bound on a wrapper is replaced by the obligations of all
+    its parts, on the contract that a wrapper implements the trait when its type arguments do. A
+    cycle member is an edge, as before, and a part that contains no member is now kept as a premise
+    on the original trait, as written: `(B, crate::m::C): Loop` is `B: Loop` and
+    `crate::m::C: Loop`, `(B, u8): Loop` is `B: Loop` and `u8: Loop`. Those parts used to be
+    dropped, so a path-spelled cycle type inside a wrapper (`(B, crate::m::C)`, `Vec<(B,
+    crate::m::C)>`, `Box<(B, Box<crate::m::C>)>`) panicked at run time ("re-entry fn not registered
+    before the floor was reached") where it now fails to compile, and a bound that cannot hold
+    (`(B, u8): Loop` with no `u8` impl) was accepted where it is now `E0277`. The `for<..>` binder
+    and the extra non-cyclic bounds of the predicate are kept as before.
+- **The structural engine shares premises among the members of each cycle, always**, as the
+  ranked engine does: each impl of a trait in a cycle gets the `where`-predicates of the cycle's
+  other impls of that trait that are no edge of the cycle (its leaf premises). A member's generated
+  impl reaches a sibling through the public trait, and the sibling's impl demands its own leaf
+  premises, which the member need not state (`Stmt` reaching a `#[group]`-like `Group` whose impl
+  alone needs `A: Clone`): that used to be `E0277` on the member, unless a graph was supplied
+  (`process_module_with_graph`, which shared across every impl of the trait). The premises land on
+  the member's generated impls, the natural type's impl included (`impl<T> Tr<T> for A where T:
+  Clone`), which changes nothing it effectively requires: the stripped cyclic bound required them
+  already. Impls outside every cycle, and the impls of another cycle, are left alone. The premises
+  travel along the cycle's bounds, whatever their trait (see **Fixed**): an impl receives those of
+  every impl its cyclic bounds reach, transitively, with the reached impl's generic parameters
+  mapped through the bound, so `impl<U> Size<U> for Term where U: Clone` gives `impl<T> Eval<T> for
+  Expr where Term: Size<T>` the bound `T: Clone`, and through `Term: Size<u8>` only `u8: Clone`.
+  Inline parameter bounds and the non-cyclic co-bounds of a cyclic bound (`Clone` in
+  `Term: Size<T> + Clone`) count as premises, and a premise naming `Self` is given with `Self`
+  spelled as the reached impl's self type (`Self: Debug` on `Term<R>` reaches `Expr<S>` as
+  `Term<S>: Debug`). A premise that cannot be said in the receiving impl's terms is skipped,
+  without a diagnostic (if it was needed, the error is the `E0277` there would have been without
+  it): one naming a lifetime of the reached impl that no argument of the bound fixes
+  (`impl<'u, T> .. where T: 'u`), one naming an item the receiving impl shadows with a parameter of
+  the same name, a projection `T::Out` whose `T` maps to a type that is no plain name, and one
+  behind a macro. Beside that, the impls of one trait in a cycle still take the union of each
+  other's premises by name, as in the ranked engine: a predicate is only given to an impl that
+  declares every generic parameter it names, and a `Self`-mentioning one is not.
+- **Breaking (ranked): a leading `::` on a one-segment trait path is a path, the opt-out**, as it
+  already was in the structural engine and for types in both: `impl ::Tr for X`, `where Y: ::Tr`
+  and `<Y as ::Tr>::f` name the item `::Tr` itself, not the module's `Tr`, and are left as written.
+  The ranked engine read them as the bare `Tr` and rewrote them into the cycle, so a spelling that
+  names nothing in edition 2018 on (`::Tr` is a crate there) compiled and ran; rustc now reports it
+  (``E0405: cannot find crate `Tr` in the list of imported crates``). Write `Tr` (or `self::Tr`).
+- **Breaking (structural): a `#[decycle(structural)]` module rejects three forms the ranked engine
+  already rejects, with the same errors:**
+  - a glob `#[decycle] use path::*;`, which compiled and routed no trait (`glob is not supported in
+    #[decycle] use`; name the traits, `use path::{Tr, Other};`);
+  - a `#[decycle]` anywhere inside a nested module, which compiled: a nested `#[decycle] mod` was
+    expanded on its own, and a marked item of a plain nested module as if outside any `#[decycle]`
+    module (`#[decycle] is not supported in nested modules`; move the module out of the
+    `#[decycle]` module);
+  - `#[decycle]` on a trait alias (`#[decycle] is not supported on a trait alias`). The marker used
+    to be left on the alias, where it failed as an unknown attribute.
+- **In a module with a cycle, the markers are checked only where the engine takes them**, item by
+  item in source order, so the first faulty item is the one reported. The value-generic growth
+  pre-pass, which runs first, used to check the markers of the module's traits and `use`s on its
+  way, and reported a marker with arguments (`#[decycle] takes no arguments on an item inside a
+  #[decycle] module`) ahead of everything: ahead of a glob `#[decycle] use` or a marked trait alias
+  earlier in the module (`tests/ui/marker_args_after_glob_use.rs`), ahead of a second marker with
+  arguments on an earlier item, and ahead of the growth itself, which the structural engine now
+  reports first (`tests/ui/value_generic_growth_before_marker_args_structural.rs`).
+- **A diagnostic on a `Self` that the ranked engine copies from a signature points at that `Self`.**
+  The ranked trait's methods, the floor's copies and the bridges of a wrapper respelled every bare
+  `Self` of the signature at the macro's call site, so an error on one (an impl for `str` taking
+  `other: Self`) pointed at `#[decycle]`, with rustc suggesting `&#[decycle]`; it now points at the
+  user's `Self`, where it merges with the same error on the user's impl
+  (`tests/ui/ranked_self_span_unsized.rs`).
+- **The value-generic growth check reads an impl's self type as the engines do**: a qualified-self
+  type (`impl Eval for <Q as P>::Out`) is no cycle member, whatever its last segment spells, so the
+  check no longer rejects such an impl's methods when that segment happens to be a member's name
+  (`tests/growth_qself_target.rs`).
+- **Structural engine: `Self` is found wherever a signature spells it**, by one visitor over the
+  whole signature: also in the expression of an array length or a const argument
+  (`[u8; Self::N]`, `Wrap<{ Self::N }>`), in the generics of an associated-type binding
+  (`Fam<Assoc<Self> = u8>`) and in an attribute of a fn pointer's parameter, and an `impl Trait` or
+  a `dyn` mentioning `Self` anywhere in a type. A parameter or return type mentioning `Self` only
+  there is now cast to the terminator's type (`decycle-impl/src/structural/tests.rs`), and these signatures,
+  which used to fail on generated code, are rejected up front with the engine's own errors:
+  - a method-level bound mentioning `Self` in one of those positions (`F: Fam<Assoc<Self> = u8>`,
+    `tests/ui/structural_method_gat_binding_self_bound.rs`; it was a wall of `E0271` naming
+    `__ATerm_..`);
+  - an argument-position `impl Trait` mentioning `Self` inside a generic argument
+    (`Option<impl Fn(&Self)>`, `tests/ui/structural_nested_impl_trait_self_arg.rs`; it was
+    `E0562` on the generated cast);
+  - a parameter whose type holds a `dyn` mentioning `Self` only in such an expression, and a
+    qualified projection whose base mentions `Self` only there (`<[u8; Self::N] as Tr>::Out`).
+
+  With a `#[decycle] use`d trait, whose declaration the engine cannot read, a signature naming the
+  concrete self type by the last segment of a path in one of those positions (`Box<dyn
+  Iterator<Item = A>>`, `[u8; size_of::<A>()]`) is rejected as a concrete `Self` spelling, like
+  `&A`; and a wrapped bound's forwarding assertion is no longer emitted when its container names an
+  impl parameter there (`Box<dyn Iterator<Item = T>>`), where it named a parameter out of scope.
+
+### Removed
+
+- **Breaking: the obligation-graph API**, without a deprecation period: `ranked::
+  process_module_with_graph`, `ranked::finalize::finalize_with_graph` (and their `emit_contracts`
+  re-spelling), `structural::process_module_with_graph`, the `decycle::analysis` module
+  (`analyze_module`, `analyze_items`, `cyclic_subgraph`, `with_nodes`, `EdgeKind`) and the
+  `decycle::safegraph` re-export. The engines take their participants from the module's own
+  spelling only. The plain programmatic entry points stay: `ranked::process_module`,
+  `ranked::process_module_at`, `ranked::finalize::finalize` (with its `AlsoRank` hook) and
+  `structural::process_module`/`process_module_at`, behind the `api` feature as before.
+
+  **Migrating a macro that generates the impls it hands an engine** (the graph's use case): spell
+  the module for the engine instead of stating its cycle — bring each routed trait in with
+  `#[decycle] use path::to::Trait;` and call the plain `process_module`, with
+  - every impl header naming the routed trait bare (`impl<S, A> Parse<A> for Expr<S>`);
+  - a where-bound naming it bare only when its bounded type names a type the module declares,
+    generated helper types (`#[group]` substructs) included: `Vec<Box<Stmt<S>>>: Parse<A>`;
+  - every other bound naming it fully qualified (`crate::lexer::Integer: ::syan::Parse<A>`), which
+    makes it a premise rather than an edge.
+
+  The leaf premises the graph path used to share across a trait's impls are now shared among each
+  cycle's members by both engines (see **Changed**).
+
+### Fixed
+
+- **The ranked engine takes every `#[decycle]` marker of an item, as the structural engine does.**
+  An item marked twice (`#[decycle] #[decycle] trait Tr`, as a macro that marks the items it emits
+  can leave one the user marked already) is marked once. The ranked engine took only the first
+  marker and re-emitted the second, which then failed as an unknown attribute (``cannot find
+  attribute `decycle` in this scope``; on a `use`, `place it inside module annotated with
+  #[decycle]`), or, with `decycle` imported into the module, announced the trait as if it stood
+  outside any `#[decycle]` module. Each marker is checked, the second one too: an argument list on
+  it is the error a first one gets (`#[decycle] takes no arguments on an item inside a #[decycle]
+  module`). A marker inside `#[cfg_attr(..)]` is still not read as one, by either engine.
+- **A cycle that alternates between traits shares its premises**, in both engines (`Expr: Eval`
+  needing `Term: Size`, which needs `Expr: Eval`; three traits or more alike). Premises were shared
+  among the impls of one trait only, so `Expr`, the cycle's only `Eval` impl, never received
+  `Term`'s `T: Clone`. With `structural` that was `E0277` on the generated impl (``the trait bound
+  `T: Clone` is not satisfied``); the ranked engine compiled it, but skipped the re-entry
+  registrations that need the premise, and a recursion past the floor panicked ("re-entry fn not
+  registered before the floor was reached"). That was the documented heterogeneous side-bound
+  limitation (`impl<T: Clone> Ca for A<T> where B<T>: Cb` beside `impl<T: Default> Cb for B<T>
+  where A<T>: Ca`), which now runs unbounded. Each impl now receives the premises of the impls its
+  cyclic bounds reach, whatever their trait, with the generic parameters mapped through the bound
+  (not matched by name), as described for the structural engine under **Changed**. The ranked
+  engine only carries a premise its registration check reads the same way, so it leaves out a
+  premise naming `Self`, and a premise with a trait bound that names a lifetime other than
+  `'static`, has a `for<..>` binder, names a const parameter or projects from a parameter
+  (`T::Out`), or has a parameter in `Fn(..)` sugar or an associated-item constraint of the bound;
+  a side bound of that kind still fails closed past the floor. A premise given to a parameter that
+  has inline bounds joins them (`impl<T: Clone + Default>`), so the generated impl does not trip
+  `clippy::multiple_bound_locations` on the user's impl header.
+- **A floor reached by elimination is a compile error (`E0283`) instead of a run-time panic.** In
+  a ranked module, a call of a `#[decycle]` trait's method whose rank nothing pins leaves the rank
+  of the ranked twin to inference: one on a type the impl has no bound for (`self.base()` in an impl
+  of another trait, with no `Self: Base`), or one through an impl of the module whose step impl
+  cannot apply (a pair impl `impl<X: Loop, Y: Loop> Loop for (X, Y)` called as
+  `(B, Foreign).step(n)`, with `Foreign`'s impl outside the module and no ranked impl forwarding to
+  it: see the next entry for when it gets one). Where the step impl
+  (`XxxRanked<(R,)>`) was ruled out, the floor (`XxxRanked<()>`) was the one impl left and was
+  selected, though no frame had registered anything for it: the call compiled and panicked at run
+  time, "re-entry fn not registered" (or "cycle limit reached" with
+  `support_infinite_cycle = false`). Every solver rules the step impl out for the pair. For
+  `self.base()`, the old solver (stable's) reported `E0283` already, but the next-generation
+  solver, nightly's default since rust-lang/rust#160619 (2026-08-21) and planned for stabilisation,
+  rules it out through the caller's where-bounds. Each floor now has a twin at an uninhabited rank
+  no other rank unifies with, so two impls are left and every solver reports the call as ambiguous.
+  A pinned rank is unaffected. On nightly, a call of the first shape that ran because an earlier
+  frame had happened to register its callee now fails to compile as well. Pin the call with a bound
+  (`Self: Base`), a supertrait (`trait Eval: Base`) or a call by path
+  (`crate::m::Base::base(self)`); see the README for the pair.
+  `tests/ui/ranked_floor_by_elimination*.rs` pin both shapes, blessed on the old solver; to check
+  them on the next one, run
+  `cargo +nightly test --test trybuild -- --ignored ui_compile_fail trybuild=ranked_floor_by_elimination`
+  (it passes with the same snapshots).
+- **Ranked engine: a call through a wrapper whose parts are partly outside the cycle compiles and
+  runs.** `impl Loop for A where (B, crate::other::Leaf): Loop`, with the pair's impl in the module
+  (`impl<X: Loop, Y: Loop> Loop for (X, Y)`) and `Leaf: Loop` implemented outside it, could not call
+  through the pair: `(B, crate::other::Leaf).step(n)` panicked on the first call ("re-entry fn not
+  registered before the floor was reached"), and with the floor's decoy twin (above) it is `E0283`;
+  the same call by the trait path was `E0277` on `Leaf: LoopRanked…`. The bound was replaced by its
+  parts, so nothing fixed the rank of the call, and the pair's ranked step demanded
+  `Leaf: LoopRanked<R>`, which a type outside the cycle never had. The engine now keeps the
+  outermost wrapper the module implements next to its parts, as an edge, registers the floors of
+  the chain through it, and gives every type outside the cycle the chain reaches (here `Leaf`;
+  `Vec<U>` for a parameter `U`) a ranked impl that forwards each method, associated type and const
+  to the original trait — for a ranked supertrait too. The wrapper's floor (and its decoy) ranks its
+  inline bounds (`X: LoopRanked<()>`) instead of demanding the original trait, which closed an
+  `E0275` cycle through the members' delegating impls; with it, a cycle through a participating
+  container (`Wrap<Stmt>: Tr` with `impl<T: Tr> Tr for Wrap<T>`, `tests/nested_participant_cycle.rs`)
+  no longer overflows. No such impl is written where it could overlap another ranked impl: for a
+  part named through a `use .. as` rename, a type alias or a relative path, which may be a cycle
+  member under another name (such a name is now spelled `self::X` in the bounds of the impls taken
+  over, which reads the same); for a part an impl of the module may implement
+  (`::std::vec::Vec<u8>` beside `impl<T: Loop> Loop for Vec<T>`, which is planned through instead
+  when spelled `Vec<u8>`), or a path to a member (`crate::m::C`); or for a part the module spells
+  two ways (`Leaf` and `crate::other::Leaf`). There the bound reads as its parts, as before, and the
+  call through the wrapper stays `E0283` (`tests/ui/ranked_floor_by_elimination_tuple.rs`, which
+  pinned the call above and now pins a renamed part). A wrapper whose impl is outside the module is
+  still reached by path only (`tests/ui/wrapper_outside_method.rs`).
+- **Ranked engine: a doc comment or a string literal naming a wrapper's parameter no longer stops
+  the call through the wrapper.** The wrapper's floor keeps an inline bound on the original trait
+  for a parameter one of its associated items mentions (`type Out = X::Out;` resolves through
+  `X: Loop`), and a wrapper whose floor keeps one is not planned, so the call through it is
+  `E0283`. The mentions were read off the item's text, so `/// The pair of an X and a Y` or
+  `const NAME: &str = "X";` counted one; they are now its ident tokens, a macro's included
+  (`tests/wrapper_bridge.rs`).
+- **The ranked engine's expansion is deterministic.** It emitted its per-trait items (the ranked
+  twins and re-entry items, the dummy shadows, the inductive and the Final impls) in the iteration
+  order of a `HashMap`, which `std` seeds per process: a module with several `#[decycle]` traits
+  expanded differently from one compilation to the next (and between two expansions in one
+  process). The same
+  items, in another order; with several errors, which one an up-front check reported varied too.
+  They now follow the traits' declaration order.
+- The ranked engine no longer panics at run time ("re-entry fn not registered before the floor
+  was reached") when a member of a cycle of several impls has a premise on the original trait — a
+  bare bound on a type that is no participant (`crate::other::Stmt: Tr`, or a part the wrapped-bound
+  peel now keeps) — and the recursion passes the floor. The reachability walk behind the re-entry
+  registrations followed the premise as an edge, found no impl to descend into and gave up, and
+  the premise was not shared with the member's siblings (it is now, like any other premise).
+
 ## [0.7.0] — 2026-10-18
 
 ### Changed

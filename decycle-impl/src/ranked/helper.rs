@@ -6,13 +6,9 @@ use template_quote::quote;
 
 /// Rejection for a `#[decycle]` trait named with `Fn(...)`-sugar (`where B: Cb(usize) -> usize`):
 /// the ranked-trait rewrite must splice a `Rank` argument, which parenthesized args can't carry.
-const PARENTHESIZED_ARGS_MSG: &str = "unsupported parenthesized generic arguments on a #[decycle] trait";
+const PARENTHESIZED_ARGS_MSG: &str =
+    "unsupported parenthesized generic arguments on a #[decycle] trait";
 
-/// Strips a leading, argument-less `self` segment (`self::Trait` -> `Trait`,
-/// `self::Trait::method` -> `Trait::method`) so a `self::`-qualified reference to a
-/// #[decycle] trait is recognized the same way the bare name is. A leading `self` is only
-/// ever a no-op module-path prefix (it can't itself carry generic arguments), so stripping
-/// it is always semantics-preserving.
 /// The head (outermost path) ident of a type: `Box` for `Box<Stmt>`, `Stmt` for `Stmt<S>`.
 /// `None` for a non-path type (`&Stmt`, `(A, B)`) or a `<T as Tr>::X` qself.
 ///
@@ -25,24 +21,6 @@ pub fn type_head_ident(ty: &Type) -> Option<Ident> {
     }
 }
 
-/// The head ident of a type, but **only** when the type is spelled as a module-local item — a bare
-/// single-segment path, or its no-op `self::`-qualified form.
-///
-/// This is [`type_head_ident`] with [`path_names_local_ident`]'s locality rule folded in, for the
-/// places that compare a head against a set of the *processed module's own* idents. Using the
-/// last segment there confuses `crate::other::B` with the local `B`: a foreign type would join a
-/// sibling's premise group (`sharing_sources`), or pass the "this bound is rank-lowerable" check
-/// (`validate_impl_where_bounds`, `peel`) and get rank-lowered into a `TrRanked<…>` wall.
-pub fn local_type_head_ident(ty: &Type) -> Option<Ident> {
-    let Type::Path(TypePath { qself: None, path }) = ty else {
-        return None;
-    };
-    let mut probe = path.clone();
-    strip_leading_self(&mut probe);
-    (probe.segments.len() == 1 && probe.leading_colon.is_none())
-        .then(|| probe.segments[0].ident.clone())
-}
-
 /// `ident`'s spelling with any raw-identifier prefix removed: `r#loop` → `loop`.
 ///
 /// Every generated name in this crate is built by interpolating user idents into a `format!` and
@@ -52,11 +30,7 @@ pub fn local_type_head_ident(ty: &Type) -> Option<Ident> {
 /// names only need to be unique and deterministic, and dropping the two-character prefix keeps
 /// both: `r#loop` and `loop` cannot co-exist as one module's items in the first place.
 pub fn unraw(ident: &Ident) -> String {
-    let name = ident.to_string();
-    match name.strip_prefix("r#") {
-        Some(stripped) => stripped.to_owned(),
-        None => name,
-    }
+    syn::ext::IdentExt::unraw(ident).to_string()
 }
 
 /// Is `path` **depth-fragile** — i.e. does its meaning change when the item carrying it is re-emitted
@@ -70,42 +44,12 @@ pub fn path_is_depth_fragile(path: &Path) -> bool {
             .is_some_and(|seg| seg.ident == "super" || seg.ident == "self")
 }
 
-pub fn strip_leading_self(path: &mut Path) {
-    if path.leading_colon.is_none()
-        && path.segments.len() > 1
-        && path.segments[0].ident == "self"
-        && matches!(path.segments[0].arguments, PathArguments::None)
-    {
-        path.segments = path.segments.iter().skip(1).cloned().collect();
-    }
-}
-
-/// Does `path` name one of `names` as a **module-local** item — i.e. is it a bare single-segment
-/// path, or its no-op `self::`-qualified form?
-///
-/// Only those two spellings can denote an item of the module being processed. A path rooted
-/// anywhere else — `crate::other::Stmt`, `super::Stmt`, `::dep::Stmt` — reaches a *different* item
-/// that merely happens to share its last segment, and must be treated as an ordinary outer type.
-///
-/// This is the type-side counterpart of `peel::is_bare_cyclic_bound`, which already applies the
-/// same bare-or-`self::` rule to the trait side of a bound.
-pub fn path_names_local_ident(path: &Path, names: &std::collections::HashSet<Ident>) -> bool {
-    if path.leading_colon.is_some() {
-        return false;
-    }
-    let mut probe = path.clone();
-    strip_leading_self(&mut probe);
-    probe.segments.len() == 1 && names.contains(&probe.segments[0].ident)
-}
-
 /// The fresh binding `reduce_pat` mints for a destructured parameter at position `ix`.
 ///
 /// Delegates to the shared minter so both engines produce the same shape; the suffix keeps it from
 /// colliding with a user parameter and is deterministic across compilations.
 fn arg_ident(ix: usize) -> Ident {
-    static RANDOM_SUFFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let suffix = RANDOM_SUFFIX.get_or_init(|| crate::name_suffix(crate::get_random()));
-    crate::arg_ident(ix, suffix)
+    crate::arg_ident(ix, crate::get_random())
 }
 
 /// Inserts a `Type` as a `GenericArgument::Type` at the given position
@@ -259,13 +203,7 @@ pub trait GenericsScheme {
 impl GenericsScheme for Generics {
     fn push_predicate(&self, predicate: WherePredicate) -> Self {
         let mut g = self.clone();
-        g.where_clause
-            .get_or_insert(WhereClause {
-                where_token: Default::default(),
-                predicates: Default::default(),
-            })
-            .predicates
-            .push(predicate);
+        g.make_where_clause().predicates.push(predicate);
         g
     }
 
@@ -309,35 +247,6 @@ impl GenericsScheme for Generics {
                 args,
                 gt_token: self.gt_token.unwrap_or_default(),
             })
-        }
-    }
-}
-
-impl GenericsScheme for Path {
-    fn push_predicate(&self, _predicate: WherePredicate) -> Self {
-        unimplemented!()
-    }
-
-    fn insert(&self, index: usize, param: TypeParam) -> Self {
-        let mut path = self.clone();
-        let ident = &param.ident;
-        let ty = Type::Path(TypePath {
-            qself: None,
-            path: syn::parse_quote!(#ident),
-        });
-        path_insert_type_arg(&mut path, index, ty);
-        path
-    }
-
-    fn impl_generics(&self) -> TokenStream {
-        quote!()
-    }
-
-    fn ty_generics(&self) -> PathArguments {
-        if let Some(last_segment) = self.segments.last() {
-            last_segment.arguments.clone()
-        } else {
-            PathArguments::None
         }
     }
 }

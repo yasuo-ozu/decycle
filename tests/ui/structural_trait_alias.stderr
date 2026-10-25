@@ -1,0 +1,13 @@
+error: #[decycle] is not supported on a trait alias
+  --> tests/ui/structural_trait_alias.rs:12:11
+   |
+12 |     trait CaAlias = Ca;
+   |           ^^^^^^^
+
+error[E0658]: trait aliases are experimental
+  --> tests/ui/structural_trait_alias.rs:12:5
+   |
+12 |     trait CaAlias = Ca;
+   |     ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: see issue #41517 <https://github.com/rust-lang/rust/issues/41517> for more information

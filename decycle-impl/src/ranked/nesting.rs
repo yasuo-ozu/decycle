@@ -27,12 +27,12 @@
 
 use proc_macro2::{Group, Ident, Spacing, TokenStream, TokenTree};
 use proc_macro_error::abort;
-use syn::spanned::Spanned;
 use std::collections::HashSet;
+use syn::spanned::Spanned;
 use syn::visit_mut::VisitMut;
 use syn::{
-    ExprPath, GenericParam, Generics, Item, ItemImpl, Macro, Path, PathArguments, PathSegment,
-    QSelf, TraitBound, TypePath,
+    ExprPath, Generics, Item, ItemImpl, Macro, Path, PathArguments, PathSegment, QSelf, TraitBound,
+    TypePath,
 };
 use template_quote::quote;
 
@@ -164,14 +164,9 @@ struct AliasHeads<'a> {
 
 impl AliasHeads<'_> {
     fn generic_idents(generics: &Generics) -> HashSet<String> {
-        generics
-            .params
+        crate::generics_fmt::type_const_idents(generics)
             .iter()
-            .filter_map(|p| match p {
-                GenericParam::Type(t) => Some(t.ident.to_string()),
-                GenericParam::Const(c) => Some(c.ident.to_string()),
-                GenericParam::Lifetime(_) => None,
-            })
+            .map(Ident::to_string)
             .collect()
     }
 
@@ -316,11 +311,13 @@ impl AliasHeads<'_> {
                         if let Some(TokenTree::Group(g)) = toks.get(i + 2) {
                             out.push(toks[i].clone());
                             out.push(toks[i + 1].clone());
-                            let nested_allowlisted = EXPRESSION_CODE_MACROS
-                                .contains(&id.to_string().as_str());
+                            let nested_allowlisted =
+                                EXPRESSION_CODE_MACROS.contains(&id.to_string().as_str());
                             if nested_allowlisted {
-                                let mut ng =
-                                    Group::new(g.delimiter(), self.rewrite_macro_tokens(g.stream()));
+                                let mut ng = Group::new(
+                                    g.delimiter(),
+                                    self.rewrite_macro_tokens(g.stream()),
+                                );
                                 ng.set_span(g.span());
                                 out.push(TokenTree::Group(ng));
                             } else {
@@ -447,11 +444,11 @@ impl LiftRelative<'_> {
 
     /// Is `path` the spelling that marks a cycle edge — the bare name of a routed trait, or its
     /// no-op `self::`-qualified form? Only those participate in ranking (the same bare-or-`self::`
-    /// rule `peel::is_bare_cyclic_bound` applies), so only those must survive un-aliased for the
+    /// rule `crate::names::is_routed_bound` applies), so only those must survive un-aliased for the
     /// downstream rewrites to recognise them. A longer-qualified reference (`super::x::Tr`)
     /// deliberately names the original, un-ranked trait and is lifted like any other premise.
     fn spells_cycle_edge(&self, path: &Path) -> bool {
-        crate::helper::path_names_local_ident(path, self.cyclic_traits)
+        crate::names::path_names_local_ident(path, self.cyclic_traits)
     }
 
     /// Lift a path written in **value position** — an expression, a struct literal, or a pattern.
@@ -645,9 +642,7 @@ fn relative_path_root_in_tokens(tokens: &TokenStream) -> Option<proc_macro2::Spa
 /// The span of a `use` tree's leading `super`/`self` segment, if it has one.
 fn relative_use_root(tree: &syn::UseTree) -> Option<proc_macro2::Span> {
     match tree {
-        syn::UseTree::Path(p) => {
-            (p.ident == "super" || p.ident == "self").then(|| p.ident.span())
-        }
+        syn::UseTree::Path(p) => (p.ident == "super" || p.ident == "self").then(|| p.ident.span()),
         syn::UseTree::Group(g) => g.items.iter().find_map(relative_use_root),
         _ => None,
     }

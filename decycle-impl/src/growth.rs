@@ -90,14 +90,15 @@ use crate::analysis;
 use std::collections::HashSet;
 use syn::visit::Visit;
 use syn::{
-    Expr, ExprPath, FnArg, Ident, ImplItem, Item, ItemImpl, ItemMod, Pat, Path, Signature, Stmt,
-    Type, UseTree,
+    Expr, ExprPath, FnArg, Ident, ImplItem, Item, ItemMod, Pat, Path, Signature, Stmt, Type,
 };
 
 /// What a call site has to name for its callee to be the cycle's own trait method — condition 3.
 struct Callees {
-    /// Idents of the traits `#[decycle]` routes through this module. A path segment naming one
-    /// (`Eval::eval(..)`, `<B as Eval>::eval(..)`) names the trait method itself.
+    /// Idents of the traits `#[decycle]` routes through this module, as the obligation graph reads
+    /// them (`analysis::module_routes`). A path segment naming one (`Eval::eval(..)`,
+    /// `<B as Eval>::eval(..)`) names the trait method itself. A marker's argument list is not
+    /// diagnosed here: the engine rejects it where it takes the markers (`markers::take_marked`).
     routed_traits: HashSet<String>,
     /// The cycle members' type names, so a receiver spelled as one (`B.eval(..)`) is recognised.
     members: HashSet<String>,
@@ -114,7 +115,9 @@ pub(crate) fn check_value_generic_growth(module: &ItemMod, decycle: &Path) -> sy
         return Ok(());
     }
     let callees = Callees {
-        routed_traits: routed_trait_names(items, decycle),
+        routed_traits: analysis::module_routes(module, decycle)
+            .map(|(_, routed)| routed.iter().map(Ident::to_string).collect())
+            .unwrap_or_default(),
         members: cyclic.clone(),
     };
     for item in items {
@@ -122,7 +125,11 @@ pub(crate) fn check_value_generic_growth(module: &ItemMod, decycle: &Path) -> sy
         if im.trait_.is_none() {
             continue;
         }
-        if !self_ident(im).is_some_and(|id| cyclic.contains(&id.to_string())) {
+        // The self type's head, as the engines read it: a qualified-self type
+        // (`<Q as P>::Out`) is no member, whatever its last segment spells.
+        if !crate::helper::type_head_ident(&im.self_ty)
+            .is_some_and(|id| cyclic.contains(&id.to_string()))
+        {
             continue;
         }
         for ii in &im.items {
@@ -134,56 +141,11 @@ pub(crate) fn check_value_generic_growth(module: &ItemMod, decycle: &Path) -> sy
     Ok(())
 }
 
-/// The idents of the traits routed through this module — `#[decycle] trait Tr` and
-/// `#[decycle] use path::Tr` (under its local name).
-///
-/// A small re-derivation of `analysis`'s private `routed_traits`, kept here because this pass runs
-/// before any of the engine's own bookkeeping exists and only needs the names.
-fn routed_trait_names(items: &[Item], decycle: &Path) -> HashSet<String> {
-    fn use_idents(tree: &UseTree, out: &mut HashSet<String>) {
-        match tree {
-            UseTree::Path(p) => use_idents(&p.tree, out),
-            UseTree::Name(n) => {
-                out.insert(n.ident.to_string());
-            }
-            UseTree::Rename(r) => {
-                out.insert(r.rename.to_string());
-            }
-            UseTree::Group(g) => g.items.iter().for_each(|t| use_idents(t, out)),
-            UseTree::Glob(_) => {}
-        }
-    }
-    let mut out = HashSet::new();
-    let Some(first) = decycle.segments.first() else {
-        return out;
-    };
-    let decycle_crate = &first.ident;
-    let marked =
-        |attrs: &[syn::Attribute]| attrs.iter().any(|a| crate::is_decycle_attribute(a, decycle_crate));
-    for item in items {
-        match item {
-            Item::Trait(t) if marked(&t.attrs) => {
-                out.insert(t.ident.to_string());
-            }
-            Item::Use(u) if marked(&u.attrs) => use_idents(&u.tree, &mut out),
-            _ => {}
-        }
-    }
-    out
-}
-
 /// The cycle members' type names. An empty set (no cycle at all) short-circuits the whole pass.
 fn cycle_member_names(module: &ItemMod, decycle: &Path) -> HashSet<String> {
-    use crate::safegraph::graph::Graph;
+    use safegraph::graph::Graph;
     let graph = analysis::cyclic_subgraph(&analysis::analyze_module(module, decycle));
     graph.nodes().map(|n| n.to_string()).collect()
-}
-
-fn self_ident(im: &ItemImpl) -> Option<&Ident> {
-    match &*im.self_ty {
-        Type::Path(tp) => tp.path.segments.last().map(|s| &s.ident),
-        _ => None,
-    }
 }
 
 /// The positions of `sig`'s arguments that are a **by-value** occurrence of one of the method's own
@@ -227,7 +189,12 @@ fn by_value_generic_args(sig: &Signature) -> Vec<(usize, Option<Ident>)> {
 /// Only projections are peeled. A call, macro, or struct literal is not a projection — its result is a
 /// fresh value whose type need not involve the parameter at all — so those return `None`. This is the
 /// strict form, used on the flagged *argument*: `recurse(&mut make_buffer(), ..)` must not be flagged.
-fn root_ident(mut e: &Expr) -> Option<&Ident> {
+///
+/// With `derived`, a **method-call receiver** and `.await` are peeled too — the "derived from"
+/// relation rather than the "same place as" one. That is used only to propagate taint along `let`
+/// chains, where `let s = src.into_src();` is the spelling that matters; the looser relation would
+/// be wrong on the flagged argument.
+fn root_ident(mut e: &Expr, derived: bool) -> Option<&Ident> {
     loop {
         e = match e {
             Expr::Path(p) if p.qself.is_none() && p.path.segments.len() == 1 => {
@@ -239,30 +206,8 @@ fn root_ident(mut e: &Expr) -> Option<&Ident> {
             Expr::Index(x) => &x.expr,
             Expr::Reference(x) => &x.expr,
             Expr::Try(x) => &x.expr,
-            Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => &u.expr,
-            _ => return None,
-        };
-    }
-}
-
-/// [`root_ident`], but also peeling a **method-call receiver**, `?` and `.await` — the "derived from"
-/// relation rather than the "same place as" one. Used only to propagate taint along `let` chains,
-/// where `let s = src.into_src();` is the spelling that matters. Kept separate from [`root_ident`]
-/// because the looser relation would be wrong on the flagged argument.
-fn taint_root(mut e: &Expr) -> Option<&Ident> {
-    loop {
-        e = match e {
-            Expr::Path(p) if p.qself.is_none() && p.path.segments.len() == 1 => {
-                return Some(&p.path.segments[0].ident)
-            }
-            Expr::Paren(x) => &x.expr,
-            Expr::Group(x) => &x.expr,
-            Expr::Field(x) => &x.base,
-            Expr::Index(x) => &x.expr,
-            Expr::Reference(x) => &x.expr,
-            Expr::Try(x) => &x.expr,
-            Expr::MethodCall(x) => &x.receiver,
-            Expr::Await(x) => &x.base,
+            Expr::MethodCall(x) if derived => &x.receiver,
+            Expr::Await(x) if derived => &x.base,
             Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => &u.expr,
             _ => return None,
         };
@@ -343,7 +288,7 @@ fn collect_lets(
                     // An annotation that names no method generic states a fixed type: opt out.
                     let annotated_fixed = ann.is_some_and(|t| !mentions_any(t, self.generics));
                     if !annotated_fixed
-                        && taint_root(&init.expr)
+                        && root_ident(&init.expr, true)
                             .is_some_and(|r| self.taint.contains(&r.to_string()))
                     {
                         self.taint.insert(name.to_string());
@@ -403,7 +348,7 @@ fn check_method(sig: &Signature, block: &syn::Block, callees: &Callees) -> syn::
                 // Only a reference GROWS. Passing the value on unchanged keeps the same `S` and
                 // terminates, which is the whole point of a by-value generic being legal here.
                 let Expr::Reference(r) = a else { continue };
-                let Some(root) = root_ident(&r.expr) else {
+                let Some(root) = root_ident(&r.expr, false) else {
                     continue;
                 };
                 if self.taint.contains(&root.to_string()) && self.found.is_none() {
@@ -420,7 +365,12 @@ fn check_method(sig: &Signature, block: &syn::Block, callees: &Callees) -> syn::
         /// function; a type-rooted path (`B::eval`) may be an inherent method with an unrelated
         /// signature.
         fn path_names_trait_method(&self, p: &ExprPath) -> bool {
-            if !p.path.segments.last().is_some_and(|s| &s.ident == self.name) {
+            if !p
+                .path
+                .segments
+                .last()
+                .is_some_and(|s| &s.ident == self.name)
+            {
                 return false;
             }
             let owner = match &p.qself {
@@ -444,9 +394,8 @@ fn check_method(sig: &Signature, block: &syn::Block, callees: &Callees) -> syn::
         /// Is this method call's receiver one the cycle's own trait method can be reached through —
         /// `self` (or a projection of it), or a cycle member named outright (`B.eval(..)`)?
         fn receiver_reaches_cycle(&self, receiver: &Expr) -> bool {
-            root_ident(receiver).is_some_and(|id| {
-                id == "self" || self.callees.members.contains(&id.to_string())
-            })
+            root_ident(receiver, false)
+                .is_some_and(|id| id == "self" || self.callees.members.contains(&id.to_string()))
         }
     }
     impl<'ast> Visit<'ast> for V<'ast> {

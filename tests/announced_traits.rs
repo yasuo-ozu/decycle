@@ -89,7 +89,9 @@ mod structural_default {
         B: Weigh,
     {
         fn weigh(&self, t: u8, depth: usize) -> usize {
-            self.0.as_ref().map_or(t as usize + depth, |b| b.weigh(t, depth + 1) + 1)
+            self.0
+                .as_ref()
+                .map_or(t as usize + depth, |b| b.weigh(t, depth + 1) + 1)
         }
     }
 
@@ -98,7 +100,9 @@ mod structural_default {
         A: Weigh,
     {
         fn weigh(&self, t: u8, depth: usize) -> usize {
-            self.0.as_ref().map_or(t as usize + depth, |a| a.weigh(t, depth + 1) + 100)
+            self.0
+                .as_ref()
+                .map_or(t as usize + depth, |a| a.weigh(t, depth + 1) + 100)
         }
     }
 }

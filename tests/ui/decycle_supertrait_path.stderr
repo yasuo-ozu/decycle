@@ -1,0 +1,24 @@
+error[E0283]: type annotations needed
+  --> tests/ui/decycle_supertrait_path.rs:44:18
+   |
+44 |             self.base() + self.0.as_ref().map_or(0, |t| t.eval())
+   |                  ^^^^
+   |
+note: multiple `impl`s satisfying `m::Expr: ranked_traits8909385c15d27adc::BaseRanked8909385c15d27adc<_>` found
+  --> tests/ui/decycle_supertrait_path.rs:6:1
+   |
+ 6 |   #[decycle::decycle]
+   |   ^^^^^^^^^^^^^^^^^^^
+...
+21 | /     impl Base for Expr
+22 | |     where
+23 | |         Term: Base,
+...  |
+28 | |     }
+   | |_____^
+   = note: this error originates in the attribute macro `decycle::decycle` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: try using a fully qualified path to specify the expected types
+   |
+44 -             self.base() + self.0.as_ref().map_or(0, |t| t.eval())
+44 +             <m::Expr as ranked_traits8909385c15d27adc::BaseRanked8909385c15d27adc<Rank8909385c15d27adc>>::base(self) + self.0.as_ref().map_or(0, |t| t.eval())
+   |

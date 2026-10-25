@@ -149,3 +149,65 @@ pub mod structural_announced {
         }
     }
 }
+
+/// `module = path` in both engines: the qualified items, an announced one among them, and the check
+/// that the path names the module (spelled with `::core`, so it builds on a core-only target).
+#[decycle(structural, module = crate::structural_module_path)]
+pub mod structural_module_path {
+    #[decycle]
+    pub trait Eval {
+        fn eval(&self) -> u32;
+    }
+
+    #[decycle::announce::announce(crate = ::decycle::announce)]
+    pub struct Expr(pub u32, pub ::core::option::Option<&'static self::Stmt>);
+    pub struct Stmt(pub u32, pub Option<&'static Expr>);
+
+    impl Eval for Expr
+    where
+        Stmt: Eval,
+    {
+        fn eval(&self) -> u32 {
+            self.0 + self.1.map(|s| s.eval()).unwrap_or(0)
+        }
+    }
+
+    impl Eval for Stmt
+    where
+        Expr: Eval,
+    {
+        fn eval(&self) -> u32 {
+            self.0 + self.1.map(|e| e.eval()).unwrap_or(0)
+        }
+    }
+}
+
+#[decycle(support_infinite_cycle = false, module = crate::ranked_module_path)]
+pub mod ranked_module_path {
+    #[decycle]
+    pub trait Walk {
+        fn walk(&self) -> u32;
+    }
+
+    #[decycle::announce::announce(crate = ::decycle::announce)]
+    pub struct A(pub u32, pub ::core::option::Option<&'static B>);
+    pub struct B(pub u32);
+
+    impl Walk for A
+    where
+        B: Walk,
+    {
+        fn walk(&self) -> u32 {
+            self.0
+        }
+    }
+
+    impl Walk for B
+    where
+        A: Walk,
+    {
+        fn walk(&self) -> u32 {
+            self.0
+        }
+    }
+}

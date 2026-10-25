@@ -1,10 +1,12 @@
+use crate::generics_fmt::type_const_idents;
+use crate::helper::type_head_ident;
+use crate::names::{use_leaves, UseLeaf};
 use proc_macro2::Span;
 use proc_macro2::TokenStream;
 use proc_macro_error::*;
 use std::collections::HashSet;
 use syn::spanned::Spanned;
 use syn::*;
-use crate::helper::type_head_ident;
 use template_quote::quote;
 
 /// A `super::super::…`-rooted path (2+ leading `super` segments) written by the user
@@ -41,82 +43,17 @@ fn check_no_deep_super_paths(contents: &[Item]) {
     }
 }
 
-fn check_submodule(module: &ItemMod, decycle_crate: &Ident) {
-    use syn::visit::Visit;
-    struct Visitor<'a> {
-        decycle_crate: &'a Ident,
-    }
-    impl<'ast, 'a> Visit<'ast> for Visitor<'a> {
-        fn visit_attribute(&mut self, i: &'ast syn::Attribute) {
-            if crate::is_decycle_attribute(i, self.decycle_crate) {
-                abort!(&i, "#[decycle] is not supported in nested modules")
-            }
-            syn::visit::visit_attribute(self, i);
-        }
-    }
-    Visitor { decycle_crate }.visit_item_mod(module);
-}
-
-fn process_trait_path(item: &Item) -> Vec<Path> {
-    match item {
-        Item::Trait(ItemTrait { ident, .. }) => {
-            vec![crate::ident_to_path(ident)]
-        }
-        Item::TraitAlias(item_trait_alias) => {
-            // A trait alias has no body to carry through the macro ping-pong (there's no
-            // `ItemTrait` to embed), so `#[decycle]` on one silently produced a bogus
-            // working-list entry with nothing behind it. Reject it cleanly instead.
-            abort!(
-                &item_trait_alias.ident,
-                "#[decycle] is not supported on a trait alias"
-            )
-        }
-        Item::Use(ItemUse { tree, .. }) => {
-            fn process_use_tree(tree: &UseTree) -> Vec<Path> {
-                match tree {
-                    UseTree::Path(UsePath { tree, .. }) => process_use_tree(tree),
-                    UseTree::Name(UseName { ident })
-                    | UseTree::Rename(UseRename { rename: ident, .. }) => {
-                        vec![crate::ident_to_path(ident)]
-                    }
-                    UseTree::Glob(use_glob) => {
-                        abort!(use_glob, "glob is not supported in #[decycle] use")
-                    }
-                    UseTree::Group(UseGroup { items, .. }) => {
-                        items.iter().flat_map(process_use_tree).collect()
-                    }
-                }
-            }
-            process_use_tree(tree)
-        }
-        _ => unreachable!(),
-    }
-}
-
 /// `(original_ident, local_alias)` for every `UseRename` (`use path::T as R;`) reachable
-/// from a `#[decycle] use` item — see `finalize::TraitRename`/L-C1. A plain `UseName`
+/// from a `#[decycle] use` item — see `FinalizeArgs::renames`/L-C1. A plain `UseName`
 /// (`use path::T;`) needs no entry: the local name already matches the original.
-fn collect_trait_renames(item: &Item) -> Vec<(Ident, Ident)> {
-    fn walk(tree: &UseTree, out: &mut Vec<(Ident, Ident)>) {
-        match tree {
-            UseTree::Path(UsePath { tree, .. }) => walk(tree, out),
-            UseTree::Rename(UseRename { ident, rename, .. }) => {
-                out.push((ident.clone(), rename.clone()));
-            }
-            UseTree::Name(_) | UseTree::Glob(_) => (),
-            UseTree::Group(UseGroup { items, .. }) => {
-                for item in items {
-                    walk(item, out);
-                }
-            }
-        }
-    }
-    let Item::Use(ItemUse { tree, .. }) = item else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    walk(tree, &mut out);
-    out
+fn collect_trait_renames(item: &ItemUse) -> Vec<(Ident, Ident)> {
+    use_leaves(&item.tree)
+        .into_iter()
+        .filter_map(|leaf| match leaf {
+            UseLeaf::Rename { original, local } => Some((original.clone(), local.clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 pub(crate) fn is_local_impl_bound_target(ty: &Type, impl_type_params: &HashSet<Ident>) -> bool {
@@ -128,6 +65,42 @@ pub(crate) fn is_local_impl_bound_target(ty: &Type, impl_type_params: &HashSet<I
     }
     let ident = &path.segments[0].ident;
     ident == "Self" || impl_type_params.contains(ident)
+}
+
+/// Does `im` implement a routed trait in the spelling the engine takes over — bare, or `self::`
+/// (`crate::names::bare_ident`)?
+fn impls_routed_trait(im: &ItemImpl, all_traits: &HashSet<Ident>) -> bool {
+    im.trait_
+        .as_ref()
+        .and_then(|(_, trait_path, _)| crate::names::bare_ident(trait_path))
+        .is_some_and(|ident| all_traits.contains(ident))
+}
+
+/// `impl Tr for self::Term` → `impl Tr for Term`, the spelling a cycle member is matched by — unless
+/// the bare name is one of the impl's own type parameters, which would then shadow the type.
+fn bare_self_type(im: &mut ItemImpl) {
+    let Type::Path(TypePath { qself: None, path }) = &mut *im.self_ty else {
+        return;
+    };
+    let mut bare = path.clone();
+    crate::names::strip_leading_self(&mut bare);
+    let shadowed = bare.segments.len() == 1
+        && im
+            .generics
+            .type_params()
+            .any(|t| t.ident == bare.segments[0].ident);
+    if !shadowed {
+        *path = bare;
+    }
+}
+
+/// Is `ty` spelled by a path other than a bare name or its no-op `self::` form (`crate::m::Term`,
+/// `super::Term`, `::dep::Term`)? Such a self type names the item itself, the opt-out.
+fn self_ty_spelled_by_path(ty: &Type) -> bool {
+    let Type::Path(TypePath { qself: None, path }) = ty else {
+        return false;
+    };
+    crate::names::bare_ident(path).is_none()
 }
 
 fn has_assoc_constraints(path: &Path) -> bool {
@@ -170,15 +143,7 @@ fn validate_impl_where_bounds(
     all_traits: &HashSet<Ident>,
     cycle_self_heads: &HashSet<Ident>,
 ) {
-    let impl_type_params: HashSet<Ident> = item_impl
-        .generics
-        .params
-        .iter()
-        .filter_map(|param| match param {
-            GenericParam::Type(ty) => Some(ty.ident.clone()),
-            _ => None,
-        })
-        .collect();
+    let impl_type_params = crate::names::type_param_idents(&item_impl.generics);
 
     let Some(where_clause) = &item_impl.generics.where_clause else {
         return;
@@ -200,7 +165,7 @@ fn validate_impl_where_bounds(
             };
             let mut path = path.clone();
             let was_self_qualified = path.segments.len() > 1;
-            crate::helper::strip_leading_self(&mut path);
+            crate::names::strip_leading_self(&mut path);
             // Single-segment match only (after self::-normalization) — a multi-segment
             // path (`some::mod::Foo`) merely sharing a last segment with a #[decycle]
             // trait is a DIFFERENT item; matching on the last segment alone was a false
@@ -211,8 +176,8 @@ fn validate_impl_where_bounds(
             // lifts the depth-fragile `super::` spelling so it survives re-emission); only
             // the bare/`self::`-qualified form participates in ranking at all, so there's
             // no reliable syntactic way to tell "meant to be ranked, mis-qualified" apart
-            // from this deliberate opt-out.
-            if path.segments.len() != 1 {
+            // from this deliberate opt-out. A leading `::` (`::Foo`) is such a path too.
+            if path.leading_colon.is_some() || path.segments.len() != 1 {
                 continue;
             }
             let last_segment = &path.segments[0];
@@ -240,7 +205,7 @@ fn validate_impl_where_bounds(
                 // different item from the local `Stmt`, and reading it as rank-lowerable skipped
                 // the abort below and let `finalize` rank-lower a foreign type — a wall of
                 // unprovable `TrRanked<…>` errors in place of one legible rejection.
-                let head_ok = crate::helper::local_type_head_ident(bounded_ty)
+                let head_ok = crate::names::local_type_head_ident(bounded_ty)
                     .is_some_and(|h| cycle_self_heads.contains(&h));
                 // F6: the earlier wording ("...on non-local type") described what the check
                 // rejects, but the check doesn't actually key on locality — a bound on a
@@ -283,8 +248,159 @@ fn validate_impl_where_bounds(
     }
 }
 
+/// The ranked engine's edges, for [`crate::premise_flow`]: a predicate with a bound naming
+/// a routed trait in the bare (or `self::`-qualified) spelling, on a target the rank chain descends.
+///
+/// `routed_traits` is the full set of `#[decycle]`-routed trait idents: a cross-trait edge (`X: Tr2`
+/// inside an impl of `Tr`) is stripped downstream exactly like an own-trait one
+/// (`remove_cyclic_bounds` keys on every routed trait). `participants` are the head idents of the
+/// impls the engine takes over — the targets `remove_cyclic_bounds` reads a bare bound as an edge
+/// on, besides `Self` and the impl's own type parameters. A bare bound on any other target
+/// (`crate::other::Leaf: Tr`, `u8: Tr`, or the parts `peel` keeps of a wrapped bound) is no edge but
+/// a premise on the original trait, which `finalize` keeps un-lowered, and it is shared like any
+/// other premise. (Not sharing it left a sibling unable to prove what the rank chain reaching this
+/// impl demands, so its re-entry fn was never registered, and a recursion past the floor panicked.)
+fn is_ranked_edge(
+    im: &ItemImpl,
+    pred: &WherePredicate,
+    routed_traits: &HashSet<Ident>,
+    participants: &HashSet<Ident>,
+) -> bool {
+    is_bare_trait_pred(pred, routed_traits)
+        && targets_participant(
+            pred,
+            participants,
+            &crate::premise_flow::impl_param_idents(im),
+        )
+}
+
+/// Does the predicate carry a bound the engine treats as a cycle edge — a bare (or
+/// `self::`-qualified, which peel/validate normalise the same way) reference to **any** routed
+/// trait? Matching only the group's own trait missed two spellings of the same edge: `B: self::Tr`
+/// (identical to `B: Tr` everywhere else in the engine) and a cross-trait `X: Tr2`, which
+/// `remove_cyclic_bounds` strips and rank-lowers exactly like an own-trait bound.
+fn is_bare_trait_pred(pred: &WherePredicate, routed_traits: &HashSet<Ident>) -> bool {
+    let WherePredicate::Type(pt) = pred else {
+        return false;
+    };
+    pt.bounds
+        .iter()
+        .any(|b| crate::names::is_routed_bound(b, routed_traits))
+}
+
+/// Is the predicate's bounded type one the ranked chain descends — `Self`, one of the impl's own type
+/// parameters (`params`), a type whose head is a participant, or a wrapper `peel` kept whole (one
+/// naming a participant by its bare name, [`crate::names::names_bare`])? The same test as
+/// `finalize::remove_cyclic_bounds`, which keys the head by its last segment.
+fn targets_participant(
+    pred: &WherePredicate,
+    heads: &HashSet<Ident>,
+    params: &HashSet<String>,
+) -> bool {
+    let WherePredicate::Type(pt) = pred else {
+        return false;
+    };
+    if let syn::Type::Path(syn::TypePath { qself: None, path }) = &pt.bounded_ty {
+        if path.is_ident("Self")
+            || (path.segments.len() == 1 && params.contains(&path.segments[0].ident.to_string()))
+        {
+            return true;
+        }
+    }
+    crate::helper::type_head_ident(&pt.bounded_ty).is_some_and(|h| heads.contains(&h))
+        || crate::names::names_bare(&pt.bounded_ty, heads)
+}
+
+/// The cyclic bounds of `im` for [`crate::premise_flow`]: each bound (`is_edge`) naming a routed
+/// trait on an adopted head (the head of a peeled bound is the member it obligates; `Self` is `im`'s
+/// own self type), with the impls of `impls` of that trait for that head, which may discharge it. A
+/// bound on one of `im`'s own type parameters names no impl in particular and is no such edge.
+fn ranked_cycle_edges(
+    im: &ItemImpl,
+    impls: &[&ItemImpl],
+    all_traits: &HashSet<Ident>,
+    adopted_heads: &HashSet<Ident>,
+    is_edge: &dyn Fn(&ItemImpl, &WherePredicate) -> bool,
+) -> Vec<crate::premise_flow::CycleEdge> {
+    let type_params = crate::names::type_param_idents(&im.generics);
+    let mut out = Vec::new();
+    for pred in im
+        .generics
+        .where_clause
+        .iter()
+        .flat_map(|wc| &wc.predicates)
+    {
+        let WherePredicate::Type(pt) = pred else {
+            continue;
+        };
+        if !is_edge(im, pred) {
+            continue;
+        }
+        let target = match &pt.bounded_ty {
+            Type::Path(TypePath { qself: None, path }) if path.is_ident("Self") => {
+                (*im.self_ty).clone()
+            }
+            other => other.clone(),
+        };
+        let Some(head) = crate::names::local_type_head_ident(&target) else {
+            continue;
+        };
+        if type_params.contains(&head) || !adopted_heads.contains(&head) {
+            continue;
+        }
+        for bound in &pt.bounds {
+            let TypeParamBound::Trait(tb) = bound else {
+                continue;
+            };
+            if !crate::names::bare_ident(&tb.path).is_some_and(|t| all_traits.contains(t)) {
+                continue;
+            }
+            out.push(crate::premise_flow::CycleEdge::new(
+                target.clone(),
+                pt,
+                tb,
+                impls,
+            ));
+        }
+    }
+    out
+}
+
+/// Spell each bare name of `renamed` that a where-predicate's bounded type of `im` mentions as
+/// `self::Name` — unless one of `im`'s own generic parameters shadows it. See the caller.
+fn spell_renamed_relative(im: &mut ItemImpl, renamed: &HashSet<Ident>) {
+    use syn::visit_mut::VisitMut;
+    struct Spell<'a> {
+        renamed: &'a HashSet<Ident>,
+    }
+    impl VisitMut for Spell<'_> {
+        fn visit_type_path_mut(&mut self, tp: &mut TypePath) {
+            if tp.qself.is_none()
+                && tp.path.leading_colon.is_none()
+                && tp.path.segments.len() == 1
+                && self.renamed.contains(&tp.path.segments[0].ident)
+            {
+                let span = tp.path.segments[0].ident.span();
+                tp.path
+                    .segments
+                    .insert(0, PathSegment::from(Ident::new("self", span)));
+            }
+            syn::visit_mut::visit_type_path_mut(self, tp);
+        }
+    }
+    let shadowed: HashSet<Ident> = type_const_idents(&im.generics).into_iter().collect();
+    let renamed: HashSet<Ident> = renamed.difference(&shadowed).cloned().collect();
+    if let Some(wc) = &mut im.generics.where_clause {
+        for pred in wc.predicates.iter_mut() {
+            if let WherePredicate::Type(pt) = pred {
+                Spell { renamed: &renamed }.visit_type_mut(&mut pt.bounded_ty);
+            }
+        }
+    }
+}
+
 /// For each impl of one routed trait, which of its siblings' premises it may inherit — the
-/// obligation-reachability scoping behind [`crate::ranked::sharing::share_side_predicates`].
+/// obligation-reachability scoping of [`crate::premise_flow`]'s by-name pass.
 ///
 /// `members` are the adopted impls of `trait_ident`, in group order; the result is indexed the same
 /// way: `sources[i]` lists the indices of the members whose premises member `i`'s rank chain can
@@ -303,8 +419,6 @@ fn validate_impl_where_bounds(
 /// of the impl's own generic params names no other member (and a param *shadowing* a member's name
 /// must not fabricate an edge), so it contributes none.
 fn sharing_sources(members: &[&ItemImpl], trait_ident: &Ident) -> Vec<Vec<usize>> {
-    use crate::safegraph::algo::dfs::Dfs;
-    use crate::safegraph::graph::Graph;
     // Node key per member: its self type's head ident. An un-headed self type (`&A`, `(A, B)`)
     // gets a synthetic key no bound can name: it can obligate others, never be obligated by ident.
     let keys: Vec<String> = members
@@ -320,32 +434,14 @@ fn sharing_sources(members: &[&ItemImpl], trait_ident: &Ident) -> Vec<Vec<usize>
     let mut edges: Vec<(String, String)> = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
     for (i, im) in members.iter().enumerate() {
-        let impl_type_params: HashSet<Ident> = im
-            .generics
-            .params
-            .iter()
-            .filter_map(|param| match param {
-                GenericParam::Type(ty) => Some(ty.ident.clone()),
-                _ => None,
-            })
-            .collect();
-        let Some(where_clause) = &im.generics.where_clause else {
-            continue;
-        };
-        for pred in &where_clause.predicates {
-            let WherePredicate::Type(pt) = pred else {
-                continue;
-            };
+        let impl_type_params = crate::names::type_param_idents(&im.generics);
+        for pt in crate::names::type_predicates(&im.generics) {
             if is_local_impl_bound_target(&pt.bounded_ty, &impl_type_params) {
                 continue;
             }
             let names_this_trait = pt.bounds.iter().any(|b| {
-                let TypeParamBound::Trait(TraitBound { path, .. }) = b else {
-                    return false;
-                };
-                let mut path = path.clone();
-                crate::helper::strip_leading_self(&mut path);
-                path.segments.len() == 1 && path.segments[0].ident == *trait_ident
+                matches!(b, TypeParamBound::Trait(TraitBound { path, .. })
+                    if crate::names::bare_ident(path) == Some(trait_ident))
             });
             if !names_this_trait {
                 continue;
@@ -359,8 +455,8 @@ fn sharing_sources(members: &[&ItemImpl], trait_ident: &Ident) -> Vec<Vec<usize>
             // member that merely shares that name, and predicate sharing then unioned the
             // sibling's own leaf premises into `A` — `A<NotClone>: Tr` stopped holding, while
             // renaming the foreign type made the identical program compile. Same rule as
-            // `peel::cycle_types_within` and `contract::reaches_participant`.
-            let Some(head) = crate::helper::local_type_head_ident(&pt.bounded_ty) else {
+            // `peel::cycle_types_within`.
+            let Some(head) = crate::names::local_type_head_ident(&pt.bounded_ty) else {
                 continue;
             };
             let head = head.to_string();
@@ -372,40 +468,27 @@ fn sharing_sources(members: &[&ItemImpl], trait_ident: &Ident) -> Vec<Vec<usize>
             }
         }
     }
-    // Reuse the crate's own graph machinery (the same `safegraph` backing `crate::analysis`) for
-    // the reachability walk, mirroring how `analysis.rs` builds and reads its obligation graph.
+    // The reachability walk, over the crate's own graph machinery (`crate::graph`, which backs
+    // `crate::analysis` too), by head name.
     let mut names: Vec<String> = member_heads.iter().map(|s| s.to_string()).collect();
     names.sort();
-    let mut graph: crate::safegraph::VecGraph<String, ()> = Default::default();
-    graph.scope_mut(|mut ctx| {
-        let index: std::collections::HashMap<String, _> = names
+    let position = |name: &String| {
+        names
+            .binary_search(name)
+            .expect("every key and every edge endpoint is a node")
+    };
+    let graph = crate::graph::compose(
+        names.iter().cloned(),
+        edges
             .iter()
-            .map(|name| {
-                let ix = ctx
-                    .insert_node(name.clone())
-                    .expect("insertion into a fresh VecGraph cannot fail");
-                (name.clone(), ix)
-            })
-            .collect();
-        for (from, to) in &edges {
-            ctx.insert_edge((), [index[from], index[to]])
-                .expect("both endpoints were just inserted");
-        }
-    });
-    let reach: std::collections::HashMap<String, HashSet<String>> = graph.scope(|ctx| {
-        ctx.node_indices()
-            .map(|ix| ix.to_ix())
-            .map(|ix| {
-                let set: HashSet<String> = Dfs::new(ctx, ix).map(|n| ctx.node(n).clone()).collect();
-                (ctx.node(ix).clone(), set)
-            })
-            .collect()
-    });
+            .map(|(from, to)| (position(from), position(to), ())),
+    );
+    let reach = crate::graph::reachable(&graph);
     (0..members.len())
         .map(|i| {
-            let reachable = &reach[&keys[i]];
+            let reachable = &reach[position(&keys[i])];
             (0..members.len())
-                .filter(|j| *j != i && reachable.contains(&keys[*j]))
+                .filter(|j| *j != i && reachable.contains(&position(&keys[*j])))
                 .collect()
         })
         .collect()
@@ -426,51 +509,30 @@ pub fn process_module(
     process_module_inner(module, None, decycle, recurse_level, support_infinite_cycle)
 }
 
-/// [`process_module`], but with the participant set supplied by the caller instead of derived.
+/// [`process_module`] for a module whose absolute path is `module_path` — the programmatic form of
+/// `#[decycle(module = path)]`.
 ///
-/// `graph` is an obligation graph in the shape [`crate::analysis::analyze_module`] returns. Its
-/// **node set replaces** the engine's own `cycle_self_heads` — the types it would otherwise take to
-/// be cycle participants, namely every head with a bare-spelled impl of a routed trait. Everything
-/// downstream keys off that set: which impls get contracted, which where-bounds count as cycle edges,
-/// which wrapped bounds are peeled and which are rejected, and which local names need aliasing
-/// against the helper-module nesting.
-///
-/// Passing `analyze_module(&module, decycle)` reproduces [`process_module`] exactly. Passing a subset
-/// narrows the cycle: the omitted types keep verbatim impls, and a bound naming one becomes an
-/// ordinary premise rather than an edge. That is the useful direction — a caller that already knows
-/// its cycles (from field structure, say) can state them instead of relying on the bare/qualified
-/// trait spelling to signal them.
-///
-/// The **edges are not consumed**. Direct-vs-`Peeled` is re-derived per bound from the node set,
-/// because a bound has to be matched by its own syntax, and a graph keyed on type idents cannot say
-/// *which* bound of *which* impl an edge came from. They are still worth passing — they are what the
-/// caller inspects to decide on the node set — but adding or removing one changes nothing here.
-///
-/// A node naming a type with no routed impl in this module is ignored rather than rejected: the
-/// engine only ever asks whether a given head is in the set.
-/// `emit_contracts` re-spells the adopted impls **from the graph** before anything else runs, via
-/// [`super::contract`]: bare the header trait path, bare a bound whose target reaches a participant,
-/// qualify every other bound naming a routed trait.
-///
-/// Pass `false` and the graph supplies the node set only, leaving everything else exactly as
-/// [`process_module`] does it — the engine's normal contract, where the *caller* expresses the
-/// classification in how it spells each bound. Pass `true` when the graph is the intended source of
-/// truth and the impls are generated code not yet spelled for the engine: then the cycle is stated
-/// once, rather than encoded into every bound by the caller and decoded again here. Rewriting a
-/// caller's spelling changes what a crate-rooted path means, which is why it is not the default.
-pub fn process_module_with_graph(
+/// `module_path` must be absolute (`crate::..`, `$crate::..` or `::..`), without generic arguments,
+/// and end in the module's own name; anything else aborts (through `proc_macro_error`). The cycle is
+/// solved on the module as written, where only a bare (or `self::`) name is the module's; once it
+/// is, the items re-emitted as written (everything but the impls the engine takes over — an impl of
+/// a `#[decycle]` trait that names the trait or its self type by a path is the opt-out, re-emitted
+/// and qualified too) have each bare or `self::` name of a type or trait declared in the module
+/// spelled `<module_path>::X`, so an `#[announce]` on one of them sees absolute paths only. A check
+/// that `module_path` names this module is emitted into it (an error at the path otherwise). A
+/// bound that names one of the module's own types by a path (`<module_path>::C: Tr`) and is certain
+/// to overflow, because `C`'s impl leads back to it, is reported at the bound (through
+/// `proc_macro_error`), with the cycle in the module's types.
+pub fn process_module_at(
     module: ItemMod,
-    graph: &crate::safegraph::VecGraph<Ident, crate::analysis::EdgeKind>,
-    emit_contracts: bool,
+    module_path: &Path,
     decycle: &Path,
     recurse_level: usize,
     support_infinite_cycle: bool,
 ) -> TokenStream {
-    use crate::safegraph::graph::Graph;
-    let heads: HashSet<Ident> = graph.nodes().cloned().collect();
     process_module_inner(
         module,
-        Some((heads, emit_contracts)),
+        Some(module_path),
         decycle,
         recurse_level,
         support_infinite_cycle,
@@ -479,11 +541,21 @@ pub fn process_module_with_graph(
 
 fn process_module_inner(
     mut module: ItemMod,
-    graph_input: Option<(HashSet<Ident>, bool)>,
+    module_path: Option<&Path>,
     decycle: &Path,
     recurse_level: usize,
     support_infinite_cycle: bool,
 ) -> TokenStream {
+    // `module = path`: the cycle is solved on the module as written, where only a bare name is the
+    // module's; the items re-emitted as written are qualified on the way out (`qualify`), after it.
+    // See `crate::module_path`.
+    let scope = module_path.map(|path| crate::module_path::ModuleScope::new(path, &module));
+    let qualify = |item: &Item| match &scope {
+        Some(scope) => scope.qualify_item(item),
+        None => item.clone(),
+    };
+    // ... and the path is checked against the module, in the module (`ModuleScope::path_check`).
+    let path_check = scope.as_ref().map(|scope| scope.path_check());
     // Value-level instantiation growth (a cyclic method reborrowing its own by-value generic
     // parameter) — neither engine can break it, and left alone it surfaces as a monomorphisation limit
     // naming generated internals. See `crate::growth`.
@@ -500,51 +572,50 @@ fn process_module_inner(
     // The decycle crate name as passed to the macro (leading segment of `decycle = …`, default
     // `decycle`) — used to match `#[<crate>::decycle]` on inner items without reading the manifest.
     let decycle_crate = &decycle.segments.first().unwrap().ident;
-    let (traits, working_list, renames): (Vec<_>, Vec<_>, Vec<_>) = contents.iter_mut().fold(
-        Default::default(),
-        |(mut traits, mut working_list, mut renames), item| {
-            match item {
-                Item::Trait(ItemTrait { attrs, .. })
-                | Item::TraitAlias(ItemTraitAlias { attrs, .. })
-                | Item::Use(ItemUse { attrs, .. }) => {
-                    // detect and remove #[decycle] attribute
-                    let mut old_attrs = std::mem::take(attrs).into_iter();
-                    let mut flag = false;
-                    attrs.extend((&mut old_attrs).take_while(|attr| {
-                        if crate::is_decycle_attribute(attr, decycle_crate) {
-                            flag = true;
-                        }
-                        !flag
-                    }));
-                    attrs.extend(old_attrs);
-                    if flag {
-                        if let Item::Trait(item_trait) = item {
-                            traits.push(item_trait.clone());
-                        } else {
-                            working_list.extend(process_trait_path(item));
-                            renames.extend(collect_trait_renames(item));
-                        }
-                    }
-                }
-                _ => (),
+    let (mut traits, mut working_list, mut renames) = (Vec::new(), Vec::new(), Vec::new());
+    for marked in crate::markers::take_marked(contents, decycle_crate) {
+        match marked {
+            crate::markers::Marked::Trait(item_trait) => traits.push(item_trait.clone()),
+            crate::markers::Marked::Use(item_use, names) => {
+                working_list.extend(names.iter().map(crate::ident_to_path));
+                renames.extend(collect_trait_renames(item_use));
             }
-            (traits, working_list, renames)
-        },
-    );
-    proc_macro_error::set_dummy(
+        }
+    }
+    let all_traits: HashSet<Ident> = working_list
+        .iter()
+        .filter_map(|path| path.segments.last().map(|seg| seg.ident.clone()))
+        .chain(traits.iter().map(|ItemTrait { ident, .. }| ident.clone()))
+        .collect();
+    proc_macro_error::set_dummy(quote! {
+        #{&module.vis} #{&module.unsafety} mod #{&module.ident} {
+            #(for content in contents.iter()) { #{qualify(content)} }
+            #path_check
+        }
+    });
+    // The fallback for an opt-out bound on a cycle (`crate::ranked::opt_out`), kept from the module
+    // as written: without the global bounds of the routed traits, so that the impls do not overflow
+    // on their own and the reported errors stand alone. Only `module = path` can report one, and
+    // only on a module whose own attributes cannot remove it (a `#[cfg]` that is off compiles).
+    let check_opt_outs =
+        scope.is_some() && module.attrs.iter().all(crate::ranked::opt_out::is_inert);
+    let quiet_dummy = check_opt_outs.then(|| {
         quote! {
             #{&module.vis} #{&module.unsafety} mod #{&module.ident} {
-                #(for content in contents.clone()) { #content }
+                #(for content in contents.iter()) {
+                    #{crate::ranked::opt_out::quiet(qualify(content), &all_traits)}
+                }
+                #path_check
             }
-        },
-    );
+        }
+    });
     if let Err(e) = growth {
         abort!(e.span(), "{}", e);
     }
     for item in contents.iter() {
         match item {
             Item::Mod(item_mod) => {
-                check_submodule(item_mod, decycle_crate);
+                crate::markers::check_submodule(item_mod, decycle_crate);
             }
             // A `macro_rules!` DEFINITION is transparent: it introduces no item the rewrite has to
             // see, and it is re-emitted in place among the raw contents — ahead of the nested helper
@@ -598,7 +669,8 @@ fn process_module_inner(
             if let Item::Impl(im) = item {
                 for it in &im.items {
                     if let ImplItem::Fn(f) = it {
-                        if let Some(a) = f.attrs.iter().find(|a| a.path().is_ident("track_caller")) {
+                        if let Some(a) = f.attrs.iter().find(|a| a.path().is_ident("track_caller"))
+                        {
                             abort!(
                                 a,
                                 "decycle: `#[track_caller]` on method `{}` in an unbounded #[decycle] cycle is not supported — the re-entry fn-pointer indirection loses the caller location past the recursion floor", f.sig.ident;
@@ -610,56 +682,106 @@ fn process_module_inner(
             }
         }
     }
-    let all_traits: HashSet<Ident> = working_list
-        .iter()
-        .filter_map(|path| path.segments.last().map(|seg| seg.ident.clone()))
-        .chain(traits.iter().map(|ItemTrait { ident, .. }| ident.clone()))
-        .collect();
-    // Head idents of the types that IMPLEMENT a cyclic trait here — the only heads a bare cyclic
-    // where-bound may target (besides `Self` / an impl type-param). A bound whose head is a foreign
-    // container (`Box<Stmt>: Tr`) has no ranked impl to descend through, so it's flagged below.
-    // With a caller-supplied participant set, re-spell the impls here rather than requiring the
-    // caller to have encoded the classification in how it wrote every bound — see `super::contract`.
-    // Must run before everything below: adoption, peeling and validation all read the spelling.
-    if let Some((participants, true)) = graph_input.as_ref().map(|(p, e)| (p, *e)) {
-        crate::ranked::contract::contract_from_graph(contents, &all_traits, participants);
-    }
-
-    let cycle_self_heads: HashSet<Ident> = graph_input.map(|(heads, _)| heads).unwrap_or_else(|| {
-        contents
-            .iter()
-            .filter_map(|item| {
-                let Item::Impl(im) = item else { return None };
-                let (_, trait_path, _) = im.trait_.as_ref()?;
-                let mut tp = trait_path.clone();
-                crate::helper::strip_leading_self(&mut tp);
-                (tp.segments.len() == 1 && all_traits.contains(&tp.segments[0].ident))
-                    .then(|| type_head_ident(&im.self_ty))
-                    .flatten()
-            })
-            .collect()
-    });
-    // Peel wrapped cyclic bounds (`Vec<Box<Stmt>>: Tr` ⇒ `Stmt: Tr`) BEFORE validating, so the
-    // validation below only rejects heads that genuinely cannot be made rankable.
+    // `impl Tr for self::Term` is `impl Tr for Term`: read (and re-emit) a self type in the bare
+    // spelling, which is the one everything below matches a cycle member by.
     for item in contents.iter_mut() {
         if let Item::Impl(im) = item {
-            let impl_type_params: HashSet<Ident> = im
-                .generics
-                .params
-                .iter()
-                .filter_map(|param| match param {
-                    GenericParam::Type(ty) => Some(ty.ident.clone()),
+            if impls_routed_trait(im, &all_traits) {
+                bare_self_type(im);
+            }
+        }
+    }
+    // The impls the engine takes over: those of a routed trait spelled bare (see the split below),
+    // for a self type the module names by its bare name. A self type spelled by any other path
+    // (`impl Tr for crate::m::Term`, `impl Tr for crate::other::B`) names the item itself, the
+    // opt-out, exactly as a path-spelled trait does: the impl takes no part in the cycle and is
+    // re-emitted as written.
+    let adopts = |im: &ItemImpl| {
+        impls_routed_trait(im, &all_traits) && !self_ty_spelled_by_path(&im.self_ty)
+    };
+    // Head idents of the types that IMPLEMENT a cyclic trait here, of the impls taken over
+    // (`adopts`) — the only heads a bare cyclic where-bound may target (besides `Self` / an impl
+    // type-param). A bound whose head is a foreign container (`Box<Stmt>: Tr`) has no ranked impl
+    // to descend through, so it's flagged below. Peeling and validating leave self types as they
+    // are, so these are also the heads of the impls split off below for `finalize`.
+    let cycle_self_heads: HashSet<Ident> = contents
+        .iter()
+        .filter_map(|item| {
+            let Item::Impl(im) = item else { return None };
+            adopts(im).then(|| type_head_ident(&im.self_ty)).flatten()
+        })
+        .collect();
+    // A type alias or a `use .. as` rename the module declares may be a cycle member under another
+    // name (`type L = B;`). In the bounds of the impls taken over, such a name is spelled `self::L`
+    // (the same item), which `nesting` then lifts through its relative-path alias: `peel` keeps no
+    // wrapper around it, and `finalize::wrapper` gives it no bridge, which would conflict with the
+    // member's own ranked impls (E0119). Read as the parts of a bound, it is what it always was.
+    let renamed: HashSet<Ident> = contents
+        .iter()
+        .flat_map(|item| match item {
+            Item::Type(t) => vec![t.ident.clone()],
+            Item::Use(u) => use_leaves(&u.tree)
+                .into_iter()
+                .filter_map(|leaf| match leaf {
+                    UseLeaf::Rename { local, .. } => Some(local.clone()),
                     _ => None,
                 })
-                .collect();
-            crate::ranked::peel::peel_cyclic_bounds(im, &all_traits, &cycle_self_heads, &|ty| {
-                is_local_impl_bound_target(ty, &impl_type_params)
-            });
+                .collect(),
+            _ => Vec::new(),
+        })
+        .filter(|ident| !cycle_self_heads.contains(ident))
+        .collect();
+    if !renamed.is_empty() {
+        for item in contents.iter_mut() {
+            if let Item::Impl(im) = item {
+                if adopts(im) {
+                    spell_renamed_relative(im, &renamed);
+                }
+            }
+        }
+    }
+    // Peel wrapped cyclic bounds (`Vec<Box<Stmt>>: Tr` ⇒ `Stmt: Tr`) BEFORE validating, so the
+    // validation below only rejects heads that genuinely cannot be made rankable. A wrapper an impl
+    // taken over implements is kept whole besides (`peel`'s module docs; `finalize::wrapper`).
+    let adopted: Vec<ItemImpl> = contents
+        .iter()
+        .filter_map(|item| match item {
+            Item::Impl(im) if adopts(im) => Some(im.clone()),
+            _ => None,
+        })
+        .collect();
+    let keep_whole = |ty: &Type, bound: &TypeParamBound| {
+        crate::ranked::finalize::wrapper::shape_matches(&adopted, ty, bound)
+    };
+    for item in contents.iter_mut() {
+        if let Item::Impl(im) = item {
+            let impl_type_params = crate::names::type_param_idents(&im.generics);
+            crate::ranked::peel::peel_cyclic_bounds(
+                im,
+                &all_traits,
+                &cycle_self_heads,
+                &|ty| is_local_impl_bound_target(ty, &impl_type_params),
+                &keep_whole,
+            );
         }
     }
     for item in contents.iter() {
         if let Item::Impl(item_impl) = item {
             validate_impl_where_bounds(item_impl, &all_traits, &cycle_self_heads);
+        }
+    }
+    // A bound naming an own type by its path (the opt-out, left as written, as peeling left it) on
+    // a cycle overflows in rustc, on the generated `…Ranked` traits. Say so in the module's terms,
+    // at each such bound, after the fallback is made quiet. See `crate::ranked::opt_out`.
+    if let (Some(scope), Some(quiet_dummy)) = (&scope, quiet_dummy) {
+        let cycles =
+            crate::ranked::opt_out::opt_out_cycles(contents, scope, &all_traits, recurse_level);
+        if !cycles.is_empty() {
+            proc_macro_error::set_dummy(quiet_dummy);
+            for cycle in cycles {
+                emit_error!(cycle.at, "{}", cycle.message; help = "{}", cycle.help);
+            }
+            abort_if_dirty();
         }
     }
     let (raw_contents, contents): (Vec<_>, Vec<_>) = contents
@@ -671,10 +793,8 @@ fn process_module_inner(
                 },
             ) = content
             {
-                let mut normalized_impl = item_impl.clone();
-                let trait_path = &mut normalized_impl.trait_.as_mut().unwrap().1;
-                crate::helper::strip_leading_self(trait_path);
-                // Check the (self::-normalized) trait_path contains just one segment.
+                // Taken over when the (self::-normalized) trait path is a single segment naming a
+                // routed trait, for a self type that is no path-spelled opt-out (`adopts`).
                 // NOTE: a still-qualified trait path (`impl crate::foo::MyTrait for X`,
                 // `impl super::MyTrait for X`) is intentionally left as an ordinary,
                 // non-decycled impl rather than flagged — the same qualified-reference
@@ -682,14 +802,13 @@ fn process_module_inner(
                 // impl of the ORIGINAL, un-ranked trait from inside a #[decycle] module
                 // (mirrored by the identical, deliberate pattern in where-bounds; see
                 // `validate_impl_where_bounds`), so it can't be reliably distinguished
-                // from a genuine mis-qualification at this syntactic level.
-                if trait_path.segments.len() == 1 {
-                    if let Some(seg) = trait_path.segments.first() {
-                        if all_traits.contains(&seg.ident) {
-                            // The item is impl of a trait annotated with #[decycle]
-                            return (None, Some(normalized_impl));
-                        }
-                    }
+                // from a genuine mis-qualification at this syntactic level. A path-spelled
+                // self type (`impl MyTrait for crate::m::X`) is the same opt-out.
+                if adopts(item_impl) {
+                    let mut normalized_impl = item_impl.clone();
+                    let trait_path = &mut normalized_impl.trait_.as_mut().unwrap().1;
+                    crate::names::strip_leading_self(trait_path);
+                    return (None, Some(normalized_impl));
                 }
             }
             (Some(content), None)
@@ -710,21 +829,55 @@ fn process_module_inner(
     // of the trait", so a standalone acyclic impl silently inherited a cycle's premises (`C<T>`
     // acquiring `T: Clone` rejects code that is valid without the macro), and two disjoint cycles of
     // one trait unioned each other's. Scope each impl's inheritance to the impls its own cyclic
-    // bounds (transitively) obligate instead — see `sharing_sources` and `crate::ranked::sharing`.
-    for trait_ident in &all_traits {
-        let is_member = |im: &ItemImpl| {
-            im.trait_.as_ref().is_some_and(|(_, path, _)| {
-                path.segments.last().is_some_and(|s| s.ident == *trait_ident)
+    // bounds (transitively) obligate instead — see `sharing_sources` and `crate::premise_flow`.
+    // The heads `finalize` reads a bare bound as an edge on (`remove_cyclic_bounds`): those of the
+    // impls taken over, `cycle_self_heads`. A bare bound on any other type is a premise, shared
+    // like one.
+    let is_edge = |im: &ItemImpl, pred: &WherePredicate| {
+        is_ranked_edge(im, pred, &all_traits, &cycle_self_heads)
+    };
+    // The same premises, carried along every cyclic bound, whatever its trait, with the reached
+    // impl's parameters mapped through the bound (`crate::premise_flow`). The by-name union below
+    // is per trait, so in a cycle alternating between traits (`Expr: Eval` needing `Term: Size`) a
+    // member never received the premises of the impls of the other traits it reaches. Its re-entry
+    // registrations then failed `reachable_side_bounds_ok` and were skipped, and a recursion past the
+    // floor panicked ("re-entry fn not registered"). Computed on the impls as written, before the
+    // by-name union adds to them.
+    let (edges, by_name) = {
+        let impls: Vec<&ItemImpl> = contents.iter().collect();
+        let edges: Vec<Vec<crate::premise_flow::CycleEdge>> = impls
+            .iter()
+            .map(|im| ranked_cycle_edges(im, &impls, &all_traits, &cycle_self_heads, &is_edge))
+            .collect();
+        let by_name: Vec<(Vec<usize>, Vec<Vec<usize>>)> = all_traits
+            .iter()
+            .filter_map(|trait_ident| {
+                let is_member = |im: &ItemImpl| {
+                    im.trait_.as_ref().is_some_and(|(_, path, _)| {
+                        path.leading_colon.is_none()
+                            && path.segments.len() == 1
+                            && path.segments[0].ident == *trait_ident
+                    })
+                };
+                let members: Vec<usize> =
+                    (0..impls.len()).filter(|k| is_member(impls[*k])).collect();
+                (members.len() >= 2).then(|| {
+                    let group: Vec<&ItemImpl> = members.iter().map(|k| impls[*k]).collect();
+                    let sources = sharing_sources(&group, trait_ident);
+                    (members, sources)
+                })
             })
-        };
-        let members: Vec<&ItemImpl> = contents.iter().filter(|im| is_member(im)).collect();
-        if members.len() < 2 {
-            continue;
-        }
-        let sources = sharing_sources(&members, trait_ident);
-        let mut group: Vec<&mut ItemImpl> = contents.iter_mut().filter(|im| is_member(im)).collect();
-        crate::ranked::sharing::share_side_predicates_scoped(&mut group, &all_traits, &sources);
-    }
+            .collect();
+        (edges, by_name)
+    };
+    let mut impls: Vec<&mut ItemImpl> = contents.iter_mut().collect();
+    crate::premise_flow::share_premises(
+        &mut impls,
+        &edges,
+        &is_edge,
+        crate::premise_flow::Respell::TypeParams,
+        &by_name,
+    );
 
     // Restricted to types this module DEFINES: a foreign self type (`impl Tr for &str`) is reachable
     // by one path only, so it is neither ambiguous nor bindable as `use self::…`.
@@ -738,10 +891,11 @@ fn process_module_inner(
             _ => None,
         })
         .collect();
-    let local_cycle_heads: HashSet<Ident> =
-        cycle_self_heads.intersection(&local_types).cloned().collect();
-    let alias_items =
-        crate::ranked::nesting::defuse_nesting(
+    let local_cycle_heads: HashSet<Ident> = cycle_self_heads
+        .intersection(&local_types)
+        .cloned()
+        .collect();
+    let alias_items = crate::ranked::nesting::defuse_nesting(
         &mut contents,
         &local_cycle_heads,
         &all_traits,
@@ -770,7 +924,9 @@ fn process_module_inner(
 
             #(for alias_item in &alias_items) { #alias_item }
 
-            #(for raw_content in raw_contents) { #raw_content }
+            #(for raw_content in raw_contents) { #{qualify(raw_content)} }
+
+            #path_check
 
             #(if first_path.is_some()) {
                 #{ args.cont_list().invoke(args.rest_tokens()) }

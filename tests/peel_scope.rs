@@ -47,7 +47,7 @@ fn member_nested_in_a_foreign_wrapper_is_still_peeled() {
 }
 
 // A `self::`-qualified member is the same item as the bare spelling — the convention
-// `is_bare_cyclic_bound` already applies to the trait side — so it still peels.
+// `names::is_routed_bound` already applies to the trait side — so it still peels.
 #[decycle]
 mod self_qualified_member {
     #[decycle]

@@ -100,3 +100,58 @@ fn foreign_premise_survives_on_original_trait_bounded() {
     let v: Vec<other::Stmt> = vec![other::Stmt, other::Stmt];
     assert_eq!(v.g(), 102);
 }
+
+// A two-member cycle with such a premise, recursing past the floor. The premise used to be walked
+// as an edge of the cycle (`reachable_side_bounds_ok` found no impl to descend into and gave up)
+// and was not shared with the sibling, so neither member's re-entry fn was registered and the
+// first recursion past the floor panicked at run time ("re-entry fn not registered").
+#[decycle]
+mod two {
+    #[decycle]
+    pub trait Tw {
+        fn h(&self, n: u32) -> u32;
+    }
+
+    pub struct A;
+    pub struct B;
+
+    impl Tw for A
+    where
+        B: Tw,
+        crate::other::Stmt: Tw,
+    {
+        fn h(&self, n: u32) -> u32 {
+            if n == 0 {
+                0
+            } else {
+                B.h(n - 1) + 1
+            }
+        }
+    }
+
+    impl Tw for B
+    where
+        A: Tw,
+    {
+        fn h(&self, n: u32) -> u32 {
+            if n == 0 {
+                0
+            } else {
+                A.h(n - 1) + 1
+            }
+        }
+    }
+}
+
+impl two::Tw for other::Stmt {
+    fn h(&self, _n: u32) -> u32 {
+        0
+    }
+}
+
+#[test]
+fn foreign_premise_in_a_two_member_cycle_past_the_floor() {
+    use two::Tw;
+    assert_eq!(two::A.h(100), 100);
+    assert_eq!(two::B.h(101), 101);
+}

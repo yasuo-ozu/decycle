@@ -1,0 +1,8 @@
+error: decycle: `crate::m::B` names `B` of this module by its path, so this bound is left as written, but `B`'s impl of `Loop` leads back to this impl (`A` → `B` → `A`): rustc cannot prove that cycle (E0275)
+
+         = help: write `B` to make the bound part of the cycle decycle breaks
+
+  --> tests/ui/module_absolute_bound.rs:18:9
+   |
+18 |         crate::m::B: Loop,
+   |         ^^^^^^^^^^^

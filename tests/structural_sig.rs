@@ -67,7 +67,10 @@ mod sig {
 fn self_projection_param_is_cast() {
     use sig::Tr;
     assert_eq!(sig::B(1).seed(sig::B(2)), 3);
-    assert_eq!(sig::A(1, Box::new(sig::B(0))).seed(sig::A(2, Box::new(sig::B(0)))), 3);
+    assert_eq!(
+        sig::A(1, Box::new(sig::B(0))).seed(sig::A(2, Box::new(sig::B(0)))),
+        3
+    );
 }
 
 #[test]

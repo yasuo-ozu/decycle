@@ -1,0 +1,43 @@
+error: #[decycle(structural)]: an argument-position `impl Trait` that mentions `Self` (e.g. `impl Fn(&Self)`) is not supported — its cast target is unnameable. Use a concrete form the layout cast can reinterpret: `fn(&Self)` or `&dyn Fn(&Self)`.
+  --> tests/ui/structural_nested_impl_trait_self_arg.rs:21:28
+   |
+21 |         fn visit(&self, f: Option<impl Fn(&Self) -> u32>) -> u32 {
+   |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: cannot find attribute `decycle` in this scope
+ --> tests/ui/structural_nested_impl_trait_self_arg.rs:9:7
+  |
+9 |     #[decycle]
+  |       ^^^^^^^
+  |
+  = note: `decycle` is in scope, but it is a crate, not an attribute
+
+error[E0275]: overflow evaluating the requirement `A: Tr`
+  --> tests/ui/structural_nested_impl_trait_self_arg.rs:19:9
+   |
+19 |         B: Tr,
+   |         ^^^^^
+   |
+note: required for `B` to implement `Tr`
+  --> tests/ui/structural_nested_impl_trait_self_arg.rs:26:10
+   |
+26 |     impl Tr for B
+   |          ^^     ^
+27 |     where
+28 |         A: Tr,
+   |            -- unsatisfied trait bound introduced here
+
+error[E0275]: overflow evaluating the requirement `B: Tr`
+  --> tests/ui/structural_nested_impl_trait_self_arg.rs:28:9
+   |
+28 |         A: Tr,
+   |         ^^^^^
+   |
+note: required for `A` to implement `Tr`
+  --> tests/ui/structural_nested_impl_trait_self_arg.rs:17:10
+   |
+17 |     impl Tr for A
+   |          ^^     ^
+18 |     where
+19 |         B: Tr,
+   |            -- unsatisfied trait bound introduced here

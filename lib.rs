@@ -1,8 +1,6 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![doc(html_logo_url = "https://raw.githubusercontent.com/yasuo-ozu/decycle/main/decycle.png")]
-#![doc(
-    html_favicon_url = "https://raw.githubusercontent.com/yasuo-ozu/decycle/main/decycle.png"
-)]
+#![doc(html_favicon_url = "https://raw.githubusercontent.com/yasuo-ozu/decycle/main/decycle.png")]
 #![doc = include_str!("README.md")]
 
 #[doc(hidden)]
@@ -22,28 +20,6 @@ pub use decycle_impl::ranked;
 /// unroll that emits no runtime machinery.
 #[cfg(feature = "api")]
 pub use decycle_impl::structural;
-/// Engine-independent, code-free inspection: the module's obligation graph over type idents, with
-/// each edge labelled `Direct` or `Peeled`.
-///
-/// The analysis itself is the same whichever engine you go on to use — it lives here, and only here.
-/// What differs per engine is how a graph is *consumed*: [`ranked::process_module_with_graph`]
-/// **replaces** its participant set with the graph's nodes, whereas
-/// [`structural::process_module_with_graph`] can only **filter** with them, its model being keyed on
-/// `(type, trait)` pairs rather than on types.
-///
-/// - [`analysis::analyze_module`] reads a module's own classification back out;
-/// - [`analysis::cyclic_subgraph`] restricts a graph to the nodes that lie on a cycle, so a caller
-///   can supply a whole reference relation and let decycle decide what recurses;
-/// - [`analysis::with_nodes`] adds participants discovered after the graph was built.
-///
-/// The result is what [`ranked::process_module_with_graph`] and
-/// [`structural::process_module_with_graph`] take.
-#[cfg(feature = "api")]
-pub use decycle_impl::analysis;
-/// Re-exported so callers can name the [`safegraph::VecGraph`] that
-/// [`analysis::analyze_module`] returns without depending on `safegraph` themselves.
-#[cfg(feature = "api")]
-pub use decycle_impl::safegraph;
 /// Attribute macro that expands a module or trait to break circular trait
 /// obligations within the annotated module. Also see module-level documentation.
 ///
@@ -111,9 +87,11 @@ pub use decycle_impl::safegraph;
 /// ## Attribute Arguments
 ///
 /// - **Module**:
-///   - `#[decycle::decycle(structural, recurse_level = N, support_infinite_cycle = true|false, decycle = path)]`
+///   - `#[decycle::decycle(structural, module = path, recurse_level = N, support_infinite_cycle = true|false, decycle = path)]`
 ///   - `structural`: select the structural unroll instead of the ranked engine (see *Two engines*
 ///     above); incompatible with `recurse_level` / `support_infinite_cycle`
+///   - `module`: the absolute path of the annotated module (`crate::path::to::m`); both engines. See
+///     *The module's own path* below
 ///   - `recurse_level`: expansion depth (default 10, must be at least 1); ranked engine only
 ///   - `support_infinite_cycle`: enable/disable infinite-cycle handling (default true); ranked engine only
 ///   - `decycle`: override the path used to refer to this crate
@@ -127,6 +105,102 @@ pub use decycle_impl::safegraph;
 ///     crate. Paths in the trait must be absolute (`crate::..`, `::krate::..`), except std prelude
 ///     names (`Vec`, `Option`, `Clone`). For announce's own options, write
 ///     `#[decycle::announce::announce(crate = ::decycle::announce, ..)]`; see also [`check`].
+///
+/// ### The module's own path (`module = path`)
+///
+/// The engines read a cycle participant only by the name the module gives it, bare (or
+/// `self::`-qualified): the trait of an impl, its self type, and the trait and the types of a bound
+/// (`impl Eval for X where Term: Eval`). A trait or a type the module names by a path
+/// (`impl crate::m::Eval for X`, `impl super::Eval for X`, `impl Eval for crate::m::Term`,
+/// `where crate::m::Term: Eval`) is the item itself, the opt-out: it is left as written, and a cycle
+/// through it fails to compile as it would without `#[decycle]` — with `structural`, rustc's own
+/// overflow (`E0275`); with the ranked engine an `E0275` too, which may name its internal `…Ranked`
+/// traits (but see the last point below). A wrapped bound is read as the obligations of its parts
+/// (a wrapper implements the trait when its type arguments do): `(B, crate::m::C): Eval` is the
+/// edge `B: Eval` and the premise `crate::m::C: Eval`, as written. When the module implements the
+/// wrapper itself (`impl<X: Eval, Y: Eval> Eval for (X, Y)`), the ranked engine also keeps the whole
+/// bound, so a call through the wrapper works, and gives each type outside the cycle that the
+/// wrapper's impls reach a ranked impl forwarding to the original trait (only where that cannot
+/// overlap another impl; otherwise the bound reads as its parts alone). An item that
+/// [`#[announce]`](https://docs.rs/announce) re-reads elsewhere, on the other hand, must spell every
+/// path absolutely. `module = path` gives the module's own absolute path — starting with `crate`
+/// (or `$crate` from a `macro_rules!`, or a leading `::` through `extern crate self as ..`),
+/// without generic arguments, and ending in the module's name. The cycle is still solved on the
+/// module as written, and once it is:
+///
+/// - in the items emitted as written (structs, enums, unions, type aliases, traits, fns, consts,
+///   statics, and the impls an engine does not take over), a bare or `self::` name of a type or
+///   trait **declared directly in the module** is spelled `path::X` in type and bound positions —
+///   before any attribute on those items (`#[announce]`, a derive) expands. A bare name shadowed by
+///   a generic parameter, `Self`, other multi-segment paths, fn bodies and other expressions, macro
+///   invocations, nested modules and imported names are left as written. The impls of the
+///   `#[decycle]` traits are generated anew and keep the bare spelling. The rewrite is syntactic: a
+///   type declared under an inactive `#[cfg]` still counts as declared, and a type a macro
+///   invocation declares does not.
+/// - the path is checked against the module: a path that is not this module's — one naming another
+///   module, which would otherwise quietly retarget a name to that module's item, or one naming no
+///   module — is an error at the `module` argument.
+/// - with the ranked engine, an opt-out bound on a cycle is reported in the module's terms, when the
+///   overflow is certain: a bound (or a peeled part of one) that names one of the module's own
+///   structs, enums or unions by its path (`crate::m::C`, or `super::m::C` resolved against the
+///   module path), where `C`'s impl leads back to the impl carrying the bound through impls without
+///   generics, is an error at the bound — ``decycle: `crate::m::C` names `C` of this module by its
+///   path, so this bound is left as written, but `C`'s impl of `Loop` leads back to this impl (`A`
+///   → `C` → `A`): rustc cannot prove that cycle (E0275)``, with the help to write `C` — and only
+///   these errors are reported. A chain through a generic impl, a type with arguments, an impl
+///   under `#[cfg]` or another trait is left to rustc, as is a chain of more bare bounds than
+///   `recurse_level`, which reaches the rank floor first and compiles.
+///
+/// ```rust
+/// #[decycle::decycle(module = crate::ast)]
+/// pub mod ast {
+///     #[decycle]
+///     pub trait Eval {
+///         fn eval(&self) -> i32;
+///     }
+///
+///     // Emitted as `::std::boxed::Box<crate::ast::Term>`, which `#[announce]` accepts.
+///     #[decycle::announce::announce(crate = ::decycle::announce)]
+///     pub enum Expr {
+///         Add(::std::boxed::Box<Term>, ::std::boxed::Box<Term>),
+///         One,
+///     }
+///
+///     pub enum Term {
+///         Paren(Box<Expr>),
+///         Lit(i32),
+///     }
+///
+///     impl Eval for Expr
+///     where
+///         Term: Eval,
+///     {
+///         fn eval(&self) -> i32 {
+///             match self {
+///                 Expr::Add(a, b) => a.eval() + b.eval(),
+///                 Expr::One => 1,
+///             }
+///         }
+///     }
+///
+///     impl Eval for Term
+///     where
+///         Expr: Eval,
+///     {
+///         fn eval(&self) -> i32 {
+///             match self {
+///                 Term::Paren(e) => e.eval(),
+///                 Term::Lit(n) => *n,
+///             }
+///         }
+///     }
+/// }
+/// # fn main() {
+/// #     use ast::{Eval, Expr, Term};
+/// #     let e = Expr::Add(Box::new(Term::Lit(2)), Box::new(Term::Paren(Box::new(Expr::One))));
+/// #     assert_eq!(e.eval(), 3);
+/// # }
+/// ```
 ///
 /// ### Impl where-clause bounds
 /// In `impl` blocks inside a `#[decycle]` module, avoid constraining
@@ -190,13 +264,19 @@ pub use decycle_impl::safegraph;
 ///   panic instead of silently misbehaving: (a) a generic method's floor
 ///   reached before any frame of that exact instantiation ran on the
 ///   current thread (e.g. a first descent at cycle width greater than
-///   `recurse_level`); (b) any floor of an impl whose cyclic bound targets
+///   `recurse_level`, or a generic method of a `#[decycle]` supertrait first
+///   called from a subtrait impl's body on a type whose supertrait impl is
+///   generic over its cyclic parameter); (b) any floor of an impl whose cyclic bound targets
 ///   a bare type parameter (`impl<T: Cb> Ca for Wrap<T>` — its re-entry
 ///   registration is not expressible, so the cycle is unbounded only
 ///   through its other impls); and (c) a heterogeneous side-bound cycle
 ///   where the registering impl's own bounds don't cover every bound a
 ///   reachable sibling impl needs (its registration is skipped rather than
-///   risk naming an unprovable obligation). Such impls simply never
+///   risk naming an unprovable obligation) — each impl is given the side
+///   bounds of the impls its cyclic bounds reach, whatever their trait, so
+///   this is left to side bounds that cannot be carried over (one naming
+///   `Self`, or a trait bound naming a lifetime, a `for<..>` or a const
+///   parameter). Such impls simply never
 ///   register, compile cleanly, and panic (rather than corrupt memory) if
 ///   their floor is ever actually reached.
 /// - `support_infinite_cycle = false` emits no runtime machinery at all
@@ -288,7 +368,6 @@ pub mod __reentry {
         }
 
         type Undo = ((&'static str, u64), Option<*const ()>);
-
 
         /// Puts back the entries that were *displaced* inside one registration scope.
         ///
@@ -394,9 +473,7 @@ pub mod __reentry {
         /// generated method prologue opens one of these before its registrations and holds it for
         /// the rest of the body, so the entries stay live for exactly the descent they serve.
         pub fn scope() -> Registration {
-            let mark = UNDO
-                .try_with(|u| u.borrow().len())
-                .unwrap_or(usize::MAX);
+            let mark = UNDO.try_with(|u| u.borrow().len()).unwrap_or(usize::MAX);
             Registration { mark }
         }
 
@@ -480,7 +557,6 @@ pub mod __reentry {
     }
 
     pub use imp::{lookup, register, scope, Registration};
-
 }
 
 #[doc(hidden)]

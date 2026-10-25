@@ -123,6 +123,11 @@ mod absolute_types {
         let a = m::A(Box::new(m::B(None)));
         assert_eq!(a.produce(0).0, 1);
         assert_eq!(a.produce(1).0, 11);
-        assert_eq!(m::B(Some(Box::new(m::A(Box::new(m::B(None)))))).produce(0).0, 2);
+        assert_eq!(
+            m::B(Some(Box::new(m::A(Box::new(m::B(None))))))
+                .produce(0)
+                .0,
+            2
+        );
     }
 }

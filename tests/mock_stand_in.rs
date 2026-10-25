@@ -6,9 +6,9 @@
 // A stand-in named like its real trait (another crate's).
 #[decycle::decycle]
 mod m {
+    use traitdef::real::Weigh;
     #[decycle]
     use traitdef::stand::Weigh;
-    use traitdef::real::Weigh;
 
     pub struct A(pub Option<Box<B>>);
     pub struct B(pub Option<Box<A>>);
@@ -27,7 +27,9 @@ mod m {
         A: Weigh,
     {
         fn weigh(&self, depth: usize) -> usize {
-            self.0.as_ref().map_or(depth * 10, |a| a.weigh(depth + 1) + 100)
+            self.0
+                .as_ref()
+                .map_or(depth * 10, |a| a.weigh(depth + 1) + 100)
         }
     }
 }
@@ -106,9 +108,9 @@ mod local {
 
 #[decycle::decycle]
 mod same_crate {
-    use crate::local::Count;
     #[decycle]
     use crate::local::stand::Count;
+    use crate::local::Count;
 
     pub struct A(pub Option<Box<A>>);
 
@@ -125,7 +127,9 @@ mod same_crate {
 #[test]
 fn same_crate_stand_in() {
     use local::Count;
-    let a = same_crate::A(Some(Box::new(same_crate::A(Some(Box::new(same_crate::A(None)))))));
+    let a = same_crate::A(Some(Box::new(same_crate::A(Some(Box::new(
+        same_crate::A(None),
+    ))))));
     assert_eq!(a.count(0), 2);
 }
 
@@ -165,7 +169,9 @@ mod std_mock {
 
 #[test]
 fn announce_std_mock() {
-    let a = std_mock::A(Some(Box::new(std_mock::B(Some(Box::new(std_mock::A(None)))))));
+    let a = std_mock::A(Some(Box::new(std_mock::B(Some(Box::new(std_mock::A(
+        None,
+    )))))));
     assert_eq!(a.to_string(), "A(B(A))");
 }
 

@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use syn::visit_mut::VisitMut;
 use syn::*;
 
-// ===== Shared, code-free analysis =====
-pub mod analysis;
+// ===== Shared, code-free analysis (the obligation graph `growth` reads the cycle members off) =====
+mod analysis;
 
 // ===== Ranked engine (default) =====
 pub mod ranked;
@@ -14,19 +14,36 @@ pub mod ranked;
 pub use ranked::finalize;
 pub(crate) use ranked::helper;
 #[doc(hidden)]
-pub use ranked::process_module;
-#[doc(hidden)]
 pub use ranked::{check_trait, check_trait_structural};
+#[doc(hidden)]
+pub use ranked::{process_module, process_module_at};
 
 // ===== Structural unroll (`#[decycle(structural)]`) =====
 pub mod structural;
 // Aliased root re-export kept for `decycle-macro` (the public name is `structural::process_module`).
 #[doc(hidden)]
-pub use structural::process_module as process_module_structural;
+pub use structural::{
+    process_module as process_module_structural, process_module_at as process_module_structural_at,
+};
 
 // Rendering `syn::Generics` to token form, shared by both engines.
 mod generics_fmt;
+// The small directed graphs a module's cycles are read off, shared by both engines.
+mod graph;
+// How a module names its own items (bare or `self::`), as both engines read it.
+mod names;
+// The checks both engines make of a module's `#[decycle]` markers.
 mod growth;
+mod markers;
+// Carrying a cycle's premises along its bounds, across traits, shared by both engines.
+mod premise_flow;
+// Matching an impl header against a bound or an obligation, and substituting the match.
+mod unify;
+// `#[decycle(module = path)]`: qualifying the items re-emitted as written, and checking the path.
+mod module_path;
+// For `decycle-macro`, which reports an invalid `module = path` after expanding without it.
+#[doc(hidden)]
+pub use module_path::{module_path_error, ModulePathError};
 
 /// Emitted by both engines when a `#[decycle]` module contains no trait (nor `#[decycle] use`)
 /// annotated with `#[decycle]` — nothing marks a cycle participant, so there is nothing to break.
@@ -34,7 +51,6 @@ pub(crate) const NO_DECYCLE_TRAITS_MSG: &str =
     "cannot detect traits nor `use` statement annotated with #[decycle]";
 
 pub use proc_macro_error;
-pub use safegraph;
 
 #[derive(Clone)]
 struct GenericRenamer {
@@ -52,31 +68,28 @@ impl VisitMut for GenericRenamer {
     }
 
     fn visit_type_mut(&mut self, ty: &mut Type) {
-        if let Type::Path(type_path) = ty {
-            if type_path.qself.is_none() && type_path.path.segments.len() == 1 {
-                let segment = &mut type_path.path.segments[0];
-                if matches!(segment.arguments, PathArguments::None) {
-                    if let Some(new) = self.ident_renames.get(&segment.ident.to_string()) {
-                        segment.ident = new.clone();
-                    }
-                }
-            }
+        if let Type::Path(tp) = ty {
+            self.rename_path(&tp.qself, &mut tp.path);
         }
         syn::visit_mut::visit_type_mut(self, ty);
     }
 
     fn visit_expr_mut(&mut self, expr: &mut Expr) {
-        if let Expr::Path(expr_path) = expr {
-            if expr_path.qself.is_none() && expr_path.path.segments.len() == 1 {
-                let segment = &mut expr_path.path.segments[0];
-                if matches!(segment.arguments, PathArguments::None) {
-                    if let Some(new) = self.ident_renames.get(&segment.ident.to_string()) {
-                        segment.ident = new.clone();
-                    }
-                }
-            }
+        if let Expr::Path(ep) = expr {
+            self.rename_path(&ep.qself, &mut ep.path);
         }
         syn::visit_mut::visit_expr_mut(self, expr);
+    }
+}
+
+impl GenericRenamer {
+    /// Rename `path` when it is a single argument-less segment naming a renamed parameter.
+    fn rename_path(&self, qself: &Option<QSelf>, path: &mut Path) {
+        if qself.is_none() && path.segments.len() == 1 && path.segments[0].arguments.is_none() {
+            if let Some(new) = self.ident_renames.get(&path.segments[0].ident.to_string()) {
+                path.segments[0].ident = new.clone();
+            }
+        }
     }
 }
 
@@ -96,17 +109,11 @@ pub(crate) fn randomize_impl_generics(
                 lt.lifetime = new.clone();
                 lifetime_renames.insert(old.ident.to_string(), new);
             }
-            GenericParam::Type(tp) => {
-                let old = tp.ident.clone();
-                let new = Ident::new(&format!("{}{}", old, random_suffix), old.span());
-                tp.ident = new.clone();
-                ident_renames.insert(old.to_string(), new);
-            }
-            GenericParam::Const(cp) => {
-                let old = cp.ident.clone();
-                let new = Ident::new(&format!("{}{}", old, random_suffix), old.span());
-                cp.ident = new.clone();
-                ident_renames.insert(old.to_string(), new);
+            GenericParam::Type(TypeParam { ident, .. })
+            | GenericParam::Const(ConstParam { ident, .. }) => {
+                let new = Ident::new(&format!("{}{}", ident, random_suffix), ident.span());
+                ident_renames.insert(ident.to_string(), new.clone());
+                *ident = new;
             }
         }
     }
@@ -120,8 +127,10 @@ pub(crate) fn randomize_impl_generics(
 }
 
 /// Does `attr`'s PATH name decycle — the bare `#[decycle]` or the two-segment `#[<crate>::decycle]`
-/// form, where `<crate>` is the decycle crate name *as passed to the macro* (`decycle_crate` — the
-/// leading segment of the `decycle = …` path argument, default `decycle`)?
+/// form, where `<crate>` is `decycle` or the decycle crate name *as passed to the macro*
+/// (`decycle_crate` — the leading segment of the `decycle = …` path argument, default `decycle`)?
+/// With no crate name (`None`), any `<crate>` is accepted: `decycle-macro` uses that before the
+/// arguments naming it are parsed, to strip the markers from the fallback it sets first.
 ///
 /// We deliberately do NOT read the consumer's `Cargo.toml` to discover a dependency rename: a renamed
 /// decycle must be named explicitly via `#[decycle(decycle = ::my_rename)]`, and the two-segment inner
@@ -129,15 +138,18 @@ pub(crate) fn randomize_impl_generics(
 /// lowers the crate's MSRV.)
 ///
 /// Arguments are not inspected. Everything that *acts* on the marker goes through
-/// [`is_decycle_attribute`], which rejects them; this bare predicate exists for the read-only
-/// [`analysis`] module, whose whole contract is to inspect a module without diagnosing it — and
-/// which, unlike the engines, is routinely called outside a `#[proc_macro_error]` entry point,
-/// where `abort!` could only panic.
-fn names_decycle_attribute(attr: &Attribute, decycle_crate: &Ident) -> bool {
+/// `is_decycle_attribute`, which rejects them; this bare predicate exists for the read-only
+/// `analysis` module (and `growth`), whose whole contract is to inspect a module without
+/// diagnosing it — its unit tests run it outside a `#[proc_macro_error]` entry point, where
+/// `abort!` could only panic. `decycle-macro` uses it for the attribute on the item itself.
+#[doc(hidden)]
+pub fn names_decycle_attribute(attr: &Attribute, decycle_crate: Option<&Ident>) -> bool {
     let path = attr.path();
     path.is_ident("decycle")
         || (path.segments.len() == 2
-            && (path.segments[0].ident == "decycle" || &path.segments[0].ident == decycle_crate)
+            && decycle_crate.map_or(true, |name| {
+                path.segments[0].ident == "decycle" || path.segments[0].ident == *name
+            })
             && path.segments[1].ident == "decycle")
 }
 
@@ -155,7 +167,7 @@ fn names_decycle_attribute(attr: &Attribute, decycle_crate: &Ident) -> bool {
 /// scans (`ranked::process_module`, `structural::collect_decycle_traits`) and the nested-module
 /// check. `#[decycle()]` — an empty list — is accepted, being no argument at all.
 fn is_decycle_attribute(attr: &Attribute, decycle_crate: &Ident) -> bool {
-    if !names_decycle_attribute(attr, decycle_crate) {
+    if !names_decycle_attribute(attr, Some(decycle_crate)) {
         return false;
     }
     use syn::spanned::Spanned;
@@ -239,7 +251,11 @@ pub(crate) fn is_symbol_attr(a: &Attribute) -> bool {
 
 /// The symbol-defining attributes among `attrs` (see [`is_symbol_attr`]).
 pub(crate) fn symbol_attrs(attrs: &[Attribute]) -> Vec<Attribute> {
-    attrs.iter().filter(|a| is_symbol_attr(a)).cloned().collect()
+    attrs
+        .iter()
+        .filter(|a| is_symbol_attr(a))
+        .cloned()
+        .collect()
 }
 
 fn get_random() -> u64 {
@@ -250,16 +266,22 @@ fn get_crate_identity() -> String {
     "decycle".to_string()
 }
 
+/// `prefix` followed by the suffix every generated identifier carries ([`name_suffix`] of `seed`):
+/// how both engines mint every name they generate.
+pub(crate) fn suffixed_ident(prefix: &str, seed: u64) -> proc_macro2::Ident {
+    proc_macro2::Ident::new(
+        &format!("{prefix}{}", name_suffix(seed)),
+        proc_macro2::Span::call_site(),
+    )
+}
+
 /// The fresh binding minted for a destructured / `mut` / `ref` parameter at position `ix`.
 ///
 /// Both engines normalise such a parameter to a plain ident so the forwarding call can pass it on,
 /// and both need that ident to be un-collidable with a user parameter. Shared so the two mint the
 /// same shape; the suffix comes from each engine's own seed (see [`name_suffix`]).
-pub(crate) fn arg_ident(ix: usize, suffix: &str) -> proc_macro2::Ident {
-    proc_macro2::Ident::new(
-        &format!("__decycle_arg{ix}_{suffix}"),
-        proc_macro2::Span::call_site(),
-    )
+pub(crate) fn arg_ident(ix: usize, seed: u64) -> proc_macro2::Ident {
+    suffixed_ident(&format!("__decycle_arg{ix}_"), seed)
 }
 
 /// Render the suffix that every generated identifier carries, in both engines.

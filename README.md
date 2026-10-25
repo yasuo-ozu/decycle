@@ -30,7 +30,7 @@ All are on by default; a normal `std` user needs none of these flags.
 | feature | default | what turning it **off** does |
 | --- | --- | --- |
 | `std` | on | Drops the re-entry registry, which is a `thread_local!` map. The ranked engine then requires `support_infinite_cycle = false`; asking for unbounded re-entry without `std` is a compile error naming `UnboundedReentryRequiresTheDecycleStdFeature`. The structural engine is unaffected — it emits no runtime machinery at all. |
-| `api` | on | Drops the programmatic surface (`decycle::{analysis, ranked, structural, safegraph}`). This is what keeps `decycle-impl` out of your *target* graph, and is therefore required for `no_std`. |
+| `api` | on | Drops the programmatic surface (`decycle::{ranked, structural}`, the engines' entry points for macro authors). This is what keeps `decycle-impl` out of your *target* graph, and is therefore required for `no_std`. |
 | `announce` | on | Drops `decycle::announce`, the re-export of [announce](https://docs.rs/announce) that `#[decycle]` on a trait outside a module expands to. It builds for a core-only target. |
 
 **`no_std` needs `default-features = false`.** With the defaults on, `api` pulls `decycle-impl`
@@ -204,6 +204,7 @@ mod cycle {
 | Generic arg instantiated with an **anonymous type** (closure, `async` block, `-> impl Trait` value) | ✗ in unbounded mode — see the closure note below | **✓** |
 | Arg mentioning `Self`: **`fn(&Self)`** / **`&dyn Fn(&Self)`** | ✗ | **✓** |
 | Non-`#[decycle]` **supertrait** on the trait | **✓** | ✗ |
+| `#[decycle]` **supertrait** (another trait of the module, `trait Eval: Base`) | **✓** | only when the supertrait is cyclic on the same types |
 | Third-party trait *in* the cycle | only when `#[decycle]`-annotated at its definition | **✓**  |
 
 > **Note on closures (ranked engine, unbounded mode only).** With
@@ -329,6 +330,16 @@ mod cycle {
     impl BRanked<()> for Right {
         fn b(&self) -> usize { unimplemented!("decycle: cycle limit reached") }
     }
+
+    // The floor's twin at a rank no other rank unifies with, so that a call whose rank
+    // nothing pins is ambiguous (E0283) instead of resolving to the floor.
+    enum Decoy {}
+    impl ARanked<Decoy> for Left {
+        fn a(&self) -> usize { unreachable!() }
+    }
+    impl BRanked<Decoy> for Right {
+        fn b(&self) -> usize { unreachable!() }
+    }
 }
 # fn main() {}
 ```
@@ -358,8 +369,37 @@ actionable panic that cannot corrupt or poison other cycles or threads:
   type argument is chosen inside the body and nothing in scope can spell it;
 - an impl whose cyclic bound targets a **bare type parameter**
   (`impl<T: Cb> Ca for Wrap<T>`), or a heterogeneous side-bound cycle whose registering impl
-  does not syntactically cover what a reachable sibling needs. Such a cycle is still unbounded
-  through its other impls.
+  does not syntactically cover what a reachable sibling needs. Each impl is given the side
+  bounds of the impls its cyclic bounds reach (whatever their trait, with the generic
+  parameters mapped through the bound), so this is left to side bounds that cannot be carried:
+  one naming `Self`, or a trait bound naming a lifetime, a `for<..>` or a const parameter. Such
+  a cycle is still unbounded through its other impls.
+
+**Calls whose rank nothing pins.** In an impl's body, a call of a `#[decycle]` trait's method
+resolves to the ranked twin at the rank the impl's bounds give it. A call on a type the impl has no
+bound for has no such rank — `self.base()` in `impl Eval for Expr` with no `Self: Base` bound — and
+is a compile error, `E0283` ("type annotations needed", on `…BaseRanked…<_>`). Pin it with any of:
+
+- a bound: `impl Eval for Expr where Term: Base, Self: Base`;
+- a supertrait: `trait Eval: Base`, whose ranked twin carries `Base`'s at the same rank;
+- a call by path, through the public trait: `crate::m::Base::base(self)`.
+
+A call through an impl of the module is pinned by a bound on the whole wrapper: a pair impl
+`impl<X: Loop, Y: Loop> Loop for (X, Y)` called as `(B, crate::other::Leaf).step(n)`, with `Leaf`'s
+impl outside the module, under `where (B, crate::other::Leaf): Loop`. The engine keeps that bound
+whole next to its parts (`B: Loop`, `crate::other::Leaf: Loop`), and gives each type outside the
+cycle that the wrapper's impls reach (here `Leaf`; `Vec<U>` for a parameter `U`) a ranked impl
+forwarding every item to `Loop`, so the call, and the same call by path, work at any depth. Such an
+impl is written only where it cannot overlap another ranked impl; where it cannot be, the call
+through the wrapper is `E0283` (and by path `E0277`, on `Leaf: LoopRanked…`): a part named through
+a `use .. as` rename, a type alias or a relative path (`super::x::Leaf`), which may be a cycle
+member under another name; a part one of the module's impls may implement (`::std::vec::Vec<u8>`
+beside `impl<T: Loop> Loop for Vec<T>`); or one the module spells two ways (`Leaf` and
+`crate::other::Leaf`). Name the part by its path, once. A wrapper whose impl is outside the module
+has no ranked impl, so a call through it is reached by path only
+(`<(B, Leaf) as crate::m::Loop>::step(&(B, Leaf), n)`). (Before 0.8 the pair's call could compile,
+and then panic at the floor: "re-entry fn not registered", or "cycle limit reached" when bounded;
+the first shape did so only on the next-generation trait solver.)
 
 **At the floor (`support_infinite_cycle = false`).** No runtime machinery is emitted at all —
 this is the zero-cost mode. Recursion simply stops at the configured `recurse_level`, panicking
@@ -513,8 +553,52 @@ resolve in one pass.
 ## Attribute Arguments
 
 - **Module**: 
-  - `#[decycle::decycle(recurse_level = N, support_infinite_cycle = true|false, decycle = path)]`
+  - `#[decycle::decycle(module = path, recurse_level = N, support_infinite_cycle = true|false, decycle = path)]`
   - `structural`: use the structural unroll instead of the ranked engine (see [Two algorithms](#two-algorithms)); incompatible with `recurse_level` / `support_infinite_cycle`
+  - `module`: the absolute path of the annotated module (`module = crate::path::to::m`; it may also
+    start with `$crate`, or with `::` through `extern crate self as ..`, takes no generic
+    arguments, and must end in the module's name). The cycle is still solved on the module as
+    written; once it is, the items the engines emit as written (structs, enums, unions, type
+    aliases, traits, fns, consts, statics, and every impl they do not take over) have each bare or
+    `self::` name of a type or trait declared directly in the module spelled `path::X` — so an item
+    inside the module can carry [`#[announce]`](https://docs.rs/announce), which requires absolute
+    paths, with bare fields. Bare names shadowed by a generic parameter, `Self`, other multi-segment
+    paths, fn bodies, macro invocations, nested modules and imported names are left as written.
+    The rewrite is syntactic: a type declared under an inactive `#[cfg]` still counts as declared,
+    and a type declared by a macro invocation does not. The path is checked against the module, so
+    a path that is not this module's (one naming another module, or none) is an error at the
+    argument.
+  - Both engines read a cycle participant only by the name the module gives it, bare (or
+    `self::`-qualified): the trait of an impl, its self type, and the trait and the types of a
+    bound. A trait or a type the module names by a path (`impl crate::m::Eval for X`,
+    `impl super::Eval for X` for a `#[decycle] use super::Eval`, `impl Eval for crate::m::Term`,
+    `where crate::m::Term: Eval`) is the opt-out and is left as written, with or without `module`,
+    so a cycle through it fails to compile: with `structural`, rustc's own overflow (`E0275`); with
+    the ranked engine an `E0275` too, which may name its internal `…Ranked` traits. A wrapped
+    bound is read as the obligations of its parts (a wrapper implements the trait when its type
+    arguments do): `(B, crate::m::C): Eval` is the edge `B: Eval` plus the premise
+    `crate::m::C: Eval`, as written. When the module implements the wrapper itself
+    (`impl<X: Eval, Y: Eval> Eval for (X, Y)`), the ranked engine also keeps the whole bound, so a
+    call through the wrapper works, and gives each type outside the cycle that the wrapper's impls
+    reach a ranked impl forwarding to the original trait (where that cannot overlap another impl;
+    see *Calls whose rank nothing pins*).
+  - With `module`, the ranked engine reports such a cycle itself, in the module's terms, when it
+    is certain: a bound (or a peeled part of one) that names one of the module's own structs,
+    enums or unions by its path (`crate::m::C`, or `super::m::C` resolved against the module
+    path), where `C`'s impl leads back to the impl carrying the bound through impls without
+    generics:
+
+    ```text
+    error: decycle: `crate::m::C` names `C` of this module by its path, so this bound is left as
+           written, but `C`'s impl of `Loop` leads back to this impl (`A` → `C` → `A`): rustc
+           cannot prove that cycle (E0275)
+             = help: write `C` to make the bound part of the cycle decycle breaks
+    ```
+
+    Every such bound is reported, and nothing else: the module is emitted without the bounds that
+    would overflow on their own. A chain through a generic impl (`impl<T> Eval for Wrap<T>`),
+    a type with arguments, an impl under `#[cfg]` or another trait is left to rustc, as is a chain
+    of more bare bounds than `recurse_level`, which reaches the rank floor first and compiles.
   - `recurse_level`: expansion depth (default 10, must be at least 1)
   - `support_infinite_cycle`: enables/disable infinite cycle handling (default true)
   - `decycle`: override the path used to refer to this crate

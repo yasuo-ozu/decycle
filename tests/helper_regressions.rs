@@ -44,7 +44,10 @@ mod lifetime_trait {
 fn elided_lifetime_bare_and_qself_calls() {
     use lifetime_trait::Tr;
     assert_eq!(lifetime_trait::B(None).f("ab"), 2);
-    assert_eq!(lifetime_trait::A(Box::new(lifetime_trait::B(None))).f("abc"), 3);
+    assert_eq!(
+        lifetime_trait::A(Box::new(lifetime_trait::B(None))).f("abc"),
+        3
+    );
 }
 
 // A destructured parameter is rebound to a generated ident. Unsuffixed, it collided with a user
@@ -80,5 +83,8 @@ mod arg_name_collision {
 fn user_param_named_like_the_generated_one() {
     use arg_name_collision::Tr;
     assert_eq!(arg_name_collision::B(None).g((1, 2), 3), 6);
-    assert_eq!(arg_name_collision::A(Box::new(arg_name_collision::B(None))).g((1, 2), 3), 12);
+    assert_eq!(
+        arg_name_collision::A(Box::new(arg_name_collision::B(None))).g((1, 2), 3),
+        12
+    );
 }

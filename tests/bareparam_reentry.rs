@@ -91,6 +91,10 @@ fn bareparam_wrap_reentry_is_unbounded_once_primed() {
     // (`Leaf`'s base case propagates `n` unchanged, so the wrapper is the identity function.)
     let v = bareparam::Wrap(bareparam::Wrap(bareparam::Leaf));
     for n in [0usize, 1, 2, 50, 2000] {
-        assert_eq!(v.ca(n), n, "unbounded descent must still compute correctly at n={n}");
+        assert_eq!(
+            v.ca(n),
+            n,
+            "unbounded descent must still compute correctly at n={n}"
+        );
     }
 }

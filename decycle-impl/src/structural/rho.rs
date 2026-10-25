@@ -17,27 +17,22 @@ pub(crate) fn make_nonce(seed: &TokenStream) -> u64 {
 
 /// The terminator type name for a cycle member: `__MTerm_<nonce>`.
 pub(crate) fn term_ident(member: &str, nonce: u64) -> Ident {
-    Ident::new(&format!("__{}Term_{}", member, crate::name_suffix(nonce)), Span::call_site())
+    crate::suffixed_ident(&format!("__{member}Term_"), nonce)
 }
 
 /// The layout-cast helper fn name: `__decycle_cast_<nonce>`.
 pub(crate) fn cast_ident(nonce: u64) -> Ident {
-    Ident::new(&format!("__decycle_cast_{}", crate::name_suffix(nonce)), Span::call_site())
+    crate::suffixed_ident("__decycle_cast_", nonce)
 }
 
 /// The body-holding local trait name: `__DecycleBody_<nonce>`.
 pub(crate) fn body_ident(nonce: u64) -> Ident {
-    Ident::new(&format!("__DecycleBody_{}", crate::name_suffix(nonce)), Span::call_site())
+    crate::suffixed_ident("__DecycleBody_", nonce)
 }
 
 /// The body-holding local method name: `__run_<nonce>`.
 pub(crate) fn run_ident(nonce: u64) -> Ident {
-    Ident::new(&format!("__run_{}", crate::name_suffix(nonce)), Span::call_site())
-}
-
-/// A fresh parameter ident for a normalized (destructured / `mut` / `ref`) param at index `i`.
-pub(crate) fn arg_ident(i: usize, nonce: u64) -> Ident {
-    crate::arg_ident(i, &crate::name_suffix(nonce))
+    crate::suffixed_ident("__run_", nonce)
 }
 
 /// The generic placeholder type used in a forwarding assertion. It stands for "any element type that
@@ -50,5 +45,5 @@ pub(crate) fn memberx_ident() -> Ident {
 
 /// The compile-time size-guard helper type used by the layout cast: `__DecycleSizeGuard_<nonce>`.
 pub(crate) fn sizeguard_ident(nonce: u64) -> Ident {
-    Ident::new(&format!("__DecycleSizeGuard_{}", crate::name_suffix(nonce)), Span::call_site())
+    crate::suffixed_ident("__DecycleSizeGuard_", nonce)
 }

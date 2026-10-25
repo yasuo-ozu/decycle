@@ -1,0 +1,5 @@
+error: #[decycle] is not supported in nested modules
+  --> tests/ui/structural_nested_marker.rs:11:9
+   |
+11 |         #[decycle]
+   |         ^^^^^^^^^^
